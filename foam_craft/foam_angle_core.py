@@ -9,6 +9,8 @@ import sys
 from dataclasses import dataclass, field
 from math import degrees, tan, cos, radians
 
+from mathutils import Vector
+
 # UV coordinates closer than this are treated as the same point when deciding
 # whether two faces share a UV island boundary.
 UV_EPSILON = 1e-6
@@ -251,6 +253,12 @@ class DartRun:
     max_angle_deg: float = 0.0
     length_3d: float = 0.0
     chord_deviation: float = 0.0
+    # Unit vector in UV space pointing out of the piece, perpendicular to the
+    # run. Derived from the boundary's winding rather than from the island
+    # centroid: "away from the centre" only coincides with "outside" on convex
+    # outlines, and real pieces are frequently concave, where the centroid test
+    # silently puts annotations and darts on the wrong side.
+    uv_outward: object = None
     # False when the run lies on an open mesh boundary (the rim of the sculpt)
     # rather than a seam against another panel. Such a run has no facing piece,
     # so there is no dihedral to split and no saw bevel to set -- distinct from
@@ -328,6 +336,17 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
     uvs = [l[uv_layer].uv.copy() for l in cycle]
     uvs.append(cycle[-1].link_loop_next[uv_layer].uv.copy())
 
+    # Winding of this boundary loop in UV space, via the shoelace formula.
+    # Positive means counter-clockwise. Every run in the loop shares it, so the
+    # outward perpendicular is a fixed rotation of the run direction -- correct
+    # for concave outlines too, unlike a centroid test. Holes wind the opposite
+    # way to the outer boundary and therefore get the opposite rotation, which
+    # is exactly right: "outside the piece" for a hole points into the hole.
+    shoelace = 0.0
+    for k in range(len(uvs) - 1):
+        shoelace += uvs[k].x * uvs[k + 1].y - uvs[k + 1].x * uvs[k].y
+    winding = 1.0 if shoelace >= 0.0 else -1.0
+
     runs = []
     i = 0
     while i < n:
@@ -345,6 +364,14 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
         span = angles[i:j]
         seg = cycle[i:j]
         length = sum((points[k + 1] - points[k]).length for k in range(i, j))
+
+        run_uv = uvs[j] - uvs[i]
+        run_len = run_uv.length
+        if run_len > 1e-12:
+            # Rotate the run direction a quarter turn, the way the winding says.
+            outward = Vector((run_uv.y, -run_uv.x)) * (winding / run_len)
+        else:
+            outward = Vector((0.0, 0.0))
         runs.append(DartRun(
             island_index=island_index,
             loops=seg,
@@ -356,6 +383,7 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
             length_3d=length,
             chord_deviation=_run_deviation(points, i, j),
             has_dihedral=measured[i],
+            uv_outward=outward,
         ))
         i = j
     return runs

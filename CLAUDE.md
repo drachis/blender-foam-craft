@@ -125,6 +125,15 @@ Measured directly in a running session, not inferred from docs.
   delimiter — requests are **null-byte terminated** JSON,
   `{"type": "execute", "code": str, "strict_json": bool}` + `b"\0"`, and the
   executed code must assign a JSON-serializable dict to `result`.
+- **`Material.use_nodes = False` silently does not stick.** On a material from
+  `bpy.data.materials.new()`, assigning `False` raises no exception but
+  `mat.use_nodes` reads back `True` immediately after. Presumably EEVEE Next in
+  5.2 requires node-based materials; the legacy non-node diffuse workflow is
+  gone. Consequence: to make a material show a **flat solid color in every
+  viewport shading mode**, set *both* `mat.diffuse_color` (used by Solid mode's
+  "Material Color") *and* the Principled BSDF node's `Base Color` input (used by
+  Material Preview and Rendered). `diffuse_color` alone is not enough, and
+  turning nodes off to force it is not an option.
 
 ## Good test shapes
 - **Torus, 12 major x 5 minor** — the craftability reference case: it needs

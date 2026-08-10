@@ -35,6 +35,11 @@ _SHADER_NAME = 'UNIFORM_COLOR'
 # not notice it; sampling coordinates catches it for a fixed small cost.
 _UV_SAMPLE_COUNT = 240
 
+# Distance in UV units used to probe which way "outward" points on screen.
+# Small enough to stay local to the run, large enough to survive the float
+# precision of the view transform at ordinary zoom levels.
+_OUTWARD_PROBE = 1e-3
+
 
 class _RunMark(NamedTuple):
     """One cut run, reduced to plain numbers.
@@ -53,6 +58,13 @@ class _RunMark(NamedTuple):
     per_side_deg: float
     has_dihedral: bool
     needs_heat_form: bool
+    # Unit vector in UV space pointing out of the island. The hand-drafted
+    # patterns put every bracket and number in the margin outside the piece,
+    # where they cannot be confused with cut lines, so the overlay needs to
+    # know which side of a boundary run is "outside" rather than picking a
+    # perpendicular arbitrarily.
+    ox: float = 0.0
+    oy: float = 0.0
 
 
 class _OverlayCache:
@@ -156,6 +168,7 @@ def _rebuild(pairs, s):
     for obj, bm, uv_layer in pairs:
         islands = core.uv_islands(bm, uv_layer, s.only_selected)
 
+
         for run in core.iter_boundary_dart_segments(
                 bm, uv_layer, s.max_chord_deviation, s.max_angle_variation_deg,
                 only_selected=s.only_selected, islands=islands):
@@ -165,9 +178,14 @@ def _rebuild(pairs, s):
                 per_side, heat = bevel.per_side_deg, bevel.needs_heat_form
             else:
                 per_side, heat = 0.0, False
+
+            # Outward comes from the boundary's winding, computed in core.
+            ox, oy = (run.uv_outward.x, run.uv_outward.y) \
+                if run.uv_outward is not None else (0.0, 0.0)
+
             runs.append(_RunMark(
                 run.uv_start.x, run.uv_start.y, run.uv_end.x, run.uv_end.y,
-                run.mean_angle_deg, per_side, run.has_dihedral, heat))
+                run.mean_angle_deg, per_side, run.has_dihedral, heat, ox, oy))
 
         # Piece numbers come from the numbering operator's attribute when it
         # has been run; otherwise fall back to island order so the overlay
@@ -267,7 +285,22 @@ def draw_callback():
         length = (dx * dx + dy * dy) ** 0.5
         if length < 1e-6:
             continue
-        px, py = -dy / length, dx / length
+
+        # Convert the UV-space outward vector into region space. Doing it by
+        # transforming a second point keeps it correct under whatever pan and
+        # zoom the view is at, rather than assuming the axes stay aligned.
+        if run.ox or run.oy:
+            tipx, tipy = view.view_to_region(
+                run.ax + run.ox * _OUTWARD_PROBE,
+                run.ay + run.oy * _OUTWARD_PROBE, clip=False)
+            px, py = tipx - ax, tipy - ay
+            plen = (px * px + py * py) ** 0.5
+            if plen < 1e-9:
+                px, py = -dy / length, dx / length
+            else:
+                px, py = px / plen, py / plen
+        else:
+            px, py = -dy / length, dx / length
 
         if run.needs_heat_form and s.show_heat_form:
             color = heat
@@ -276,21 +309,26 @@ def draw_callback():
         else:
             color = convex if run.angle_deg >= 0 else concave
 
+        # The bracket sits clear of the piece, in the margin, so it can never
+        # be mistaken for a cut line -- the way the hand-drafted sheets do it.
+        off = tick * 1.2
+        bax, bay = ax + px * off, ay + py * off
+        bbx, bby = bx + px * off, by + py * off
+
         if s.show_brackets:
             bucket = segments.setdefault(color, [])
-            # The run itself, then a tick at each end -- the |--- 45° ---| mark.
-            bucket.extend([(ax, ay), (bx, by)])
-            bucket.extend([(ax - px * tick, ay - py * tick),
-                           (ax + px * tick, ay + py * tick)])
-            bucket.extend([(bx - px * tick, by - py * tick),
-                           (bx + px * tick, by + py * tick)])
+            # |--- ---| : the run offset outward, with a tick at each end
+            # reaching back toward the edge it measures.
+            bucket.extend([(bax, bay), (bbx, bby)])
+            bucket.extend([(ax, ay), (bax + px * tick * 0.5, bay + py * tick * 0.5)])
+            bucket.extend([(bx, by), (bbx + px * tick * 0.5, bby + py * tick * 0.5)])
 
         if run.has_dihedral and abs(run.angle_deg) >= s.min_angle:
             text = f"{abs(run.per_side_deg):.{s.decimals}f}°"
             if run.needs_heat_form and s.show_heat_form:
                 text += " HEAT"
-            labels.append((ax + dx * 0.5 + px * tick * 1.6,
-                           ay + dy * 0.5 + py * tick * 1.6, text, color))
+            labels.append(((bax + bbx) * 0.5 + px * tick * 0.9,
+                           (bay + bby) * 0.5 + py * tick * 0.9, text, color))
 
     _draw_lines(segments, max(1.0, scale))
 
