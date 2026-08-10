@@ -15,3 +15,6 @@ Thumbs.db
 
 # Agent worktrees
 .claude/worktrees/
+
+# Test screenshots (reference only)
+screenshots/
