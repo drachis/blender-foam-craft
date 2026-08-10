@@ -336,11 +336,14 @@ def draw_callback():
     px_per_uv = abs(unit_x - origin_x) or 1.0
 
     if s.scale_text_with_view:
-        angle_px = int(s.label_uv_fraction * px_per_uv * scale)
-        tick = s.tick_uv_fraction * px_per_uv * scale
+        # Sizes are thousandths of the UV sheet.
+        angle_px = int(s.angle_text_size / 1000.0 * px_per_uv * scale)
+        tick = s.mark_size / 1000.0 * px_per_uv * scale
+        number_px = int(s.number_size / 1000.0 * px_per_uv * scale)
     else:
         angle_px = int(s.font_size * scale)
         tick = s.tick_length_px * scale
+        number_px = int(s.island_id_font_size * scale)
     angle_px = max(6, min(angle_px, 400))
     tick = max(2.0, min(tick, 600.0))
     blf.size(font_id, angle_px)
@@ -490,10 +493,7 @@ def draw_callback():
         blf.draw(font_id, text)
 
     if s.show_island_ids:
-        # Piece numbers keep their proportion to the angle text, so both hold
-        # their relative sizes whichever mode is active.
-        ratio = s.island_id_font_size / max(1, s.font_size)
-        blf.size(font_id, max(6, min(int(angle_px * ratio), 500)))
+        blf.size(font_id, max(6, min(number_px, 500)))
         id_color = tuple(s.island_id_color)
         for u, v, text, key in _cache.island_labels:
             x, y = view.view_to_region(u, v, clip=False)
@@ -617,12 +617,13 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         layout.separator()
         layout.prop(s, "scale_text_with_view")
         if s.scale_text_with_view:
-            layout.prop(s, "label_uv_fraction")
-            layout.prop(s, "tick_uv_fraction")
+            layout.prop(s, "angle_text_size")
+            layout.prop(s, "mark_size")
+            layout.prop(s, "number_size")
         else:
             layout.prop(s, "font_size")
             layout.prop(s, "tick_length_px")
-        layout.prop(s, "island_id_font_size")
+            layout.prop(s, "island_id_font_size")
         layout.prop(s, "decimals")
         layout.prop(s, "min_angle")
         layout.prop(s, "convex_color")
@@ -643,6 +644,27 @@ class IMAGE_PT_foam_craft_advice(bpy.types.Panel):
         s = _settings(context)
         if s is None:
             return
+        # Real-world size of what is being built, so the sheet figures below
+        # can be judged against it without leaving the panel.
+        objects = getattr(context, "objects_in_mode", None) or []
+        if not objects and context.edit_object:
+            objects = [context.edit_object]
+        meshes = [o for o in objects if o and o.type == 'MESH']
+        if meshes:
+            unit = context.scene.unit_settings.scale_length
+            box = layout.box()
+            box.label(text="Model Size", icon='FIXED_SIZE')
+            for obj in meshes:
+                w, d, h = (v * unit for v in obj.dimensions)
+                if len(meshes) > 1:
+                    box.label(text=obj.name)
+                # One row each: the sidebar is narrow enough that two
+                # dimensions on a line get truncated mid-number.
+                col = box.column(align=True)
+                col.scale_y = 0.85
+                for axis, value in (("W", w), ("D", d), ("H", h)):
+                    col.label(text=f"{axis}  {_fmt_len(value)}")
+
         row = layout.row(align=True)
         row.prop(s, "sheet_width")
         row.prop(s, "sheet_height")
@@ -665,6 +687,20 @@ class IMAGE_PT_foam_craft_advice(bpy.types.Panel):
                 for para in finding.advice.split("\n"):
                     for line in _wrap(para, 46):
                         sub.label(text=line)
+
+
+def _fmt_len(metres):
+    """Length in whichever unit reads naturally, plus inches for the workshop.
+
+    Foam stock is bought in imperial here while Blender works in metres, so
+    showing both saves converting in your head at the saw.
+    """
+    inches = metres * 39.3701
+    if metres >= 1.0:
+        return f"{metres:.2f} m ({inches / 12.0:.1f} ft)"
+    if metres >= 0.01:
+        return f"{metres * 100.0:.1f} cm ({inches:.1f} in)"
+    return f"{metres * 1000.0:.0f} mm ({inches:.2f} in)"
 
 
 def _wrap(text, width):
