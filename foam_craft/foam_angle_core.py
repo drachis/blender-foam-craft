@@ -288,11 +288,20 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
                            max_angle_variation_deg, island_index=0):
     """Split one boundary cycle into DartRuns.
 
-    Greedy forward scan: extend a run while it stays inside both tolerances,
-    close it when either is exceeded, then start the next run. Greedy (rather
-    than a global optimum like Douglas-Peucker) matches the physical process --
-    runs are cut one after another along the edge, each as long as the material
-    and the saw allow.
+    A run is one continuous pass at one blade tilt, so the angle staying put is
+    what defines it. Straightness is a separate, optional concern: a band saw
+    happily follows a curve at a fixed tilt, and only a table saw needs the cut
+    to be straight. Pass ``max_chord_deviation <= 0`` to drop the straightness
+    constraint entirely, which is the default -- otherwise a curved edge held at
+    a constant angle gets chopped into several runs carrying the same number,
+    which is exactly what the hand-drafted sheets do not do: they draw one
+    bracket across the whole stretch with the angle written once.
+
+    Greedy forward scan: extend a run while it stays inside the active
+    tolerances, close it when one is exceeded, then start the next. Greedy
+    (rather than a global optimum like Douglas-Peucker) matches the physical
+    process -- runs are cut one after another along the edge, each as long as
+    the material and the saw allow.
 
     The scan starts at the sharpest corner of the cycle so a run never straddles
     an obvious physical break.
@@ -358,7 +367,8 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
             span = angles[i:j + 1]
             if (max(span) - min(span)) > max_angle_variation_deg:
                 break
-            if _run_deviation(points, i, j + 1) > max_chord_deviation:
+            if max_chord_deviation > 0.0 and \
+                    _run_deviation(points, i, j + 1) > max_chord_deviation:
                 break
             j += 1
         span = angles[i:j]

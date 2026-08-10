@@ -58,19 +58,21 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
         subtype='DISTANCE', unit='LENGTH', precision=4)
 
     # --- Dart run segmentation
-    max_chord_deviation: bpy.props.FloatProperty(
-        name="Max Deviation",
-        description="How far a straight cut may stray from the true surface "
-                    "before the run is broken and a dart placed. This is the "
-                    "main control over how many darts appear",
-        default=0.003, min=0.0001, max=0.1,
-        subtype='DISTANCE', unit='LENGTH', precision=4)
     max_angle_variation_deg: bpy.props.FloatProperty(
         name="Max Angle Variation",
         description="How much the bevel angle may drift along one run. One run "
-                    "is one pass at one blade tilt, so a wide drift means the "
-                    "cut no longer matches the surface",
+                    "is one pass at one blade tilt, so this is what decides "
+                    "where a run ends and the next begins",
         default=10.0, min=0.5, max=90.0)
+    max_chord_deviation: bpy.props.FloatProperty(
+        name="Straight Cut Limit",
+        description="Only for straight-cut tools. How far a run may bow away "
+                    "from a straight line before it is split. Zero means no "
+                    "limit, correct for a band saw, which follows a curve at a "
+                    "fixed blade tilt. Raise above zero only for a table saw, "
+                    "where every pass has to be straight",
+        default=0.0, min=0.0, max=0.1,
+        subtype='DISTANCE', unit='LENGTH', precision=4)
     dissolve_angle_limit_deg: bpy.props.FloatProperty(
         name="Pre-simplify Angle",
         description="Optional Decimate (Planar) pre-pass, delimited by UV and "
