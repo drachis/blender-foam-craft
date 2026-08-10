@@ -161,6 +161,14 @@ def register():
         type=FoldAngleOverlaySettings)
 
     global _draw_handle
+    # Never stack handlers: a reload that registers without unregistering
+    # leaves the old callback attached forever, still drawing from dead data.
+    if _draw_handle is not None:
+        try:
+            bpy.types.SpaceImageEditor.draw_handler_remove(_draw_handle, 'WINDOW')
+        except ValueError:
+            pass
+        _draw_handle = None
     _draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
         draw_callback, (), 'WINDOW', 'POST_PIXEL')
 
@@ -168,7 +176,10 @@ def register():
 def unregister():
     global _draw_handle
     if _draw_handle is not None:
-        bpy.types.SpaceImageEditor.draw_handler_remove(_draw_handle, 'WINDOW')
+        try:
+            bpy.types.SpaceImageEditor.draw_handler_remove(_draw_handle, 'WINDOW')
+        except ValueError:
+            pass
         _draw_handle = None
 
     del bpy.types.Scene.fold_angle_overlay
