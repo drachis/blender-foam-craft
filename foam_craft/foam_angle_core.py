@@ -7,13 +7,18 @@ foam workflow (foam_panel_tabs) import from here.
 
 import sys
 from dataclasses import dataclass, field
-from math import degrees, tan, cos, radians
+from math import acos, degrees, tan, cos, radians
 
 from mathutils import Vector
 
 # UV coordinates closer than this are treated as the same point when deciding
 # whether two faces share a UV island boundary.
 UV_EPSILON = 1e-6
+
+# Turn beyond which a boundary vertex counts as a corner rather than part of a
+# curve. Corners break a run: one angle guide should belong to one edge, and
+# running it through a corner produces a mark that describes neither side.
+CORNER_ANGLE_DEG = 35.0
 
 
 def dihedral_angle_deg(edge):
@@ -266,6 +271,10 @@ class DartRun:
     # real shape instead.
     uv_points: list = field(default_factory=list, repr=False)
     uv_normals: list = field(default_factory=list, repr=False)
+    # Indices into uv_points where a relief dart belongs. Interior vertices
+    # only, and only concave ones -- a convex vertex already has its material
+    # falling away and needs nothing released.
+    dart_indices: list = field(default_factory=list, repr=False)
     # False when the run lies on an open mesh boundary (the rim of the sculpt)
     # rather than a seam against another panel. Such a run has no facing piece,
     # so there is no dihedral to split and no saw bevel to set -- distinct from
@@ -292,7 +301,8 @@ def _run_deviation(points, i, j):
 
 
 def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
-                           max_angle_variation_deg, island_index=0):
+                           max_angle_variation_deg, island_index=0,
+                           corner_angle_deg=CORNER_ANGLE_DEG):
     """Split one boundary cycle into DartRuns.
 
     A run is one continuous pass at one blade tilt, so the angle staying put is
@@ -377,26 +387,59 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
                                  if dl > 1e-12 else Vector((0.0, 0.0)))
 
     closed = (uvs[0] - uvs[-1]).length < 1e-9
-    cycle_normals = []
+    # Two normals per vertex: the one approaching it and the one leaving it.
+    # On a gentle bend they are the same blended vector, so brackets either
+    # side meet seamlessly. At a genuine corner, blending would give a bisector
+    # that suits neither edge and visually welds two separate brackets into
+    # one, so each side keeps its own normal and the brackets stay distinct.
+    normals_in, normals_out, corner_flags = [], [], []
     for k in range(len(uvs)):
         before = cycle_seg_normals[k - 1] if k > 0 else (
             cycle_seg_normals[-1] if closed else None)
         after = cycle_seg_normals[k] if k < len(cycle_seg_normals) else (
             cycle_seg_normals[0] if closed else None)
-        if before is None:
-            blended = after.copy()
-        elif after is None:
-            blended = before.copy()
+        if before is None or after is None:
+            single = (after if before is None else before).copy()
+            normals_in.append(single)
+            normals_out.append(single.copy())
+            corner_flags.append(False)
+            continue
+        cosine = max(-1.0, min(1.0, before.dot(after)))
+        turn = degrees(acos(cosine))
+        if turn >= corner_angle_deg:
+            normals_in.append(before.copy())
+            normals_out.append(after.copy())
+            corner_flags.append(True)
         else:
             blended = before + after
-        cycle_normals.append(blended.normalized() if blended.length > 1e-12
-                             else (after or before).copy())
+            blended = (blended.normalized() if blended.length > 1e-12
+                       else after.copy())
+            normals_in.append(blended)
+            normals_out.append(blended.copy())
+            corner_flags.append(False)
+
+    # Convexity of each boundary vertex, as seen from the material. Sign of the
+    # turn combined with the loop's winding: a convex vertex is one where the
+    # outline bulges outward.
+    convex_flags = []
+    for k in range(len(uvs)):
+        if k == 0 or k >= len(uvs) - 1:
+            convex_flags.append(not closed)
+            continue
+        v1 = uvs[k] - uvs[k - 1]
+        v2 = uvs[k + 1] - uvs[k]
+        convex_flags.append((v1.x * v2.y - v1.y * v2.x) * winding > 0.0)
 
     runs = []
     i = 0
     while i < n:
         j = i + 1  # run covers cycle[i:j]; always at least one edge
         while j < n:
+            # A corner is a physical break in the outline. Running one bracket
+            # through it welds two separate edges into a single mark that
+            # belongs to neither.
+            if corner_flags[j]:
+                break
             # A seam and an open rim are different cuts -- never merge them.
             if measured[j] != measured[i]:
                 break
@@ -419,9 +462,23 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
         else:
             outward = Vector((0.0, 0.0))
 
-        # This run's slice of the shared outline and vertex normals.
+        # This run's slice of the shared outline. Its first vertex takes the
+        # leaving normal and its last the approaching one, so at a corner each
+        # side keeps the normal belonging to its own edge.
         pts = [uvs[k].copy() for k in range(i, j + 1)]
-        normals = [cycle_normals[k].copy() for k in range(i, j + 1)]
+        normals = []
+        for k in range(i, j + 1):
+            if k == i:
+                normals.append(normals_out[k].copy())
+            elif k == j:
+                normals.append(normals_in[k].copy())
+            else:
+                normals.append(normals_in[k].copy())
+        # Dart marks belong at the interior vertices, and only where the
+        # outline turns inward: a convex vertex already has its material
+        # falling away, so nothing needs releasing there.
+        darts = [(k - i) for k in range(i + 1, j)
+                 if not convex_flags[k]]
         runs.append(DartRun(
             island_index=island_index,
             loops=seg,
@@ -436,6 +493,7 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
             uv_outward=outward,
             uv_points=pts,
             uv_normals=normals,
+            dart_indices=darts,
         ))
         i = j
     return runs
@@ -443,7 +501,8 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
 
 def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
                                 max_angle_variation_deg, only_selected=False,
-                                islands=None):
+                                islands=None,
+                                corner_angle_deg=CORNER_ANGLE_DEG):
     """Yield a DartRun for every saw pass along every UV island boundary.
 
     This replaces per-mesh-edge iteration: foam flexes between darts, so a dart
@@ -456,7 +515,8 @@ def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
         for cycle in island_boundary_cycles(faces, uv_layer):
             for run in segment_boundary_cycle(
                     cycle, uv_layer, max_chord_deviation,
-                    max_angle_variation_deg, island_index=index):
+                    max_angle_variation_deg, island_index=index,
+                    corner_angle_deg=corner_angle_deg):
                 yield run
 
 

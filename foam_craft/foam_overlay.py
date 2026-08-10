@@ -70,6 +70,10 @@ class _RunMark(NamedTuple):
     # the bracket can be offset along the real edge rather than drawn as a
     # straight chord between the endpoints of a curved run.
     outline: tuple = ()
+    # ((u, v, tu, tv, nu, nv), ...) -- where a relief dart goes, with the edge
+    # tangent and outward normal there, so the mark can be drawn as a T lying
+    # along the boundary with its stem cut into the material.
+    darts: tuple = ()
 
 
 class _OverlayCache:
@@ -192,10 +196,23 @@ def _rebuild(pairs, s):
                 (p.x, p.y, n.x, n.y)
                 for p, n in zip(run.uv_points, run.uv_normals))
 
+            dart_marks = []
+            for k in run.dart_indices:
+                pt = run.uv_points[k]
+                nrm = run.uv_normals[k]
+                nxt = run.uv_points[min(k + 1, len(run.uv_points) - 1)]
+                prv = run.uv_points[max(k - 1, 0)]
+                tangent = nxt - prv
+                if tangent.length > 1e-12:
+                    tangent = tangent.normalized()
+                dart_marks.append((pt.x, pt.y, tangent.x, tangent.y,
+                                   nrm.x, nrm.y))
+            darts = tuple(dart_marks)
+
             runs.append(_RunMark(
                 run.uv_start.x, run.uv_start.y, run.uv_end.x, run.uv_end.y,
                 run.mean_angle_deg, per_side, run.has_dihedral, heat, ox, oy,
-                outline))
+                outline, darts))
 
         # Piece numbers come from the numbering operator's attribute when it
         # has been run; otherwise fall back to island order so the overlay
@@ -282,6 +299,7 @@ def draw_callback():
 
     segments = {}
     labels = []
+    dart_seen = {}
 
     for run in _cache.runs:
         ax, ay = view.view_to_region(run.ax, run.ay, clip=False)
@@ -355,27 +373,17 @@ def draw_callback():
                 bucket.extend([(bxp - nxp * tick * 0.5, byp - nyp * tick * 0.5),
                                (bxp + nxp * tick * 0.5, byp + nyp * tick * 0.5)])
 
-        # Relief cuts are a different mark entirely: they sit at the vertices
-        # along the edge, they go only into the material, and they are the cuts
-        # themselves rather than an annotation. Depth follows how hard the
-        # boundary turns there -- a tighter corner has to open further to let
-        # the panel curve, so it needs more material taken out.
-        if s.show_brackets and len(bracket) > 2:
-            bucket = segments.setdefault(color, [])
-            for k in range(1, len(bracket) - 1):
-                _bx0, _by0, ex, ey, nx0, ny0 = bracket[k]
-                prev_e = bracket[k - 1]
-                next_e = bracket[k + 1]
-                v1x, v1y = ex - prev_e[2], ey - prev_e[3]
-                v2x, v2y = next_e[2] - ex, next_e[3] - ey
-                l1 = (v1x * v1x + v1y * v1y) ** 0.5
-                l2 = (v2x * v2x + v2y * v2y) ** 0.5
-                if l1 < 1e-9 or l2 < 1e-9:
+        # Relief cuts are a different mark from the angle guide: they are the
+        # cuts themselves. Drawn as a T lying on the boundary -- the bar runs
+        # along the edge, the stem goes into the material and never out of it.
+        # Collected per vertex rather than per run so a vertex shared by two
+        # runs gets one mark, not two crossing into an X.
+        if s.show_brackets:
+            for u, v, tu, tv, nu, nv in run.darts:
+                key = (round(u, 6), round(v, 6))
+                if key in dart_seen:
                     continue
-                cosine = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) / (l1 * l2)))
-                turn = degrees(acos(cosine))
-                depth = tick * (0.45 + 1.05 * min(turn / 45.0, 1.0))
-                bucket.extend([(ex, ey), (ex - nx0 * depth, ey - ny0 * depth)])
+                dart_seen[key] = (tu, tv, nu, nv, color)
 
         if run.has_dihedral and abs(run.angle_deg) >= s.min_angle:
             text = f"{abs(run.per_side_deg):.{s.decimals}f}°"
@@ -395,6 +403,29 @@ def draw_callback():
             # position now: the text has to clear its own height to stay off
             # the piece, and that is only known once the font is measured.
             labels.append((mx, my, nx / nlen, ny / nlen, text, color))
+
+    for (u, v), (tu, tv, nu, nv, color) in dart_seen.items():
+        px0, py0 = view.view_to_region(u, v, clip=False)
+        if not all(abs(c) < 1e6 for c in (px0, py0)):
+            continue
+        tx, ty = view.view_to_region(u + tu * _OUTWARD_PROBE,
+                                     v + tv * _OUTWARD_PROBE, clip=False)
+        nx2, ny2 = view.view_to_region(u + nu * _OUTWARD_PROBE,
+                                       v + nv * _OUTWARD_PROBE, clip=False)
+        tdx, tdy = tx - px0, ty - py0
+        ndx, ndy = nx2 - px0, ny2 - py0
+        tl = (tdx * tdx + tdy * tdy) ** 0.5
+        nl = (ndx * ndx + ndy * ndy) ** 0.5
+        if tl < 1e-9 or nl < 1e-9:
+            continue
+        tdx, tdy = tdx / tl, tdy / tl
+        ndx, ndy = ndx / nl, ndy / nl
+        bucket = segments.setdefault(color, [])
+        bar = tick * 0.55
+        stem = tick * 1.1
+        bucket.extend([(px0 - tdx * bar, py0 - tdy * bar),
+                       (px0 + tdx * bar, py0 + tdy * bar)])
+        bucket.extend([(px0, py0), (px0 - ndx * stem, py0 - ndy * stem)])
 
     _draw_lines(segments, max(1.0, scale))
 
