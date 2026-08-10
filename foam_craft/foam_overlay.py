@@ -15,6 +15,7 @@ of them -- and a draw handler fires on every redraw, so results are cached and
 recomputed only when something that affects them actually changes.
 """
 
+from math import acos, degrees
 from typing import NamedTuple
 
 import blf
@@ -65,6 +66,10 @@ class _RunMark(NamedTuple):
     # perpendicular arbitrarily.
     ox: float = 0.0
     oy: float = 0.0
+    # ((u, v, nu, nv), ...) -- the run's outline with its outward normals, so
+    # the bracket can be offset along the real edge rather than drawn as a
+    # straight chord between the endpoints of a curved run.
+    outline: tuple = ()
 
 
 class _OverlayCache:
@@ -183,9 +188,14 @@ def _rebuild(pairs, s):
             ox, oy = (run.uv_outward.x, run.uv_outward.y) \
                 if run.uv_outward is not None else (0.0, 0.0)
 
+            outline = tuple(
+                (p.x, p.y, n.x, n.y)
+                for p, n in zip(run.uv_points, run.uv_normals))
+
             runs.append(_RunMark(
                 run.uv_start.x, run.uv_start.y, run.uv_end.x, run.uv_end.y,
-                run.mean_angle_deg, per_side, run.has_dihedral, heat, ox, oy))
+                run.mean_angle_deg, per_side, run.has_dihedral, heat, ox, oy,
+                outline))
 
         # Piece numbers come from the numbering operator's attribute when it
         # has been run; otherwise fall back to island order so the overlay
@@ -311,24 +321,78 @@ def draw_callback():
 
         # The bracket sits clear of the piece, in the margin, so it can never
         # be mistaken for a cut line -- the way the hand-drafted sheets do it.
+        # It follows the edge's own shape: a run can span a curve, and a
+        # straight chord across it would not read as belonging to that edge.
         off = tick * 1.2
-        bax, bay = ax + px * off, ay + py * off
-        bbx, bby = bx + px * off, by + py * off
+        bracket = []
+        for u, v, nu, nv in run.outline:
+            sx, sy = view.view_to_region(u, v, clip=False)
+            tx, ty = view.view_to_region(u + nu * _OUTWARD_PROBE,
+                                         v + nv * _OUTWARD_PROBE, clip=False)
+            dxn, dyn = tx - sx, ty - sy
+            nlen = (dxn * dxn + dyn * dyn) ** 0.5
+            if nlen < 1e-9:
+                dxn, dyn = px, py
+            else:
+                dxn, dyn = dxn / nlen, dyn / nlen
+            bracket.append((sx + dxn * off, sy + dyn * off, sx, sy, dxn, dyn))
+
+        if not bracket:
+            bracket = [(ax + px * off, ay + py * off, ax, ay, px, py),
+                       (bx + px * off, by + py * off, bx, by, px, py)]
+
+        bax, bay = bracket[0][0], bracket[0][1]
+        bbx, bby = bracket[-1][0], bracket[-1][1]
 
         if s.show_brackets:
             bucket = segments.setdefault(color, [])
-            # |--- ---| : the run offset outward, with a tick at each end
-            # reaching back toward the edge it measures.
-            bucket.extend([(bax, bay), (bbx, bby)])
-            bucket.extend([(ax, ay), (bax + px * tick * 0.5, bay + py * tick * 0.5)])
-            bucket.extend([(bx, by), (bbx + px * tick * 0.5, bby + py * tick * 0.5)])
+            # The offset outline, segment by segment, so it hugs the curve.
+            for (x0, y0, *_), (x1, y1, *_) in zip(bracket, bracket[1:]):
+                bucket.extend([(x0, y0), (x1, y1)])
+            # Ends are drawn as a T: a bar crossing the bracket both ways, which
+            # is how a dimension line terminates on the reference sheets.
+            for bxp, byp, _ex, _ey, nxp, nyp in (bracket[0], bracket[-1]):
+                bucket.extend([(bxp - nxp * tick * 0.5, byp - nyp * tick * 0.5),
+                               (bxp + nxp * tick * 0.5, byp + nyp * tick * 0.5)])
+
+        # Relief cuts are a different mark entirely: they sit at the vertices
+        # along the edge, they go only into the material, and they are the cuts
+        # themselves rather than an annotation. Depth follows how hard the
+        # boundary turns there -- a tighter corner has to open further to let
+        # the panel curve, so it needs more material taken out.
+        if s.show_brackets and len(bracket) > 2:
+            bucket = segments.setdefault(color, [])
+            for k in range(1, len(bracket) - 1):
+                _bx0, _by0, ex, ey, nx0, ny0 = bracket[k]
+                prev_e = bracket[k - 1]
+                next_e = bracket[k + 1]
+                v1x, v1y = ex - prev_e[2], ey - prev_e[3]
+                v2x, v2y = next_e[2] - ex, next_e[3] - ey
+                l1 = (v1x * v1x + v1y * v1y) ** 0.5
+                l2 = (v2x * v2x + v2y * v2y) ** 0.5
+                if l1 < 1e-9 or l2 < 1e-9:
+                    continue
+                cosine = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) / (l1 * l2)))
+                turn = degrees(acos(cosine))
+                depth = tick * (0.45 + 1.05 * min(turn / 45.0, 1.0))
+                bucket.extend([(ex, ey), (ex - nx0 * depth, ey - ny0 * depth)])
 
         if run.has_dihedral and abs(run.angle_deg) >= s.min_angle:
             text = f"{abs(run.per_side_deg):.{s.decimals}f}°"
             if run.needs_heat_form and s.show_heat_form:
                 text += " HEAT"
-            labels.append(((bax + bbx) * 0.5 + px * tick * 0.9,
-                           (bay + bby) * 0.5 + py * tick * 0.9, text, color))
+            # Sit the number against the middle of the bracket as drawn, which
+            # on a curved run is nowhere near the midpoint of its chord.
+            mid = len(bracket) // 2
+            if len(bracket) % 2 == 0:
+                a_pt, b_pt = bracket[mid - 1], bracket[mid]
+                mx, my = (a_pt[0] + b_pt[0]) * 0.5, (a_pt[1] + b_pt[1]) * 0.5
+                nx, ny = (a_pt[4] + b_pt[4]) * 0.5, (a_pt[5] + b_pt[5]) * 0.5
+            else:
+                mx, my, _, _, nx, ny = bracket[mid]
+            nlen = (nx * nx + ny * ny) ** 0.5 or 1.0
+            labels.append((mx + nx / nlen * tick * 0.9,
+                           my + ny / nlen * tick * 0.9, text, color))
 
     _draw_lines(segments, max(1.0, scale))
 

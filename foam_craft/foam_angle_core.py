@@ -259,6 +259,13 @@ class DartRun:
     # outlines, and real pieces are frequently concave, where the centroid test
     # silently puts annotations and darts on the wrong side.
     uv_outward: object = None
+    # The run's own outline in UV space: every vertex it passes through, plus a
+    # matching outward normal at each. A run can span several mesh edges along a
+    # curve, so a straight line between its endpoints would not sit against the
+    # edge it annotates. Offsetting these points along their normals traces the
+    # real shape instead.
+    uv_points: list = field(default_factory=list, repr=False)
+    uv_normals: list = field(default_factory=list, repr=False)
     # False when the run lies on an open mesh boundary (the rim of the sculpt)
     # rather than a seam against another panel. Such a run has no facing piece,
     # so there is no dihedral to split and no saw bevel to set -- distinct from
@@ -382,6 +389,29 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
             outward = Vector((run_uv.y, -run_uv.x)) * (winding / run_len)
         else:
             outward = Vector((0.0, 0.0))
+
+        # Outline of this run, with an outward normal at every vertex. Interior
+        # vertices average the normals of the two segments meeting there, so an
+        # offset copy follows the curve without kinking at each joint.
+        pts = [uvs[k].copy() for k in range(i, j + 1)]
+        seg_normals = []
+        for k in range(len(pts) - 1):
+            d = pts[k + 1] - pts[k]
+            dl = d.length
+            seg_normals.append(Vector((d.y, -d.x)) * (winding / dl)
+                               if dl > 1e-12 else Vector((0.0, 0.0)))
+        normals = []
+        for k in range(len(pts)):
+            if not seg_normals:
+                normals.append(Vector((0.0, 0.0)))
+            elif k == 0:
+                normals.append(seg_normals[0].copy())
+            elif k == len(pts) - 1:
+                normals.append(seg_normals[-1].copy())
+            else:
+                blended = seg_normals[k - 1] + seg_normals[k]
+                normals.append(blended.normalized() if blended.length > 1e-12
+                               else seg_normals[k].copy())
         runs.append(DartRun(
             island_index=island_index,
             loops=seg,
@@ -394,6 +424,8 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
             chord_deviation=_run_deviation(points, i, j),
             has_dihedral=measured[i],
             uv_outward=outward,
+            uv_points=pts,
+            uv_normals=normals,
         ))
         i = j
     return runs
