@@ -142,10 +142,32 @@ def _edit_meshes(context):
     return out
 
 
+def _selection_fingerprint(bm):
+    """Cheap fingerprint of which faces are selected.
+
+    Without this the overlay only noticed a selection change when some other
+    setting happened to change too, so "Only Selected" appeared to need
+    toggling before it would follow a new selection. Sampled at a fixed cost
+    like the UV fingerprint, since this runs on every draw.
+    """
+    faces = bm.faces
+    if not faces:
+        return 0
+    step = max(1, len(faces) // _UV_SAMPLE_COUNT)
+    total = 0
+    count = 0
+    for i in range(0, len(faces), step):
+        if faces[i].select:
+            total += i + 1
+            count += 1
+    return (count, total)
+
+
 def _signature(pairs, s):
     per_object = tuple(
         (obj.name, len(bm.verts), len(bm.edges), len(bm.faces),
-         _uv_fingerprint(bm, uv_layer))
+         _uv_fingerprint(bm, uv_layer),
+         _selection_fingerprint(bm) if s.only_selected else 0)
         for obj, bm, uv_layer in pairs
     )
     return (
@@ -178,6 +200,7 @@ def _rebuild(pairs, s):
     runs = []
     labels = []
     flagged = set()
+    heat_islands = set()
 
     for obj, bm, uv_layer in pairs:
         islands = core.uv_islands(bm, uv_layer, s.only_selected)
@@ -215,6 +238,9 @@ def _rebuild(pairs, s):
                                    nrm.x, nrm.y))
             darts = tuple(dart_marks)
 
+            if heat:
+                heat_islands.add((obj.name, run.island_index))
+
             runs.append(_RunMark(
                 run.uv_start.x, run.uv_start.y, run.uv_end.x, run.uv_end.y,
                 run.mean_angle_deg, per_side, run.has_dihedral, heat, ox, oy,
@@ -246,7 +272,11 @@ def _rebuild(pairs, s):
 
     _cache.runs = runs
     _cache.island_labels = labels
-    _cache.stretch_islands = flagged
+    # Heat forming is a property of a piece, not of a single cut: either some
+    # seam on it is too steep to saw, or the piece will not lie flat at all.
+    # Marking every affected run cluttered the sheet without telling the user
+    # anything the piece-level flag does not.
+    _cache.stretch_islands = flagged | heat_islands
 
 
 def _ensure_cache(context, s):
@@ -352,9 +382,7 @@ def draw_callback():
         else:
             px, py = -dy / length, dx / length
 
-        if run.needs_heat_form and s.show_heat_form:
-            color = heat
-        elif not s.show_dart_colors:
+        if not s.show_dart_colors:
             color = convex
         else:
             color = convex if run.angle_deg >= 0 else concave
@@ -409,8 +437,6 @@ def draw_callback():
 
         if run.has_dihedral and abs(run.angle_deg) >= s.min_angle:
             text = f"{abs(run.per_side_deg):.{s.decimals}f}°"
-            if run.needs_heat_form and s.show_heat_form:
-                text += " HEAT"
             # Sit the number against the middle of the bracket as drawn, which
             # on a curved run is nowhere near the midpoint of its chord.
             mid = len(bracket) // 2
