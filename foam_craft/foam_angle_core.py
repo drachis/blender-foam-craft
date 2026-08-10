@@ -363,6 +363,35 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
         shoelace += uvs[k].x * uvs[k + 1].y - uvs[k + 1].x * uvs[k].y
     winding = 1.0 if shoelace >= 0.0 else -1.0
 
+    # Outward normal at every vertex of the cycle, computed once for the whole
+    # boundary rather than per run. Runs meet at shared vertices, and if each
+    # derived its own end normal from only its own last segment, the two
+    # brackets would part company there -- one of them ending up on the wrong
+    # side of the edge. Sharing the vertex normal makes neighbouring brackets
+    # meet exactly, at a single junction.
+    cycle_seg_normals = []
+    for k in range(len(uvs) - 1):
+        d = uvs[k + 1] - uvs[k]
+        dl = d.length
+        cycle_seg_normals.append(Vector((d.y, -d.x)) * (winding / dl)
+                                 if dl > 1e-12 else Vector((0.0, 0.0)))
+
+    closed = (uvs[0] - uvs[-1]).length < 1e-9
+    cycle_normals = []
+    for k in range(len(uvs)):
+        before = cycle_seg_normals[k - 1] if k > 0 else (
+            cycle_seg_normals[-1] if closed else None)
+        after = cycle_seg_normals[k] if k < len(cycle_seg_normals) else (
+            cycle_seg_normals[0] if closed else None)
+        if before is None:
+            blended = after.copy()
+        elif after is None:
+            blended = before.copy()
+        else:
+            blended = before + after
+        cycle_normals.append(blended.normalized() if blended.length > 1e-12
+                             else (after or before).copy())
+
     runs = []
     i = 0
     while i < n:
@@ -390,28 +419,9 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
         else:
             outward = Vector((0.0, 0.0))
 
-        # Outline of this run, with an outward normal at every vertex. Interior
-        # vertices average the normals of the two segments meeting there, so an
-        # offset copy follows the curve without kinking at each joint.
+        # This run's slice of the shared outline and vertex normals.
         pts = [uvs[k].copy() for k in range(i, j + 1)]
-        seg_normals = []
-        for k in range(len(pts) - 1):
-            d = pts[k + 1] - pts[k]
-            dl = d.length
-            seg_normals.append(Vector((d.y, -d.x)) * (winding / dl)
-                               if dl > 1e-12 else Vector((0.0, 0.0)))
-        normals = []
-        for k in range(len(pts)):
-            if not seg_normals:
-                normals.append(Vector((0.0, 0.0)))
-            elif k == 0:
-                normals.append(seg_normals[0].copy())
-            elif k == len(pts) - 1:
-                normals.append(seg_normals[-1].copy())
-            else:
-                blended = seg_normals[k - 1] + seg_normals[k]
-                normals.append(blended.normalized() if blended.length > 1e-12
-                               else seg_normals[k].copy())
+        normals = [cycle_normals[k].copy() for k in range(i, j + 1)]
         runs.append(DartRun(
             island_index=island_index,
             loops=seg,

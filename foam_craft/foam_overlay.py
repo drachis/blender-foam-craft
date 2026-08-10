@@ -391,13 +391,21 @@ def draw_callback():
             else:
                 mx, my, _, _, nx, ny = bracket[mid]
             nlen = (nx * nx + ny * ny) ** 0.5 or 1.0
-            labels.append((mx + nx / nlen * tick * 0.9,
-                           my + ny / nlen * tick * 0.9, text, color))
+            # Keep the normal with the anchor rather than resolving the
+            # position now: the text has to clear its own height to stay off
+            # the piece, and that is only known once the font is measured.
+            labels.append((mx, my, nx / nlen, ny / nlen, text, color))
 
     _draw_lines(segments, max(1.0, scale))
 
-    for x, y, text, color in labels:
+    for ax0, ay0, nx, ny, text, color in labels:
         width, height = blf.dimensions(font_id, text)
+        # Push the text out far enough that its own box clears the boundary.
+        # Projecting the half-extents onto the normal handles labels sitting
+        # against a diagonal edge, where half the height alone is not enough.
+        clearance = abs(nx) * width * 0.5 + abs(ny) * height * 0.5 + tick * 0.35
+        x = ax0 + nx * clearance
+        y = ay0 + ny * clearance
         blf.position(font_id, x - width / 2, y - height / 2, 0)
         blf.color(font_id, *color)
         blf.draw(font_id, text)
