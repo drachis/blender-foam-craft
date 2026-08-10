@@ -442,11 +442,11 @@ def draw_callback():
             continue
         tdx, tdy = tdx / tl, tdy / tl
         ndx, ndy = ndx / nl, ndy / nl
+        # A single stroke running inward from the boundary. No crossbar: the
+        # mark's job is to say "this cut goes into the material from here", and
+        # a bar lying on the edge reads as part of the outline instead.
         bucket = segments.setdefault(color, [])
-        bar = tick * 0.55
         stem = tick * 1.1
-        bucket.extend([(px0 - tdx * bar, py0 - tdy * bar),
-                       (px0 + tdx * bar, py0 + tdy * bar)])
         bucket.extend([(px0, py0), (px0 - ndx * stem, py0 - ndy * stem)])
 
     _draw_lines(segments, max(1.0, scale))

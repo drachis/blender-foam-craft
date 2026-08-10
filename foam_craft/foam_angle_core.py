@@ -474,11 +474,14 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
                 normals.append(normals_in[k].copy())
             else:
                 normals.append(normals_in[k].copy())
-        # Dart marks belong at the interior vertices, and only where the
-        # outline turns inward: a convex vertex already has its material
-        # falling away, so nothing needs releasing there.
+        # Dart marks belong at the interior vertices of the run, but not at
+        # corners: a corner of the piece already gets its shape from the bevel
+        # of the cuts meeting there, so a relief cut on top of that is
+        # redundant. Convexity deliberately does not filter here -- a dart can
+        # remove material to let a face close up, or open to give it room to
+        # stretch, so it is wanted on either kind of bend.
         darts = [(k - i) for k in range(i + 1, j)
-                 if not convex_flags[k]]
+                 if not corner_flags[k]]
         runs.append(DartRun(
             island_index=island_index,
             loops=seg,
