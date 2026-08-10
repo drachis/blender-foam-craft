@@ -18,7 +18,11 @@ from . import foam_angle_core
 
 
 class FoldAngleOverlaySettings(bpy.types.PropertyGroup):
-    show: bpy.props.BoolProperty(name="Show Fold Angles", default=True)
+    # Off by default. This overlay labels every mesh edge, which is right for
+    # paper but unreadable on a foam pattern, and with both overlays enabled
+    # the two sets of numbers sit on top of each other. Whichever workflow the
+    # user wants, they should turn it on deliberately.
+    show: bpy.props.BoolProperty(name="Show Fold Angles", default=False)
     convex_color: bpy.props.FloatVectorProperty(
         name="Convex (Mountain) Color",
         description="Color for edges bending toward you",

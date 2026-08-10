@@ -35,6 +35,11 @@ def _start():
         print('FoamCraft launcher: MCP add-on is not enabled')
         return None
     prefs = bpy.context.preferences.addons[addon].preferences
+    # The splash covers the viewport and would land in every screenshot.
+    try:
+        bpy.ops.wm.splash_close()
+    except (AttributeError, RuntimeError):
+        pass
     prefs.host, prefs.port = 'localhost', {port}
     if not getattr(prefs, 'use_online_access', True):
         try:

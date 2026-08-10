@@ -131,6 +131,24 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
     tick_length_px: bpy.props.FloatProperty(name="Tick Length", default=10.0,
                                             min=1.0, max=100.0)
     font_size: bpy.props.IntProperty(name="Angle Text Size", default=13, min=6, max=60)
+    label_uv_fraction: bpy.props.FloatProperty(
+        name="Angle Text (% of UV)",
+        description="Height of the angle numbers as a fraction of UV space. "
+                    "The numbers then hold their size relative to the pattern "
+                    "as you zoom, the way they would if printed on it, rather "
+                    "than staying a fixed number of screen pixels",
+        default=0.016, min=0.002, max=0.2, precision=4)
+    tick_uv_fraction: bpy.props.FloatProperty(
+        name="Mark Size (% of UV)",
+        description="Length of the guide ticks and dart marks as a fraction of "
+                    "UV space, so they hold their size against the pattern "
+                    "rather than against the screen",
+        default=0.010, min=0.001, max=0.2, precision=4)
+    scale_text_with_view: bpy.props.BoolProperty(
+        name="Marks Scale With Pattern", default=True,
+        description="Size every mark and number relative to the pattern, the "
+                    "way they would be if printed on it. Off falls back to "
+                    "fixed screen sizes")
     island_id_font_size: bpy.props.IntProperty(name="Number Size", default=20,
                                                min=6, max=120)
     decimals: bpy.props.IntProperty(name="Decimals", default=0, min=0, max=2)

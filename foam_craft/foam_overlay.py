@@ -41,6 +41,10 @@ _UV_SAMPLE_COUNT = 240
 # precision of the view transform at ordinary zoom levels.
 _OUTWARD_PROBE = 1e-3
 
+# Where the draw handle is parked so it outlives a module reload. See
+# _drop_existing_handler().
+_HANDLE_KEY = "foam_craft_overlay_draw_handle"
+
 
 class _RunMark(NamedTuple):
     """One cut run, reduced to plain numbers.
@@ -289,9 +293,25 @@ def draw_callback():
 
     view = region.view2d
     scale = s.overlay_scale
-    tick = s.tick_length_px * scale
     font_id = 0
-    blf.size(font_id, max(6, int(s.font_size * scale)))
+
+    # Screen pixels per unit of UV space at the current zoom. Sizing the text
+    # from this keeps it a constant fraction of the pattern, so a number holds
+    # its place against the piece it labels no matter how far in you zoom --
+    # a fixed pixel size instead shrinks relative to the pattern as it grows.
+    origin_x, origin_y = view.view_to_region(0.0, 0.0, clip=False)
+    unit_x, unit_y = view.view_to_region(1.0, 0.0, clip=False)
+    px_per_uv = abs(unit_x - origin_x) or 1.0
+
+    if s.scale_text_with_view:
+        angle_px = int(s.label_uv_fraction * px_per_uv * scale)
+        tick = s.tick_uv_fraction * px_per_uv * scale
+    else:
+        angle_px = int(s.font_size * scale)
+        tick = s.tick_length_px * scale
+    angle_px = max(6, min(angle_px, 400))
+    tick = max(2.0, min(tick, 600.0))
+    blf.size(font_id, angle_px)
 
     convex = tuple(s.convex_color)
     concave = tuple(s.concave_color)
@@ -442,7 +462,10 @@ def draw_callback():
         blf.draw(font_id, text)
 
     if s.show_island_ids:
-        blf.size(font_id, max(6, int(s.island_id_font_size * scale)))
+        # Piece numbers keep their proportion to the angle text, so both hold
+        # their relative sizes whichever mode is active.
+        ratio = s.island_id_font_size / max(1, s.font_size)
+        blf.size(font_id, max(6, min(int(angle_px * ratio), 500)))
         id_color = tuple(s.island_id_color)
         for u, v, text, key in _cache.island_labels:
             x, y = view.view_to_region(u, v, clip=False)
@@ -562,8 +585,13 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         s = _settings(context)
         if s is None:
             return
-        layout.prop(s, "tick_length_px")
-        layout.prop(s, "font_size")
+        layout.prop(s, "scale_text_with_view")
+        if s.scale_text_with_view:
+            layout.prop(s, "label_uv_fraction")
+            layout.prop(s, "tick_uv_fraction")
+        else:
+            layout.prop(s, "font_size")
+            layout.prop(s, "tick_length_px")
         layout.prop(s, "island_id_font_size")
         layout.prop(s, "decimals")
         layout.prop(s, "min_angle")
@@ -634,29 +662,42 @@ _classes = (
 )
 
 
+def _drop_existing_handler():
+    """Remove any handler this add-on previously installed, including one left
+    by an earlier copy of this module.
+
+    The handle is parked in driver_namespace rather than only in a module
+    global because reloading during development replaces the module object:
+    the new copy starts with _draw_handle None while Blender still holds the
+    old copy's callback, so both draw and every mark appears twice. A namespace
+    that outlives the module is the only place a successor can find it.
+    """
+    global _draw_handle
+    for handle in (_draw_handle, bpy.app.driver_namespace.get(_HANDLE_KEY)):
+        if handle is None:
+            continue
+        try:
+            bpy.types.SpaceImageEditor.draw_handler_remove(handle, 'WINDOW')
+        except (ValueError, TypeError):
+            pass
+    _draw_handle = None
+    bpy.app.driver_namespace.pop(_HANDLE_KEY, None)
+
+
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     global _draw_handle
-    # Never stack handlers. A reload that registers without unregistering would
-    # otherwise leave the previous callback attached forever, and every stale
-    # copy keeps drawing from its own dead cache.
-    if _draw_handle is not None:
-        try:
-            bpy.types.SpaceImageEditor.draw_handler_remove(_draw_handle, 'WINDOW')
-        except ValueError:
-            pass
-        _draw_handle = None
+    _drop_existing_handler()
     _cache.signature = None
     _draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
         draw_callback, (), 'WINDOW', 'POST_PIXEL')
+    bpy.app.driver_namespace[_HANDLE_KEY] = _draw_handle
 
 
 def unregister():
-    global _draw_handle, _findings
-    if _draw_handle is not None:
-        bpy.types.SpaceImageEditor.draw_handler_remove(_draw_handle, 'WINDOW')
-        _draw_handle = None
+    global _findings
+    _drop_existing_handler()
     _findings = []
     _cache.signature = None
     for cls in reversed(_classes):
