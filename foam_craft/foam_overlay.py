@@ -354,6 +354,7 @@ def draw_callback():
 
     segments = {}
     labels = []
+    hidden = []
     dart_seen = {}
 
     for run in _cache.runs:
@@ -438,7 +439,24 @@ def draw_callback():
                     continue
                 dart_seen[key] = (tu, tv, nu, nv, color)
 
-        if run.has_dihedral and abs(run.angle_deg) >= s.min_angle:
+        # Skip the number when the run is too short on screen to hold it.
+        # This is what stops a notch, where several short runs converge, from
+        # becoming a heap of overlapping digits.
+        run_px = ((bbx - bax) ** 2 + (bby - bay) ** 2) ** 0.5
+        labelled = run.has_dihedral and abs(run.angle_deg) >= s.min_angle
+        if labelled and run_px < s.min_label_run_px:
+            # Mark the spot rather than dropping it silently: an angle that is
+            # simply absent looks like a run that needs no cut.
+            mid = len(bracket) // 2
+            if len(bracket) % 2 == 0:
+                a_pt, b_pt = bracket[mid - 1], bracket[mid]
+                mx, my = (a_pt[0] + b_pt[0]) * 0.5, (a_pt[1] + b_pt[1]) * 0.5
+                nx, ny = (a_pt[4] + b_pt[4]) * 0.5, (a_pt[5] + b_pt[5]) * 0.5
+            else:
+                mx, my, _, _, nx, ny = bracket[mid]
+            nlen = (nx * nx + ny * ny) ** 0.5 or 1.0
+            hidden.append((mx, my, nx / nlen, ny / nlen))
+        if labelled and run_px >= s.min_label_run_px:
             text = f"{abs(run.per_side_deg):.{s.decimals}f}°"
             # Sit the number against the middle of the bracket as drawn, which
             # on a curved run is nowhere near the midpoint of its chord.
@@ -479,6 +497,19 @@ def draw_callback():
         bucket.extend([(px0, py0), (px0 - ndx * stem, py0 - ndy * stem)])
 
     _draw_lines(segments, max(1.0, scale))
+
+    # Warn where a number was withheld for want of room.
+    if hidden:
+        warn_color = tuple(s.suppressed_color)
+        blf.size(font_id, max(8, int(angle_px * 0.9)))
+        for ax0, ay0, nx, ny in hidden:
+            width, height = blf.dimensions(font_id, "!")
+            clear = abs(nx) * width * 0.5 + abs(ny) * height * 0.5 + tick * 0.35
+            blf.position(font_id, ax0 + nx * clear - width / 2,
+                         ay0 + ny * clear - height / 2, 0)
+            blf.color(font_id, *warn_color)
+            blf.draw(font_id, "!")
+        blf.size(font_id, angle_px)
 
     for ax0, ay0, nx, ny, text, color in labels:
         width, height = blf.dimensions(font_id, text)
@@ -626,8 +657,10 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
             layout.prop(s, "island_id_font_size")
         layout.prop(s, "decimals")
         layout.prop(s, "min_angle")
+        layout.prop(s, "min_label_run_px")
         layout.prop(s, "convex_color")
         layout.prop(s, "concave_color")
+        layout.prop(s, "suppressed_color")
         layout.prop(s, "heat_form_color")
         layout.prop(s, "island_id_color")
 

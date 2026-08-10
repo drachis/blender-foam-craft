@@ -193,6 +193,44 @@ def uv_islands(bm, uv_layer, only_selected=False):
     return islands
 
 
+# A boundary vertex turning inward by more than this is a notch: the outline
+# doubles back into the piece, leaving a spike of material. Texture packers
+# produce these happily because they cost nothing in UV space, but they are
+# awkward to saw, fragile at the point and hard to glue.
+NOTCH_ANGLE_DEG = 75.0
+
+
+def find_tight_notches(island_faces, uv_layer, notch_angle_deg=NOTCH_ANGLE_DEG):
+    """UV positions where this island's outline cuts sharply back into itself.
+
+    Returns a list of (Vector uv, turn_degrees). Only concave vertices count --
+    a sharp convex point is just a corner of the piece and cuts fine.
+    """
+    found = []
+    for cycle in island_boundary_cycles(island_faces, uv_layer):
+        if len(cycle) < 3:
+            continue
+        pts = [l[uv_layer].uv.copy() for l in cycle]
+        pts.append(cycle[-1].link_loop_next[uv_layer].uv.copy())
+
+        shoelace = 0.0
+        for k in range(len(pts) - 1):
+            shoelace += pts[k].x * pts[k + 1].y - pts[k + 1].x * pts[k].y
+        winding = 1.0 if shoelace >= 0.0 else -1.0
+
+        for k in range(1, len(pts) - 1):
+            v1 = pts[k] - pts[k - 1]
+            v2 = pts[k + 1] - pts[k]
+            if v1.length < 1e-12 or v2.length < 1e-12:
+                continue
+            cosine = max(-1.0, min(1.0, v1.normalized().dot(v2.normalized())))
+            turn = degrees(acos(cosine))
+            concave = (v1.x * v2.y - v1.y * v2.x) * winding < 0.0
+            if concave and turn >= notch_angle_deg:
+                found.append((pts[k].copy(), turn))
+    return found
+
+
 def island_sort_key(faces):
     """Stable identity for an island, independent of traversal order."""
     return min(f.index for f in faces)
@@ -784,6 +822,27 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
                 "natural line costs nothing visually and is easier than piecing "
                 "an overhang later.",
                 islands=oversized))
+
+    # --- Notches: the outline doubling back into the piece.
+    notched = []
+    worst_turn = 0.0
+    for index, faces in enumerate(islands):
+        notches = find_tight_notches(faces, uv_layer)
+        if notches:
+            notched.append(index)
+            worst_turn = max(worst_turn, max(t for _, t in notches))
+    if notched:
+        findings.append(Finding(
+            'warn', 'tight_notch', "Some pieces have a sharp inward notch",
+            f"{len(notched)} island(s) have an outline that cuts back into "
+            f"itself, turning up to {worst_turn:.0f} degrees.",
+            "This is a patterning problem, not a drawing one. An unwrap packed "
+            "for texturing will happily leave a needle-thin spike, because it "
+            "costs nothing in UV space -- but that piece is awkward to saw, "
+            "fragile at the point and hard to glue, and no one drafting by hand "
+            "would draw it. Move the seam so the notch becomes a piece "
+            "boundary, or split the island there.",
+            islands=notched))
 
     # --- Slivers that are painful to cut and glue.
     metrics = [(i, _island_metrics(f, uv_layer)) for i, f in enumerate(islands)]

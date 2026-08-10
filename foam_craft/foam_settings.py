@@ -154,6 +154,14 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
                                             default=10.0, min=1.0, max=100.0)
     font_size: bpy.props.IntProperty(name="Angle Text (px)", default=13,
                                      min=6, max=60)
+    min_label_run_px: bpy.props.IntProperty(
+        name="Hide Labels Under",
+        description="Runs drawn shorter than this many pixels get no angle "
+                    "number. Where several short runs meet, as at a notch, the "
+                    "numbers pile into an unreadable clump; the guide and its "
+                    "ticks still show, so nothing is lost but the crowding. "
+                    "Zoom in and they come back",
+        default=34, min=0, max=400)
     corner_angle_deg: bpy.props.FloatProperty(
         name="Corner Angle",
         description="Turn in the piece outline beyond which a vertex counts as "
@@ -179,6 +187,9 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
         min=0, max=1, subtype='COLOR', size=4)
     concave_color: bpy.props.FloatVectorProperty(
         name="Concave", default=(1.0, 0.2, 0.55, 1.0),
+        min=0, max=1, subtype='COLOR', size=4)
+    suppressed_color: bpy.props.FloatVectorProperty(
+        name="Hidden Label", default=(1.0, 0.85, 0.1, 1.0),
         min=0, max=1, subtype='COLOR', size=4)
     heat_form_color: bpy.props.FloatVectorProperty(
         name="Heat Form", default=(1.0, 0.35, 0.0, 1.0),
