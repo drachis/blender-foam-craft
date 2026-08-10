@@ -152,22 +152,37 @@ def _walk_order(adjacency, centroids, origin):
     same situation from this function's point of view) does it jump to the
     nearest remaining island by raw centroid distance and continue from
     there. Consecutive IDs can fail to be adjacent only across such a jump.
+
+    Distance ties are broken on the centroid's own coordinates (not on
+    island index) so the result depends only on geometry. `islands` -- and
+    therefore these `centroids` -- come from ``core.uv_islands``, which
+    builds its result from a Python set keyed by BMFace identity; on a
+    symmetric mesh like a seamed cube, where every face is exactly as close
+    to `origin` as several others, breaking ties on index let that
+    incidental, run-to-run-varying iteration order flip which of several
+    equal-distance islands `min()` picked -- measured live: the same cube,
+    same origin, same seams still produced a different walk (and a
+    different non-adjacent consecutive pair) from one call to the next.
     """
     n = len(centroids)
     if n == 0:
         return []
 
+    def tie_key(i, ref):
+        c = centroids[i]
+        return ((c - ref).length, round(c.x, 6), round(c.y, 6), round(c.z, 6))
+
     unvisited = set(range(n))
-    current = min(unvisited, key=lambda i: (centroids[i] - origin).length)
+    current = min(unvisited, key=lambda i: tie_key(i, origin))
     order = [current]
     unvisited.discard(current)
 
     while unvisited:
         neighbours = [i for i in adjacency.get(current, ()) if i in unvisited]
         if neighbours:
-            nxt = min(neighbours, key=lambda i: (centroids[i] - centroids[current]).length)
+            nxt = min(neighbours, key=lambda i: tie_key(i, centroids[current]))
         else:
-            nxt = min(unvisited, key=lambda i: (centroids[i] - centroids[current]).length)
+            nxt = min(unvisited, key=lambda i: tie_key(i, centroids[current]))
         order.append(nxt)
         unvisited.discard(nxt)
         current = nxt

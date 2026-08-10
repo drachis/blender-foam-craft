@@ -153,11 +153,23 @@ def uv_boundary_edge(edge, uv_layer):
 
 def uv_islands(bm, uv_layer, only_selected=False):
     """Partition faces into UV islands -- connected components of faces joined
-    across non-boundary edges. Returns a list of sets of BMFace."""
-    pool = {f for f in bm.faces if not only_selected or f.select}
+    across non-boundary edges. Returns a list of sets of BMFace.
+
+    Island order is deterministic: components come out ordered by their lowest
+    face index. This matters because the list index is an island's identity for
+    everything downstream -- piece numbers, overlay labels, export order. Seeding
+    from ``set.pop()`` instead made the order depend on BMFace identity hashing,
+    which varies between runs on identical geometry, so the same mesh could be
+    numbered differently each time it was processed.
+    """
+    bm.faces.ensure_lookup_table()
+    ordered = [f for f in bm.faces if not only_selected or f.select]
+    pool = set(ordered)
     islands = []
-    while pool:
-        seed = pool.pop()
+    for seed in ordered:
+        if seed not in pool:
+            continue
+        pool.discard(seed)
         component = {seed}
         stack = [seed]
         while stack:
@@ -172,6 +184,11 @@ def uv_islands(bm, uv_layer, only_selected=False):
                         stack.append(other)
         islands.append(component)
     return islands
+
+
+def island_sort_key(faces):
+    """Stable identity for an island, independent of traversal order."""
+    return min(f.index for f in faces)
 
 
 def _next_boundary_loop(loop, uv_layer, island_faces):
