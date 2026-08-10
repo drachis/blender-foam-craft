@@ -80,19 +80,64 @@ class _RunMark(NamedTuple):
     darts: tuple = ()
 
 
+class _RunStruct(NamedTuple):
+    """A run's structure: everything about it that a UV transform cannot change.
+
+    Points are held as (face index, corner offset) rather than BMLoop, for two
+    reasons. BMesh elements are freed on mode changes and undo, and touching a
+    freed one from a draw handler crashes Blender outright. And an index pair
+    survives a UV transform untouched, which is the whole point of the split --
+    the structure stays put while only the coordinates move.
+    """
+    corner_refs: tuple      # ((face_index, corner_offset), ...) along the run
+    dart_local: tuple       # positions within corner_refs that take a dart
+    angle_deg: float
+    per_side_deg: float
+    has_dihedral: bool
+    needs_heat_form: bool
+    island_key: tuple
+    # +1 or -1. Which way round the run's perpendicular points, taken from the
+    # whole boundary cycle's winding in core. A single run cannot work this out
+    # from its own points, so it is settled once here and reapplied cheaply.
+    winding: float = 1.0
+
+
+class _IslandStruct(NamedTuple):
+    face_indices: tuple
+    label: str
+    key: tuple
+
+
+class _StructureCache:
+    """Islands, run segmentation and angles.
+
+    Rebuilt only when topology, seams or the segmentation settings change --
+    never for a UV transform, which is what keeps dragging UVs interactive.
+    """
+
+    __slots__ = ("signature", "runs", "islands", "stretch_islands")
+
+    def __init__(self):
+        self.signature = None
+        self.runs = []               # _RunStruct
+        self.islands = []            # _IslandStruct
+        self.stretch_islands = set()
+
+
 class _OverlayCache:
-    """Computed overlay geometry, in UV space, plus the state it was built from."""
+    """Draw-ready geometry in UV space, refreshed whenever the UVs move."""
 
     __slots__ = ("signature", "runs", "island_labels", "stretch_islands")
 
     def __init__(self):
         self.signature = None
         self.runs = []               # _RunMark, plain data only
-        self.island_labels = []      # (u, v, text)
+        self.island_labels = []      # (u, v, text, key)
         self.stretch_islands = set()  # island keys needing heat forming
 
 
 _cache = _OverlayCache()
+_structure = _StructureCache()
 _draw_handle = None
 # Craftability findings, refreshed by the operator rather than every draw --
 # the assessment walks the whole mesh and is far too slow for a draw handler.
@@ -150,6 +195,7 @@ def _selection_fingerprint(bm):
     toggling before it would follow a new selection. Sampled at a fixed cost
     like the UV fingerprint, since this runs on every draw.
     """
+    bm.faces.ensure_lookup_table()
     faces = bm.faces
     if not faces:
         return 0
@@ -161,6 +207,48 @@ def _selection_fingerprint(bm):
             total += i + 1
             count += 1
     return (count, total)
+
+
+def _seam_fingerprint(bm):
+    """Cheap fingerprint of which edges are seams.
+
+    Seams are what decide island membership, so the structural cache keys on
+    them. UV coordinates deliberately do not appear here: moving an island's
+    UVs moves both faces of every interior edge together, so island boundaries
+    are unchanged by a transform.
+    """
+    bm.edges.ensure_lookup_table()
+    edges = bm.edges
+    if not edges:
+        return 0
+    step = max(1, len(edges) // _UV_SAMPLE_COUNT)
+    total = 0
+    count = 0
+    for i in range(0, len(edges), step):
+        if edges[i].seam:
+            total += i + 1
+            count += 1
+    return (count, total)
+
+
+def _structure_signature(pairs, s):
+    """State the run segmentation depends on. Excludes UV coordinates."""
+    per_object = tuple(
+        (obj.name, len(bm.verts), len(bm.edges), len(bm.faces),
+         _seam_fingerprint(bm),
+         _selection_fingerprint(bm) if s.only_selected else 0)
+        for obj, bm, uv_layer in pairs
+    )
+    return (
+        per_object,
+        round(s.max_chord_deviation, 6),
+        round(s.max_angle_variation_deg, 4),
+        round(s.foam_thickness, 6),
+        round(s.max_tilt_deg, 4),
+        round(s.stretch_tolerance, 4),
+        round(s.corner_angle_deg, 4),
+        s.only_selected,
+    )
 
 
 def _signature(pairs, s):
@@ -192,19 +280,42 @@ def _island_uv_centroid(faces, uv_layer):
     return total / count if count else Vector((0.0, 0.0))
 
 
-def _rebuild(pairs, s):
-    """Recompute overlay geometry across every mesh currently in edit mode.
+def _build_structure(pairs, s):
+    """Segment every island boundary into runs. The expensive pass.
 
-    Everything is copied out as plain numbers before returning; see _RunMark.
+    Everything computed here is invariant under a UV transform: island
+    membership follows seams, run boundaries follow 3D angles and corners, and
+    the angles themselves come from 3D geometry only. Only coordinates change
+    when UVs move, and those are handled by _build_positions.
     """
     runs = []
-    labels = []
+    islands_out = []
     flagged = set()
-    heat_islands = set()
 
     for obj, bm, uv_layer in pairs:
+        bm.faces.ensure_lookup_table()
         islands = core.uv_islands(bm, uv_layer, s.only_selected)
+        id_layer = bm.faces.layers.int.get("foam_island_id")
+        stretch = core.uv_stretch_map(bm, uv_layer)
 
+        for index, faces in enumerate(islands):
+            key = (obj.name, index)
+            label = index + 1
+            if id_layer is not None:
+                for face in faces:
+                    if face[id_layer] > 0:
+                        label = face[id_layer]
+                        break
+            islands_out.append(_IslandStruct(
+                face_indices=tuple(f.index for f in faces),
+                label=str(label), key=key))
+
+            # An island can be fine at its darted edges and still refuse to lie
+            # flat through the middle. That is a heat-forming job, not a dart,
+            # so it is flagged from areal distortion, not from a boundary angle.
+            vals = [stretch.get(f, 0.0) for f in faces]
+            if vals and sum(vals) / len(vals) > s.stretch_tolerance:
+                flagged.add(key)
 
         for run in core.iter_boundary_dart_segments(
                 bm, uv_layer, s.max_chord_deviation, s.max_angle_variation_deg,
@@ -217,77 +328,180 @@ def _rebuild(pairs, s):
             else:
                 per_side, heat = 0.0, False
 
-            # Outward comes from the boundary's winding, computed in core.
-            ox, oy = (run.uv_outward.x, run.uv_outward.y) \
-                if run.uv_outward is not None else (0.0, 0.0)
-
-            outline = tuple(
-                (p.x, p.y, n.x, n.y)
-                for p, n in zip(run.uv_points, run.uv_normals))
-
-            dart_marks = []
-            for k in run.dart_indices:
-                pt = run.uv_points[k]
-                nrm = run.uv_normals[k]
-                nxt = run.uv_points[min(k + 1, len(run.uv_points) - 1)]
-                prv = run.uv_points[max(k - 1, 0)]
-                tangent = nxt - prv
-                if tangent.length > 1e-12:
-                    tangent = tangent.normalized()
-                dart_marks.append((pt.x, pt.y, tangent.x, tangent.y,
-                                   nrm.x, nrm.y))
-            darts = tuple(dart_marks)
-
+            key = (obj.name, run.island_index)
             if heat:
-                heat_islands.add((obj.name, run.island_index))
-
-            runs.append(_RunMark(
-                run.uv_start.x, run.uv_start.y, run.uv_end.x, run.uv_end.y,
-                run.mean_angle_deg, per_side, run.has_dihedral, heat, ox, oy,
-                outline, darts))
-
-        # Piece numbers come from the numbering operator's attribute when it
-        # has been run; otherwise fall back to island order so the overlay
-        # still reads on an un-numbered mesh.
-        id_layer = bm.faces.layers.int.get("foam_island_id")
-        stretch = core.uv_stretch_map(bm, uv_layer)
-
-        for index, faces in enumerate(islands):
-            label = index + 1
-            if id_layer is not None:
-                for face in faces:
-                    if face[id_layer] > 0:
-                        label = face[id_layer]
-                        break
-            centroid = _island_uv_centroid(faces, uv_layer)
-            key = (obj.name, index)
-            labels.append((centroid.x, centroid.y, str(label), key))
-
-            # An island can be fine at its darted edges and still refuse to lie
-            # flat through the middle. That is a heat-forming job, not a dart,
-            # so it is flagged from areal distortion, not from a boundary angle.
-            vals = [stretch.get(f, 0.0) for f in faces]
-            if vals and sum(vals) / len(vals) > s.stretch_tolerance:
                 flagged.add(key)
+
+            # A run covers len(loops) edges and therefore len(loops)+1 points.
+            # Each is recorded as the loop that starts it, by face and corner,
+            # with the final point taken from the last loop's successor.
+            refs = []
+            for loop in run.loops:
+                refs.append((loop.face.index, _corner_offset(loop)))
+            if run.loops:
+                tail = run.loops[-1].link_loop_next
+                refs.append((tail.face.index, _corner_offset(tail)))
+
+            # Settle the perpendicular's direction now, against the outward
+            # vector core derived from the cycle's winding.
+            winding = 1.0
+            if run.uv_outward is not None and len(run.uv_points) >= 2:
+                local = _outward_normals(list(run.uv_points))[0]
+                if local.dot(run.uv_outward) < 0.0:
+                    winding = -1.0
+
+            runs.append(_RunStruct(
+                corner_refs=tuple(refs),
+                dart_local=tuple(run.dart_indices),
+                angle_deg=run.mean_angle_deg,
+                per_side_deg=per_side,
+                has_dihedral=run.has_dihedral,
+                needs_heat_form=heat,
+                island_key=key,
+                winding=winding))
+
+    _structure.runs = runs
+    _structure.islands = islands_out
+    _structure.stretch_islands = flagged
+
+
+def _corner_offset(loop):
+    """Which corner of its face this loop is, so it can be found again by index."""
+    for offset, other in enumerate(loop.face.loops):
+        if other is loop:
+            return offset
+    return 0
+
+
+def _build_positions(pairs, s):
+    """Re-read UV coordinates for the already-segmented runs. The cheap pass.
+
+    Touches only boundary points and island loops -- no flood fill, no
+    segmentation, no per-face area -- so it is affordable every frame while a
+    UV transform is dragging.
+    """
+    by_object = {obj.name: (bm, uv_layer) for obj, bm, uv_layer in pairs}
+    for bm, _uv in by_object.values():
+        bm.faces.ensure_lookup_table()
+
+    runs = []
+    for st in _structure.runs:
+        entry = by_object.get(st.island_key[0])
+        if entry is None:
+            continue
+        bm, uv_layer = entry
+        try:
+            pts = [bm.faces[fi].loops[ci][uv_layer].uv.copy()
+                   for fi, ci in st.corner_refs]
+        except (IndexError, ReferenceError):
+            continue
+        if len(pts) < 2:
+            continue
+
+        normals = [n * st.winding for n in _outward_normals(pts)]
+        outline = tuple((p.x, p.y, n.x, n.y) for p, n in zip(pts, normals))
+
+        run_uv = pts[-1] - pts[0]
+        if run_uv.length > 1e-12:
+            ox, oy = normals[0].x, normals[0].y
+        else:
+            ox = oy = 0.0
+
+        dart_marks = []
+        for k in st.dart_local:
+            if not 0 <= k < len(pts):
+                continue
+            nxt = pts[min(k + 1, len(pts) - 1)]
+            prv = pts[max(k - 1, 0)]
+            tangent = nxt - prv
+            if tangent.length > 1e-12:
+                tangent = tangent.normalized()
+            dart_marks.append((pts[k].x, pts[k].y, tangent.x, tangent.y,
+                               normals[k].x, normals[k].y))
+
+        runs.append(_RunMark(
+            pts[0].x, pts[0].y, pts[-1].x, pts[-1].y,
+            st.angle_deg, st.per_side_deg, st.has_dihedral,
+            st.needs_heat_form, ox, oy, outline, tuple(dart_marks)))
+
+    labels = []
+    for isl in _structure.islands:
+        entry = by_object.get(isl.key[0])
+        if entry is None:
+            continue
+        bm, uv_layer = entry
+        total = Vector((0.0, 0.0))
+        count = 0
+        try:
+            for fi in isl.face_indices:
+                for loop in bm.faces[fi].loops:
+                    total += loop[uv_layer].uv
+                    count += 1
+        except (IndexError, ReferenceError):
+            continue
+        if count:
+            centre = total / count
+            labels.append((centre.x, centre.y, isl.label, isl.key))
 
     _cache.runs = runs
     _cache.island_labels = labels
-    # Heat forming is a property of a piece, not of a single cut: either some
-    # seam on it is too steep to saw, or the piece will not lie flat at all.
-    # Marking every affected run cluttered the sheet without telling the user
-    # anything the piece-level flag does not.
-    _cache.stretch_islands = flagged | heat_islands
+    _cache.stretch_islands = set(_structure.stretch_islands)
+
+
+def _outward_normals(pts):
+    """Per-point outward normals for a run's outline, from its winding.
+
+    Mirrors what foam_angle_core does for a whole boundary cycle, but over just
+    this run's points, since that is all the positional pass has to touch.
+    """
+    seg = []
+    for k in range(len(pts) - 1):
+        d = pts[k + 1] - pts[k]
+        seg.append(Vector((d.y, -d.x)) / d.length if d.length > 1e-12
+                   else Vector((0.0, 0.0)))
+    if not seg:
+        return [Vector((0.0, 0.0))] * len(pts)
+
+    normals = []
+    for k in range(len(pts)):
+        if k == 0:
+            normals.append(seg[0].copy())
+        elif k >= len(seg):
+            normals.append(seg[-1].copy())
+        else:
+            blended = seg[k - 1] + seg[k]
+            normals.append(blended.normalized() if blended.length > 1e-12
+                           else seg[k].copy())
+    return normals
 
 
 def _ensure_cache(context, s):
     pairs = _edit_meshes(context)
     if not pairs:
         return False
+
+    # Structure first, and only when something it depends on moved. A UV
+    # transform never reaches this branch, which is what keeps dragging
+    # interactive -- it was rebuilding the lot every frame before.
+    struct_sig = _structure_signature(pairs, s)
+    if struct_sig != _structure.signature:
+        _build_structure(pairs, s)
+        _structure.signature = struct_sig
+        _cache.signature = None      # positions must follow
+
     signature = _signature(pairs, s)
     if signature != _cache.signature:
-        _rebuild(pairs, s)
+        _build_positions(pairs, s)
         _cache.signature = signature
     return True
+
+
+def _rebuild(pairs, s):
+    """Force both passes. Used by operators and tests that want a clean result."""
+    _build_structure(pairs, s)
+    _structure.signature = None
+    _build_positions(pairs, s)
+    _cache.signature = None
 
 
 def _draw_lines(segments_by_color, width):
@@ -319,6 +533,7 @@ def draw_callback():
         # The edit mesh can be freed between the redraw request and the draw.
         # Drop the cache rather than drawing from anything stale.
         _cache.signature = None
+        _structure.signature = None
         return
     if not ready:
         return
@@ -546,6 +761,7 @@ class FOAM_OT_refresh_overlay(bpy.types.Operator):
 
     def execute(self, context):
         _cache.signature = None
+        _structure.signature = None
         for area in context.screen.areas:
             area.tag_redraw()
         return {'FINISHED'}
@@ -789,6 +1005,7 @@ def register():
     global _draw_handle
     _drop_existing_handler()
     _cache.signature = None
+    _structure.signature = None
     _draw_handle = bpy.types.SpaceImageEditor.draw_handler_add(
         draw_callback, (), 'WINDOW', 'POST_PIXEL')
     bpy.app.driver_namespace[_HANDLE_KEY] = _draw_handle
@@ -799,5 +1016,6 @@ def unregister():
     _drop_existing_handler()
     _findings = []
     _cache.signature = None
+    _structure.signature = None
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
