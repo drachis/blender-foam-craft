@@ -1,3 +1,6 @@
 [submodule "blender_mcp"]
 	path = blender_mcp
 	url = https://projects.blender.org/lab/blender_mcp.git
+[submodule "blender"]
+	path = blender
+	url = https://projects.blender.org/blender/blender.git

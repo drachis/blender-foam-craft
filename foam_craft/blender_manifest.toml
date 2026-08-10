@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 id = "foam_craft"
 version = "0.1.0"
 name = "FoamCraft"
-tagline = "Bevel angles, darts and cut patterns for foam and paper panel fabrication"
+tagline = "Bevel angles, darts and cut patterns for foam panels"
 maintainer = "FoamCraft"
 type = "add-on"
 blender_version_min = "4.2.0"
@@ -13,3 +13,14 @@ license = [
 ]
 
 tags = ["Modeling", "Mesh"]
+
+[build]
+# Keep build artefacts and editor leftovers out of the shipped package. The
+# working directory is junctioned straight into Blender's user_default
+# extensions repo for development, so __pycache__ accumulates in it.
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  ".DS_Store",
+  "/.git/",
+]
