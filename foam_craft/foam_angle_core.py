@@ -1,0 +1,698 @@
+"""Shared geometry and math for the FoamCraft add-on.
+
+Pure functions only -- no bpy.types subclasses, no register()/unregister().
+Both the paper workflow (uv_fold_angle_overlay, paper_model_export) and the
+foam workflow (foam_panel_tabs) import from here.
+"""
+
+import sys
+from dataclasses import dataclass, field
+from math import degrees, tan, cos, radians
+
+# UV coordinates closer than this are treated as the same point when deciding
+# whether two faces share a UV island boundary.
+UV_EPSILON = 1e-6
+
+
+def dihedral_angle_deg(edge):
+    """Signed fold angle between the two 3D faces sharing this edge.
+
+    Positive = convex/mountain, negative = concave/valley. None if the edge
+    doesn't have exactly two connected faces (mesh boundary).
+
+    Uses BMEdge.calc_face_angle_signed rather than a hand-rolled cross-product
+    sign test. The hand-rolled version this replaces derived its sign from
+    ``edge.verts[1].co - edge.verts[0].co``, but BMEdge vertex order carries no
+    fixed relationship to the winding of the two adjacent faces, so its sign was
+    effectively arbitrary -- measured live on Blender 5.2 it disagreed on exactly
+    half of a torus's 192 interior edges, and was inverted on all 12 edges of a
+    cube (every one of which is convex). The convention below was pinned against
+    three unambiguous cases on 5.2.0: cube = +90 (all convex), normals-flipped
+    cube = -90, explicit valley crease = -90.
+    """
+    if len(edge.link_faces) != 2:
+        return None
+    return degrees(edge.calc_face_angle_signed(0.0))
+
+
+def iter_uv_edges(bm, uv_layer, only_selected=False):
+    """Yield (edge, uv_a, uv_b) once for each distinct UV-space occurrence of
+    every 3D edge, so a seam between two islands yields two entries -- one per
+    island, at their respective UV positions."""
+    seen = set()
+    for face in bm.faces:
+        if only_selected and not face.select:
+            continue
+        loops = face.loops
+        n = len(loops)
+        for i in range(n):
+            loop = loops[i]
+            next_loop = loops[(i + 1) % n]
+            uv_a = loop[uv_layer].uv.copy()
+            uv_b = next_loop[uv_layer].uv.copy()
+            key = (loop.edge.index, round(uv_a.x, 6), round(uv_a.y, 6),
+                   round(uv_b.x, 6), round(uv_b.y, 6))
+            key_rev = (loop.edge.index, round(uv_b.x, 6), round(uv_b.y, 6),
+                       round(uv_a.x, 6), round(uv_a.y, 6))
+            if key in seen or key_rev in seen:
+                continue
+            seen.add(key)
+            yield loop.edge, uv_a, uv_b
+
+
+def find_paper_model_module():
+    """Locate the already-loaded Export Paper Model add-on module, whatever
+    internal name Blender registered it under.
+
+    Duck-typing is warranted here (unlike for this package's own modules)
+    because Paper Model is a third-party add-on whose module name varies
+    between legacy installs and Blender 4.2+'s Extensions Platform.
+    """
+    for mod in list(sys.modules.values()):
+        if (mod is not None and hasattr(mod, "Unfolder")
+                and hasattr(mod, "Mesh") and hasattr(mod, "UnfoldError")):
+            return mod
+    raise ImportError(
+        "Could not find the 'Export Paper Model' add-on. "
+        "Enable it first: Preferences > Add-ons > search 'Paper Model'."
+    )
+
+
+# --- Foam bevel geometry -------------------------------------------------
+
+FOAM_GRADES = (
+    ('L200', "L200 (soft PE)", "Low-density closed-cell polyethylene"),
+    ('L400', "L400 (medium PE)", "Medium-density closed-cell polyethylene"),
+    ('L600', "L600 (firm PE)", "High-density closed-cell polyethylene"),
+    ('EVA', "EVA", "Ethylene-vinyl acetate craft foam"),
+    ('CUSTOM', "Custom", "Set flex tolerances manually"),
+)
+
+# Relative bending stiffness per grade, normalised so L400 == 1.0. Rough
+# ordering only -- calibrate against a physical bend test, see
+# estimate_flex_tolerance().
+_GRADE_STIFFNESS = {'L200': 0.6, 'L400': 1.0, 'L600': 1.6, 'EVA': 1.2,
+                    'CUSTOM': 1.0}
+
+
+@dataclass
+class BevelResult:
+    """Saw setup for one dart/seam. Angles in degrees, lengths in metres."""
+    dihedral_deg: float
+    per_side_deg: float
+    achievable: bool
+    bevel_depth: float
+    bevel_face_width: float
+    needs_heat_form: bool
+
+
+def compute_bevel(dihedral_deg, thickness_m, max_tilt_deg):
+    """Saw bevel for one seam of total dihedral angle `dihedral_deg`.
+
+    Each of the two mating panels is cut at half the total angle, so the pair
+    reconstructs the full dihedral when glued -- the same reason a 90-degree
+    box corner takes two 45-degree miters. The split is symmetric only because
+    both panels share one global thickness; differing thicknesses would need an
+    asymmetric split.
+    """
+    per_side = dihedral_deg / 2.0
+    tilt = abs(per_side)
+    achievable = tilt <= max_tilt_deg
+    tilt_rad = radians(min(tilt, 89.9))
+    return BevelResult(
+        dihedral_deg=dihedral_deg,
+        per_side_deg=per_side,
+        achievable=achievable,
+        bevel_depth=thickness_m * tan(tilt_rad),
+        bevel_face_width=thickness_m / cos(tilt_rad),
+        needs_heat_form=not achievable,
+    )
+
+
+# --- UV islands and boundaries ------------------------------------------
+
+def uv_boundary_edge(edge, uv_layer):
+    """True if `edge` bounds a UV island: an open mesh edge, or a seam where the
+    two adjacent faces place the edge at different UV coordinates."""
+    if len(edge.link_faces) != 2:
+        return True
+    try:
+        la = next(l for l in edge.link_faces[0].loops if l.edge is edge)
+        lb = next(l for l in edge.link_faces[1].loops if l.edge is edge)
+    except StopIteration:
+        return True
+    a0, a1 = la[uv_layer].uv, la.link_loop_next[uv_layer].uv
+    b0, b1 = lb[uv_layer].uv, lb.link_loop_next[uv_layer].uv
+    if la.vert is lb.vert:
+        joined = (a0 - b0).length < UV_EPSILON and (a1 - b1).length < UV_EPSILON
+    else:
+        # The two loops traverse the edge in opposite directions.
+        joined = (a0 - b1).length < UV_EPSILON and (a1 - b0).length < UV_EPSILON
+    return not joined
+
+
+def uv_islands(bm, uv_layer, only_selected=False):
+    """Partition faces into UV islands -- connected components of faces joined
+    across non-boundary edges. Returns a list of sets of BMFace."""
+    pool = {f for f in bm.faces if not only_selected or f.select}
+    islands = []
+    while pool:
+        seed = pool.pop()
+        component = {seed}
+        stack = [seed]
+        while stack:
+            face = stack.pop()
+            for loop in face.loops:
+                if uv_boundary_edge(loop.edge, uv_layer):
+                    continue
+                for other in loop.edge.link_faces:
+                    if other is not face and other in pool:
+                        pool.discard(other)
+                        component.add(other)
+                        stack.append(other)
+        islands.append(component)
+    return islands
+
+
+def _next_boundary_loop(loop, uv_layer, island_faces):
+    """Walk to the next boundary loop around the island, by rotating about the
+    shared vertex until another boundary edge is found."""
+    current = loop.link_loop_next
+    for _ in range(128):  # guard against non-manifold fans
+        if uv_boundary_edge(current.edge, uv_layer):
+            return current
+        radial = current.link_loop_radial_next
+        if radial is current or radial.face not in island_faces:
+            return None
+        current = radial.link_loop_next
+    return None
+
+
+def island_boundary_cycles(island_faces, uv_layer):
+    """Ordered boundary loops for one island, as a list of BMLoop lists.
+
+    Each returned cycle walks the island's outline in order; a loop's edge runs
+    from `loop.vert` to `loop.link_loop_next.vert`. An island with holes yields
+    more than one cycle.
+    """
+    boundary = [l for f in island_faces for l in f.loops
+                if uv_boundary_edge(l.edge, uv_layer)]
+    unvisited = set(boundary)
+    cycles = []
+    while unvisited:
+        start = unvisited.pop()
+        cycle = [start]
+        current = start
+        while True:
+            nxt = _next_boundary_loop(current, uv_layer, island_faces)
+            if nxt is None or nxt is start or nxt not in unvisited:
+                break
+            unvisited.discard(nxt)
+            cycle.append(nxt)
+            current = nxt
+        cycles.append(cycle)
+    return cycles
+
+
+# --- Dart run segmentation ----------------------------------------------
+
+@dataclass
+class DartRun:
+    """One continuous saw pass along an island boundary.
+
+    A run is a stretch of boundary that can be cut in a single straight pass at
+    a single blade tilt, so it is bounded by two constraints: it must stay
+    within `max_chord_deviation` of its own straight chord, and its dihedral
+    angle must not vary by more than `max_angle_variation_deg` along its length.
+    """
+    island_index: int
+    loops: list = field(repr=False)
+    uv_start: object = None
+    uv_end: object = None
+    mean_angle_deg: float = 0.0
+    min_angle_deg: float = 0.0
+    max_angle_deg: float = 0.0
+    length_3d: float = 0.0
+    chord_deviation: float = 0.0
+    # False when the run lies on an open mesh boundary (the rim of the sculpt)
+    # rather than a seam against another panel. Such a run has no facing piece,
+    # so there is no dihedral to split and no saw bevel to set -- distinct from
+    # a seam that genuinely measures 0 degrees.
+    has_dihedral: bool = True
+
+
+def _point_segment_distance(p, a, b):
+    ab = b - a
+    denom = ab.length_squared
+    if denom < 1e-12:
+        return (p - a).length
+    t = max(0.0, min(1.0, (p - a).dot(ab) / denom))
+    return (p - (a + ab * t)).length
+
+
+def _run_deviation(points, i, j):
+    """Max perpendicular distance of points[i+1:j] from the chord points[i]->points[j]."""
+    a, b = points[i], points[j]
+    worst = 0.0
+    for k in range(i + 1, j):
+        worst = max(worst, _point_segment_distance(points[k], a, b))
+    return worst
+
+
+def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
+                           max_angle_variation_deg, island_index=0):
+    """Split one boundary cycle into DartRuns.
+
+    Greedy forward scan: extend a run while it stays inside both tolerances,
+    close it when either is exceeded, then start the next run. Greedy (rather
+    than a global optimum like Douglas-Peucker) matches the physical process --
+    runs are cut one after another along the edge, each as long as the material
+    and the saw allow.
+
+    The scan starts at the sharpest corner of the cycle so a run never straddles
+    an obvious physical break.
+    """
+    n = len(cycle)
+    if n == 0:
+        return []
+
+    angles = []
+    measured = []
+    for loop in cycle:
+        ang = dihedral_angle_deg(loop.edge)
+        measured.append(ang is not None)
+        angles.append(0.0 if ang is None else ang)
+
+    # Rotate so index 0 sits at the most obvious physical corner of the piece.
+    # Scored on how sharply the outline turns there, plus any step in the seam
+    # angle. Turn matters most: on a flat panel every dihedral is zero, so a
+    # dihedral-only score would start the scan mid-edge and split one straight
+    # side into two runs.
+    if n > 2:
+        directions = []
+        for loop in cycle:
+            d = loop.link_loop_next.vert.co - loop.vert.co
+            directions.append(d.normalized() if d.length > 1e-12 else d)
+
+        def corner_score(i):
+            prev, cur = directions[i - 1], directions[i]
+            turn = degrees(prev.angle(cur)) if prev.length and cur.length else 0.0
+            return turn + abs(angles[i] - angles[i - 1])
+
+        pivot = max(range(n), key=corner_score)
+        if pivot:
+            cycle = cycle[pivot:] + cycle[:pivot]
+            angles = angles[pivot:] + angles[:pivot]
+            measured = measured[pivot:] + measured[:pivot]
+
+    # points[k] is the start vertex of cycle[k]; the final entry closes the loop.
+    points = [l.vert.co.copy() for l in cycle]
+    points.append(cycle[-1].link_loop_next.vert.co.copy())
+    uvs = [l[uv_layer].uv.copy() for l in cycle]
+    uvs.append(cycle[-1].link_loop_next[uv_layer].uv.copy())
+
+    runs = []
+    i = 0
+    while i < n:
+        j = i + 1  # run covers cycle[i:j]; always at least one edge
+        while j < n:
+            # A seam and an open rim are different cuts -- never merge them.
+            if measured[j] != measured[i]:
+                break
+            span = angles[i:j + 1]
+            if (max(span) - min(span)) > max_angle_variation_deg:
+                break
+            if _run_deviation(points, i, j + 1) > max_chord_deviation:
+                break
+            j += 1
+        span = angles[i:j]
+        seg = cycle[i:j]
+        length = sum((points[k + 1] - points[k]).length for k in range(i, j))
+        runs.append(DartRun(
+            island_index=island_index,
+            loops=seg,
+            uv_start=uvs[i],
+            uv_end=uvs[j],
+            mean_angle_deg=sum(span) / len(span),
+            min_angle_deg=min(span),
+            max_angle_deg=max(span),
+            length_3d=length,
+            chord_deviation=_run_deviation(points, i, j),
+            has_dihedral=measured[i],
+        ))
+        i = j
+    return runs
+
+
+def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
+                                max_angle_variation_deg, only_selected=False,
+                                islands=None):
+    """Yield a DartRun for every saw pass along every UV island boundary.
+
+    This replaces per-mesh-edge iteration: foam flexes between darts, so a dart
+    belongs where the boundary stops being cuttable in one pass, not at every
+    polygon edge.
+    """
+    if islands is None:
+        islands = uv_islands(bm, uv_layer, only_selected)
+    for index, faces in enumerate(islands):
+        for cycle in island_boundary_cycles(faces, uv_layer):
+            for run in segment_boundary_cycle(
+                    cycle, uv_layer, max_chord_deviation,
+                    max_angle_variation_deg, island_index=index):
+                yield run
+
+
+def build_island_adjacency(bm, uv_layer, islands):
+    """Map island index -> set of island indices sharing a 3D boundary edge.
+
+    Used to place a dart symmetrically on both mating pieces, and to number
+    islands by walking the surface rather than the UV layout.
+    """
+    owner = {}
+    for index, faces in enumerate(islands):
+        for face in faces:
+            owner[face] = index
+    adjacency = {i: set() for i in range(len(islands))}
+    for edge in bm.edges:
+        if len(edge.link_faces) != 2:
+            continue
+        a = owner.get(edge.link_faces[0])
+        b = owner.get(edge.link_faces[1])
+        if a is None or b is None or a == b:
+            continue
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+    return adjacency
+
+
+def _uv_area(face, uv_layer):
+    uvs = [l[uv_layer].uv for l in face.loops]
+    area = 0.0
+    for i in range(1, len(uvs) - 1):
+        u, v = uvs[i] - uvs[0], uvs[i + 1] - uvs[0]
+        area += abs(u.x * v.y - u.y * v.x) * 0.5
+    return area
+
+
+def uv_stretch_map(bm, uv_layer, faces=None):
+    """Relative areal distortion per face: {face: stretch}.
+
+    A face's raw UV-area-to-3D-area ratio is meaningless on its own -- UV space
+    is normalised while the mesh is in metres, so the raw ratio just reports the
+    unwrap's overall scale. What matters is how far a face deviates from the
+    *rest of the mesh*, so ratios are normalised against their median: 0.0 means
+    the face carries the same scale as the bulk of the unwrap, 0.5 means it is
+    stretched or compressed by half again as much.
+
+    This is the signal that a panel needs heat forming through its interior
+    rather than just a dart at its edge. It is the same quantity the UV editor's
+    Area stretch overlay displays, which is draw-only and unreadable from Python.
+    """
+    faces = list(bm.faces if faces is None else faces)
+    ratios = {}
+    for face in faces:
+        area_3d = face.calc_area()
+        if area_3d <= 1e-12:
+            continue
+        ratios[face] = _uv_area(face, uv_layer) / area_3d
+    if not ratios:
+        return {}
+    ordered = sorted(ratios.values())
+    median = ordered[len(ordered) // 2]
+    if median <= 1e-12:
+        return {f: 0.0 for f in ratios}
+    return {f: abs(r / median - 1.0) for f, r in ratios.items()}
+
+
+# --- Craftability assessment --------------------------------------------
+
+# Rules that hold regardless of what the model looks like. Shown verbatim when
+# the tool cannot confidently classify the shape, so the user always gets
+# something actionable rather than a shrug.
+FOAM_CRAFTABILITY_RULES = (
+    "Each UV island becomes one flat piece of foam, so every island has to be "
+    "something you could cut from a sheet and bend into place.",
+    "Foam bends in one direction at a time. An island spanning a dome or saddle "
+    "(curving two ways at once) cannot lie flat -- split it with more seams, or "
+    "plan to heat-form it.",
+    "A seam's bevel is half its dihedral angle, and a saw can only tilt so far. "
+    "Past that limit the joint has to be heat-formed or carved instead.",
+    "Put seams where the sculpt already changes direction. Seams along creases "
+    "and ridges disappear; seams across a smooth panel always show.",
+    "Islands must fit the foam stock, and want a consistent orientation if the "
+    "foam has a grain or a skin side.",
+    "Very small or sliver-thin islands are hard to cut accurately and harder to "
+    "glue. Merge them into a neighbour where you can.",
+)
+
+
+@dataclass
+class Finding:
+    """One craftability observation, with the fix attached."""
+    severity: str          # 'ok' | 'info' | 'warn' | 'blocker'
+    code: str
+    title: str
+    detail: str            # what was measured
+    advice: str            # what to do about it
+    islands: list = field(default_factory=list)
+
+
+def _island_metrics(faces, uv_layer):
+    area_3d = sum(f.calc_area() for f in faces)
+    area_uv = sum(_uv_area(f, uv_layer) for f in faces)
+    us = [l[uv_layer].uv for f in faces for l in f.loops]
+    if not us:
+        return None
+    min_u = min(p.x for p in us); max_u = max(p.x for p in us)
+    min_v = min(p.y for p in us); max_v = max(p.y for p in us)
+    # UV space is unitless, so convert island extents to real lengths using the
+    # island's own area ratio rather than assuming any global scale.
+    scale = (area_3d / area_uv) ** 0.5 if area_uv > 1e-12 else 0.0
+    width = (max_u - min_u) * scale
+    height = (max_v - min_v) * scale
+    return {"area_3d": area_3d, "width": max(width, height),
+            "height": min(width, height)}
+
+
+def classify_surface(bm):
+    """Describe the model as 'faceted', 'smooth', or 'mixed'.
+
+    Decided from the spread of interior dihedral angles: a faceted build is
+    mostly flat panels punctuated by hard edges, a smooth sculpt bends a little
+    at nearly every edge. Both are legitimate -- this only picks which advice
+    applies.
+    """
+    angles = [abs(a) for a in (dihedral_angle_deg(e) for e in bm.edges)
+              if a is not None]
+    if not angles:
+        return "unknown", {}
+    total = len(angles)
+    flat = sum(1 for a in angles if a < 1.0)
+    gentle = sum(1 for a in angles if 1.0 <= a < 20.0)
+    sharp = sum(1 for a in angles if a >= 30.0)
+    flat_ratio = flat / total
+    gentle_ratio = gentle / total
+    sharp_ratio = sharp / total
+    # A faceted build is bimodal: flat panels and hard creases, little between.
+    # Testing flatness alone misreads a plain cube, whose every edge is a 90°
+    # crease and which has no interior edges at all.
+    bimodal_ratio = flat_ratio + sharp_ratio
+    stats = {"edges": total, "flat_ratio": round(flat_ratio, 3),
+             "gentle_ratio": round(gentle_ratio, 3),
+             "sharp_ratio": round(sharp_ratio, 3),
+             "bimodal_ratio": round(bimodal_ratio, 3),
+             "max_angle": round(max(angles), 2)}
+    if bimodal_ratio > 0.7 and gentle_ratio < 0.25:
+        return "faceted", stats
+    if gentle_ratio > 0.6:
+        return "smooth", stats
+    return "mixed", stats
+
+
+def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
+                        max_chord_deviation=0.003,
+                        max_angle_variation_deg=10.0,
+                        sheet_width=None, sheet_height=None,
+                        stretch_tolerance=0.25, min_run_length=0.006,
+                        islands=None):
+    """Check whether this mesh and unwrap can actually be built from foam.
+
+    Returns a list of Findings, most severe first. Every warning carries the
+    change that would fix it; when the shape does not match a known profile the
+    general rules are returned instead of a guess.
+    """
+    findings = []
+
+    if uv_layer is None:
+        return [Finding('blocker', 'no_uv', "No UV map",
+                        "This mesh has no active UV layer.",
+                        "Unwrap the mesh first: mark seams where the pieces "
+                        "should separate, then Unwrap. Each UV island becomes "
+                        "one piece of foam.")]
+
+    if islands is None:
+        islands = uv_islands(bm, uv_layer)
+    if not islands:
+        return [Finding('blocker', 'no_islands', "No faces to build",
+                        "No UV islands were found.",
+                        "Select the geometry you want to build and unwrap it.")]
+
+    profile, stats = classify_surface(bm)
+
+    # --- Seams that no saw can cut.
+    steep = []
+    worst = 0.0
+    for edge in bm.edges:
+        ang = dihedral_angle_deg(edge)
+        if ang is None:
+            continue
+        per_side = abs(ang) / 2.0
+        worst = max(worst, per_side)
+        if per_side > max_tilt_deg:
+            steep.append(edge)
+    if steep:
+        findings.append(Finding(
+            'warn', 'bevel_beyond_saw', "Some seams are too sharp to saw",
+            f"{len(steep)} edge(s) need a bevel over {max_tilt_deg:.0f}° per "
+            f"side (worst {worst:.0f}°).",
+            "These can still be built, just not with a straight saw cut -- "
+            "heat-form or hand-carve them. To make them sawable instead, move "
+            "the seam off the hard crease so the angle is shared between two "
+            "gentler joints, or raise the max blade tilt if your saw allows."))
+
+    # --- Islands that cannot lie flat.
+    stretch = uv_stretch_map(bm, uv_layer)
+    bad_islands = []
+    for index, faces in enumerate(islands):
+        vals = [stretch.get(f, 0.0) for f in faces]
+        if vals and (sum(vals) / len(vals)) > stretch_tolerance:
+            bad_islands.append(index)
+    if bad_islands:
+        findings.append(Finding(
+            'warn', 'non_developable', "Some pieces will not lie flat",
+            f"{len(bad_islands)} island(s) distort more than "
+            f"{stretch_tolerance:.0%} when flattened.",
+            "This is a dome or saddle being forced onto one flat piece. Add a "
+            "seam across the curved area to split it into two shallower pieces, "
+            "or keep it and plan to heat-form. Darts along the edge help at the "
+            "border but will not fix curvature through the middle.",
+            islands=bad_islands))
+
+    # --- Pieces that outgrow the stock.
+    if sheet_width and sheet_height:
+        oversized = []
+        for index, faces in enumerate(islands):
+            m = _island_metrics(faces, uv_layer)
+            if m and (m["width"] > max(sheet_width, sheet_height)
+                      or m["height"] > min(sheet_width, sheet_height)):
+                oversized.append(index)
+        if oversized:
+            findings.append(Finding(
+                'warn', 'exceeds_stock', "Some pieces are bigger than the foam",
+                f"{len(oversized)} island(s) exceed "
+                f"{sheet_width:.3g} x {sheet_height:.3g} m of stock.",
+                "Add a seam to split each oversized piece. A seam along a "
+                "natural line costs nothing visually and is easier than piecing "
+                "an overhang later.",
+                islands=oversized))
+
+    # --- Slivers that are painful to cut and glue.
+    metrics = [(i, _island_metrics(f, uv_layer)) for i, f in enumerate(islands)]
+    slivers = [i for i, m in metrics
+               if m and m["height"] > 0 and (m["width"] / max(m["height"], 1e-9)) > 12.0]
+    if slivers:
+        findings.append(Finding(
+            'info', 'sliver_islands', "Some pieces are very long and thin",
+            f"{len(slivers)} island(s) are over 12x longer than they are wide.",
+            "Thin strips are hard to cut accurately and tend to curl when "
+            "glued. Merge them into a neighbouring island by clearing the seam "
+            "between them, unless the strip is deliberate.",
+            islands=slivers))
+
+    # --- Cuts too short to make cleanly.
+    runs = list(iter_boundary_dart_segments(
+        bm, uv_layer, max_chord_deviation, max_angle_variation_deg,
+        islands=islands))
+    if runs:
+        stubby = [r for r in runs if r.has_dihedral and r.length_3d < min_run_length]
+        if len(stubby) > len(runs) * 0.25:
+            findings.append(Finding(
+                'info', 'fragmented_runs', "Cut runs are heavily fragmented",
+                f"{len(stubby)} of {len(runs)} runs are shorter than "
+                f"{min_run_length * 1000:.0f} mm.",
+                "Very short runs mean re-setting the blade constantly. Raise "
+                "the chord deviation or the angle variation tolerance to merge "
+                "neighbouring runs into single passes -- foam bends enough to "
+                "absorb the difference."))
+        findings.append(Finding(
+            'ok', 'runs_ready', "Cut runs resolved",
+            f"{len(runs)} run(s) across {len(islands)} island(s); "
+            f"{sum(1 for r in runs if r.has_dihedral)} need a bevel.",
+            "Each run is one straight pass at one blade tilt."))
+
+    # --- Open rims are worth stating so they are not mistaken for a bug.
+    open_edges = sum(1 for e in bm.edges if len(e.link_faces) == 1)
+    if open_edges:
+        findings.append(Finding(
+            'info', 'open_boundary', "The model has open edges",
+            f"{open_edges} edge(s) border no second face.",
+            "These are the rim of the build. They get no bevel because nothing "
+            "meets them -- expected for a shell, worth checking if you meant "
+            "the model to be closed."))
+
+    non_manifold = sum(1 for e in bm.edges if len(e.link_faces) > 2)
+    if non_manifold:
+        findings.append(Finding(
+            'warn', 'non_manifold', "Non-manifold geometry",
+            f"{non_manifold} edge(s) join more than two faces.",
+            "Three faces meeting at one edge has no physical equivalent in "
+            "sheet foam. Clean it up (Mesh > Clean Up > Merge by Distance, or "
+            "delete the interior face) before planning cuts."))
+
+    # --- Profile-specific guidance, or the general rules when unsure.
+    if profile == 'faceted':
+        findings.append(Finding(
+            'ok', 'profile_faceted', "Chunky, faceted build",
+            f"{stats['flat_ratio']:.0%} of edges lie flat and "
+            f"{stats['sharp_ratio']:.0%} are hard creases "
+            f"(sharpest {stats['max_angle']:.0f}°).",
+            "This suits foam well: flat panels meeting at defined edges. Seam "
+            "every hard edge so each flat region becomes its own piece, and the "
+            "bevels follow directly."))
+    elif profile == 'smooth':
+        findings.append(Finding(
+            'info', 'profile_smooth', "Smooth, curved sculpt",
+            f"{stats['gentle_ratio']:.0%} of edges bend gently, "
+            f"sharpest {stats['max_angle']:.0f}°.",
+            "Curved sculpts need the surface broken into near-flat patches. "
+            "Run seams along the directions the form does not curve (down a "
+            "horn, around a dome) so each piece bends one way only."))
+    else:
+        findings.append(Finding(
+            'info', 'profile_unknown', "Shape did not match a known profile",
+            f"Mixed curvature: {stats.get('flat_ratio', 0):.0%} flat, "
+            f"{stats.get('gentle_ratio', 0):.0%} gently curved.",
+            "Not confident which pattern applies here, so judge it against the "
+            "general rules:\n- " + "\n- ".join(FOAM_CRAFTABILITY_RULES)))
+
+    order = {'blocker': 0, 'warn': 1, 'info': 2, 'ok': 3}
+    findings.sort(key=lambda f: order.get(f.severity, 9))
+    return findings
+
+
+def estimate_flex_tolerance(foam_grade, thickness_m):
+    """Suggested (max_chord_deviation, dissolve_angle_limit_deg) for a foam type.
+
+    A starting point, not a measurement. Bending stiffness of a flat sheet goes
+    roughly with thickness cubed and with material stiffness, so thicker/denser
+    foam holds less unaided curve and wants darts sooner. Calibrate by bending a
+    sample strip of the real stock and measuring the sagitta it holds before it
+    needs a relief cut.
+    """
+    stiffness = _GRADE_STIFFNESS.get(foam_grade, 1.0)
+    thickness_ratio = thickness_m / 0.0127  # relative to 1/2" reference stock
+    resistance = stiffness * (thickness_ratio ** 3)
+    deviation = max(0.0005, min(0.010, 0.003 / max(resistance, 0.05)))
+    angle_limit = max(1.0, min(20.0, 5.0 / max(resistance ** 0.5, 0.2)))
+    return deviation, angle_limit

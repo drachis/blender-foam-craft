@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "foam_craft"
+version = "0.1.0"
+name = "FoamCraft"
+tagline = "Bevel angles, darts and cut patterns for foam and paper panel fabrication"
+maintainer = "FoamCraft"
+type = "add-on"
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+tags = ["Modeling", "Mesh"]
