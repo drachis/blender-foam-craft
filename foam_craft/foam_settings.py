@@ -138,6 +138,14 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
                     "as you zoom, the way they would if printed on it, rather "
                     "than staying a fixed number of screen pixels",
         default=0.016, min=0.002, max=0.2, precision=4)
+    corner_angle_deg: bpy.props.FloatProperty(
+        name="Corner Angle",
+        description="Turn in the piece outline beyond which a vertex counts as "
+                    "a corner rather than part of a curve. Corners break a cut "
+                    "run, so each straight-ish edge gets its own angle guide "
+                    "instead of one guide running through the corner and "
+                    "describing neither edge. Lower values break more often",
+        default=core.CORNER_ANGLE_DEG, min=5.0, max=170.0)
     tick_uv_fraction: bpy.props.FloatProperty(
         name="Mark Size (% of UV)",
         description="Length of the guide ticks and dart marks as a fraction of "

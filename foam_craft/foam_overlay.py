@@ -155,6 +155,7 @@ def _signature(pairs, s):
         round(s.foam_thickness, 6),
         round(s.max_tilt_deg, 4),
         round(s.stretch_tolerance, 4),
+        round(s.corner_angle_deg, 4),
         s.only_selected,
     )
 
@@ -184,7 +185,8 @@ def _rebuild(pairs, s):
 
         for run in core.iter_boundary_dart_segments(
                 bm, uv_layer, s.max_chord_deviation, s.max_angle_variation_deg,
-                only_selected=s.only_selected, islands=islands):
+                only_selected=s.only_selected, islands=islands,
+                corner_angle_deg=s.corner_angle_deg):
             if run.has_dihedral:
                 bevel = core.compute_bevel(run.mean_angle_deg, s.foam_thickness,
                                            s.max_tilt_deg)
@@ -585,6 +587,8 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         s = _settings(context)
         if s is None:
             return
+        layout.prop(s, "corner_angle_deg")
+        layout.separator()
         layout.prop(s, "scale_text_with_view")
         if s.scale_text_with_view:
             layout.prop(s, "label_uv_fraction")
