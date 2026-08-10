@@ -447,6 +447,13 @@ FOAM_CRAFTABILITY_RULES = (
 )
 
 
+# Mean areal distortion above this is not curvature -- it means the unwrap
+# collapsed or overlapped. Measured on Suzanne: a sound Smart UV Project sits
+# near 0.10 and the worst island near 0.30, while unwrapping the same mesh with
+# no seams at all reached a median of 17 and a worst of 120.
+DEGENERATE_STRETCH = 3.0
+
+
 @dataclass
 class Finding:
     """One craftability observation, with the fix attached."""
@@ -564,10 +571,31 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
     # --- Islands that cannot lie flat.
     stretch = uv_stretch_map(bm, uv_layer)
     bad_islands = []
+    island_mean = {}
     for index, faces in enumerate(islands):
         vals = [stretch.get(f, 0.0) for f in faces]
-        if vals and (sum(vals) / len(vals)) > stretch_tolerance:
+        if not vals:
+            continue
+        island_mean[index] = sum(vals) / len(vals)
+        if island_mean[index] > stretch_tolerance:
             bad_islands.append(index)
+
+    # Distortion this extreme is not a curvature problem -- it means the unwrap
+    # itself collapsed or overlapped, usually from unwrapping without seams.
+    # Worth separating, because the fix is completely different.
+    wrecked = [i for i, v in island_mean.items() if v > DEGENERATE_STRETCH]
+    if wrecked:
+        worst_val = max(island_mean.values())
+        findings.append(Finding(
+            'blocker', 'degenerate_unwrap', "The unwrap is collapsed or overlapping",
+            f"{len(wrecked)} island(s) distort by {worst_val:.0f}x -- far beyond "
+            f"anything curvature alone can cause.",
+            "Almost always this is an unwrap with no seams: the mesh has "
+            "nowhere to open, so faces pile on top of each other. Mark seams "
+            "where the pieces should separate and unwrap again. Smart UV "
+            "Project is a good starting point if you have no seams yet.",
+            islands=wrecked))
+
     if bad_islands:
         findings.append(Finding(
             'warn', 'non_developable', "Some pieces will not lie flat",

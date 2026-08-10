@@ -22,14 +22,27 @@ bl_info = {
 }
 
 from . import foam_angle_core  # noqa: F401  (pure helpers, nothing to register)
+from . import foam_settings
 from . import uv_fold_angle_overlay
 from . import paper_model_export
 
-# Submodules exposing register()/unregister(), in registration order.
-_modules = (
+# Submodules exposing register()/unregister(). Settings register first; every
+# foam module reads scene.foam_craft from it.
+_modules = [
+    foam_settings,
     uv_fold_angle_overlay,
     paper_model_export,
-)
+]
+
+# Optional foam modules, added as each is built. Missing ones are skipped so a
+# partially-built checkout still registers cleanly.
+for _name in ("foam_island_ids", "foam_overlay", "foam_preview", "foam_export"):
+    try:
+        _mod = __import__(f"{__name__}.{_name}", fromlist=[_name])
+    except ImportError:
+        continue
+    if hasattr(_mod, "register"):
+        _modules.append(_mod)
 
 
 def register():
