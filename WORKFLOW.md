@@ -6,6 +6,40 @@ getting it wrong first; the failures are included because they are the point.
 
 ---
 
+## 0. Ask before inventing
+
+The cheapest tool available, and the most underused. A question costs nothing,
+and the person you are working with usually already knows the answer — they
+have context you do not, and they have often solved this before.
+
+Order of preference, and inventing is last:
+
+1. **Ask.** Zero cost, usually decisive.
+2. **Use the built-in.** It is maintained and it already handles the cases you
+   have not thought of.
+3. **Read the documentation.**
+4. **Read the source**, targeted at a specific question.
+5. **Invent** — only with a stated reason why the four above did not serve.
+
+Treat the thought *"I'll design something for this"* as the trigger to stop and
+ask. Not as a courtesy: a question is genuinely cheaper than a wrong build plus
+the debugging plus the removal.
+
+Worked example from this project: the flat preview grew a bespoke shelf packer
+with gaps and wrap-around, to arrange pieces in the viewport. It was invented,
+it was wrong (offsets were added to UV positions rather than replacing them, so
+pieces overlapped), and it was pointless — the answer was to use the UV layout
+directly, u to x and v to y at true scale, because that layout had already been
+arranged on purpose. The whole detour, and the bug inside it, cost more than
+the question would have.
+
+The same instinct produced the other expensive mistakes here: a hand-rolled
+boundary walk when the Decimate modifier already had a UV-preserving Delimit
+option, and a hand-rolled convex/concave sign test when
+`BMEdge.calc_face_angle_signed` existed and was correct.
+
+---
+
 ## 1. Drive a real Blender, do not guess at the API
 
 Write nothing against remembered API. Blender's Python API changes between

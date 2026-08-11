@@ -2,6 +2,23 @@
 
 ## Working practices (read first)
 
+**Ask before inventing. Asking costs nothing and is the preferred move.**
+The user very often already knows the answer, and a question is cheaper than
+any of: reading source, guessing, or building something that has to be undone.
+Asking is not an interruption and does not annoy — it is the ideal path. Treat
+"I'll design something here" as the signal to stop and ask instead.
+
+Worked example (2026-08-10): the flat layout preview grew a bespoke shelf
+packer — gaps, shelf widths, wrap-around — to arrange pieces in the viewport.
+It was invented, it was buggy (offsets were added to UV positions rather than
+replacing them, so pieces overlapped), and it was unnecessary: the answer was
+"use u→x, v→y scaled to the mesh", because the UV layout *is* the arrangement
+and the user had already packed it deliberately. One question would have saved
+the whole detour and the bug in it.
+
+This generalises. Prefer, in order: ask the user, use the built-in, read the
+docs, read the source. Inventing is last, and it needs a stated reason.
+
 **Check the real API and docs before designing around a problem.** Blender
 almost always already has the feature. Read the current API reference or probe
 the live API before concluding something isn't possible. A "clever" workaround

@@ -185,11 +185,7 @@ def _compute_uv_to_world_scale(bm, islands, uv_layer):
 
 def _layout_flat(src_obj, bm, islands, uv_layer, collection, settings,
                  scale):
-    """Create flat pieces laid out on XY plane in shelf/grid packing."""
-    gap = 0.05  # 50mm gap between pieces
-    shelf_height = 0.0
-    shelf_x = 0.0
-    max_shelf_height = 0.0
+    """Create one flat piece per island, positioned by its UVs at true size."""
 
     for island_index, island_faces in enumerate(islands):
         # Create one flat mesh per island.
@@ -200,21 +196,12 @@ def _layout_flat(src_obj, bm, islands, uv_layer, collection, settings,
         obj = bpy.data.objects.new(f"Piece_{island_index:02d}", mesh)
         collection.objects.link(obj)
 
-        # Compute bounding box in XY to place on the shelf.
-        xs = [v.co.x for v in mesh.vertices]
-        ys = [v.co.y for v in mesh.vertices]
-        width = max(xs) - min(xs) if xs else 0.01
-        height = max(ys) - min(ys) if ys else 0.01
-
-        # Simple shelf packing: fit on current shelf, or start a new one.
-        if shelf_x + width + gap > 10.0:  # 10m max shelf width
-            shelf_x = 0.0
-            shelf_height += max_shelf_height + gap
-            max_shelf_height = 0.0
-
-        obj.location = Vector((shelf_x + width / 2, shelf_height + height / 2, 0.0))
-        shelf_x += width + gap
-        max_shelf_height = max(max_shelf_height, height)
+        # No packing. The mesh is built straight from the UVs, so the pieces
+        # already lie exactly where the unwrap put them, at true size -- u to
+        # x, v to y, scaled to match the sculpt. Re-packing them onto shelves
+        # threw away a layout the user had arranged deliberately, and got it
+        # wrong besides: the offsets were added to UV positions rather than
+        # replacing them, so pieces overlapped.
 
         # Color by angle and heat-form status.
         _apply_vertex_colors(obj, mesh, bm, island_faces, uv_layer, settings)
@@ -297,12 +284,6 @@ def _layout_dart_cut(src_obj, bm, islands, uv_layer, collection, settings,
 
     Flat mode first, then add marker polygons (or boolean subtractions) for darts.
     """
-    # First, lay out flat pieces.
-    gap = 0.05
-    shelf_height = 0.0
-    shelf_x = 0.0
-    max_shelf_height = 0.0
-
     piece_objects = []
 
     for island_index, island_faces in enumerate(islands):
@@ -314,20 +295,9 @@ def _layout_dart_cut(src_obj, bm, islands, uv_layer, collection, settings,
         collection.objects.link(obj)
         piece_objects.append((obj, island_index, island_faces))
 
-        # Compute bounding box in XY.
-        xs = [v.co.x for v in mesh.vertices]
-        ys = [v.co.y for v in mesh.vertices]
-        width = max(xs) - min(xs) if xs else 0.01
-        height = max(ys) - min(ys) if ys else 0.01
-
-        if shelf_x + width + gap > 10.0:
-            shelf_x = 0.0
-            shelf_height += max_shelf_height + gap
-            max_shelf_height = 0.0
-
-        obj.location = Vector((shelf_x + width / 2, shelf_height + height / 2, 0.0))
-        shelf_x += width + gap
-        max_shelf_height = max(max_shelf_height, height)
+        # Left where the UVs put it -- see _layout_flat. The dart markers are
+        # built in the same UV space, so they land on their pieces with no
+        # further bookkeeping.
 
         # Color by angle and heat-form status.
         _apply_vertex_colors(obj, mesh, bm, island_faces, uv_layer, settings)
