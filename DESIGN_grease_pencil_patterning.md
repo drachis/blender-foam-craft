@@ -1,6 +1,58 @@
 # Drawing the pattern instead of unwrapping it
 
-A design note, not a plan. Nothing here is built.
+A design note. The cutter described under "What is built" now exists; the rest
+is still design.
+
+## What is built (2026-08-11)
+
+`foam_craft/foam_gp_pattern.py` cuts a stroke into a mesh as real topology and
+marks it as a seam, using the two primitives Blender's own Knife is built from:
+`bmesh.utils.edge_split` for crossing vertices and `bmesh.utils.face_split` with
+`coords=` for the path through each face. Tested in `tests/test_gp_pattern.py`.
+
+Verified: a closed ring splits a sphere into exactly two regions with a single
+closed seam loop; the result is identical at densities from 32 to 4608 faces;
+a circle drawn inside a single face works, by subdividing that face until the
+stroke crosses it.
+
+## The next problem: real seam layouts are graphs, not loops
+
+Measured on `TestModel/Suzzanne-foamcraft-designed-uvs.blend`, which carries a
+hand-designed layout of 53 islands over 27,648 faces:
+
+| | |
+|---|---|
+| seam edges | 2464 |
+| seam vertices | 2417 |
+| degree 2 / 3 / 4 / 5 / 1 | 2329 / 74 / 6 / 4 / 4 |
+| junctions (degree != 2) | 88 |
+| **open paths** | **135** |
+| **closed loops** | **1** |
+
+So a real pattern is a network of open paths meeting at junctions. The cutter
+handles closed loops and skips paths whose ends fall inside a face, because
+`face_split` joins two *boundary* vertices and an end in mid-face is neither.
+On this asset that is 1 stroke of 136.
+
+**This is not solvable by refinement.** Subdividing a face containing a junction
+leaves the junction inside some smaller face; it never lands on an edge.
+
+The route that does work, and stays within `face_split`, is to order the splits
+so each junction becomes a vertex before it is needed:
+
+1. Through a face containing a junction, first split along **two** of its
+   branches as a single boundary-to-boundary path. The junction point is one of
+   the `coords`, so it becomes a real vertex on the new edge.
+2. Each remaining branch then runs from its own boundary crossing to that
+   vertex, which is now on the boundary of one of the two new faces.
+
+A junction of degree *n* needs one through-split plus *n - 2* further splits.
+The bookkeeping is choosing which two branches pair up and which sub-face each
+remaining branch lands in.
+
+The alternative is `BM_face_split_edgenet`, which handles an arbitrary net per
+face in one call and is what the C knife uses -- but it is not exposed to
+Python, so it would mean shipping a patched Blender.
 
 ## The idea
 
