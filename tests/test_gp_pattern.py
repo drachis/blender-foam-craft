@@ -333,11 +333,72 @@ def test_circle_inside_a_face():
     return out
 
 
+# --- 5. Crossing strokes make closed pieces -----------------------------
+def test_crossing_strokes_make_regions():
+    """A pattern maker crosses strokes on purpose: that is what closes a piece.
+
+    Two horizontal and two vertical strokes across a plane must leave a 3x3 grid
+    of regions. This is the shape a real layout has -- measured on the designed
+    Suzanne, its seams are 135 open paths meeting at 88 junctions and only one
+    closed loop -- so it matters far more than the tidy single loop.
+
+    Nothing here special-cases a junction. The strokes are cut one after
+    another, so by the time the second crosses the first, the first is already
+    ordinary mesh topology.
+    """
+    _clear()
+    bpy.ops.mesh.primitive_plane_add(size=2.0)
+    me = bpy.context.object.data
+    bm0 = bmesh.new()
+    bm0.from_mesh(me)
+    bmesh.ops.subdivide_edges(bm0, edges=bm0.edges[:], cuts=15,
+                              use_grid_fill=True)
+    bm0.to_mesh(me)
+    bm0.free()
+
+    n = 40
+    strokes = []
+    for y in (-0.37, 0.41):
+        strokes.append(([Vector((-1.0 + 2.0 * i / (n - 1), y, 0.0))
+                         for i in range(n)], False))
+    for x in (-0.29, 0.33):
+        strokes.append(([Vector((x, -1.0 + 2.0 * i / (n - 1), 0.0))
+                         for i in range(n)], False))
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    edges, open_ends = gp.cut_strokes(bm, strokes, snap_distance=0.01)
+    for edge in edges:
+        edge.seam = True
+    bm.to_mesh(me)
+    me.update()
+    bm.free()
+
+    rep = _seam_report(me, [p for pts, _ in strokes for p in pts])
+    rep["new_edges"] = len(edges)
+    rep["open_ends"] = open_ends
+    rep["checks"] = {
+        # Two cuts each way divide the sheet into nine pieces.
+        "nine_regions": rep["regions"] == 9,
+        "no_unresolved_ends": open_ends == 0,
+        "seams_neither_empty_nor_all":
+            0 < rep["seam_edges"] < rep["total_edges"],
+        # Bounded by the snap tolerance, not by zero. The two loose ends of each
+        # stroke are deliberately pulled onto the nearest boundary within that
+        # distance -- that is what the tolerance is for, and a marker line has
+        # width anyway. Everything between the ends is still exact.
+        "cut_within_snap_of_the_strokes": rep["cut_vs_stroke"] <= 0.01,
+        "snap_did_not_run_wild": rep["cut_vs_stroke"] > 0.0,
+    }
+    return rep
+
+
 TESTS = (
     test_face_split_follows_a_polyline,
     test_ring_splits_a_sphere_in_two,
     test_density_does_not_change_the_line,
     test_circle_inside_a_face,
+    test_crossing_strokes_make_regions,
 )
 
 result = {}

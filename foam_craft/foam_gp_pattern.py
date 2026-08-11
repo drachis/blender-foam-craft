@@ -147,6 +147,38 @@ def _vert_at(edge, fac, snap_distance):
     return new_vert
 
 
+def _endpoint_vert(face, point, snap_distance):
+    """Resolve a stroke's loose end onto the boundary of the face it sits in.
+
+    A pattern maker crosses strokes deliberately, so that the pieces they bound
+    close up -- an end is normally drawn *onto* another line rather than left
+    hanging. Strokes are cut one after another, so by the time this one is being
+    cut, the line it ends on is already real mesh topology and the end is lying
+    on an ordinary edge. Splitting that edge turns the end into a boundary
+    vertex, which is exactly what ``face_split`` needs.
+
+    Returns None when the end really is hanging in open space, further than the
+    tolerance from anything. Nothing is invented to rescue it: a seam that
+    dead-ends mid-face separates no regions anyway, so extending it to the
+    nearest boundary would add a cut nobody drew and still achieve nothing.
+    """
+    if snap_distance <= 0.0:
+        return None
+    best_edge, best_fac, best_dist = None, 0.0, None
+    for edge in face.edges:
+        a, b = edge.verts[0].co, edge.verts[1].co
+        span = b - a
+        denom = span.length_squared
+        fac = 0.0 if denom < 1e-18 else \
+            max(0.0, min(1.0, (point - a).dot(span) / denom))
+        dist = (point - (a + span * fac)).length
+        if best_dist is None or dist < best_dist:
+            best_edge, best_fac, best_dist = edge, fac, dist
+    if best_edge is None or best_dist > snap_distance:
+        return None
+    return _vert_at(best_edge, best_fac, snap_distance)
+
+
 def _cut_path_edges(face, entry, exit_v, n_interior):
     """The edges face_split just created, walked off the new face's boundary.
 
@@ -308,6 +340,21 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
         # run's entry. On an open stroke this index is always in range.
         runs[(run_index + 1) % len(runs)]["entry"] = vert
 
+    # An open stroke's two loose ends. Resolved after the crossings, so an end
+    # landing on a line cut earlier in this same call finds it already there.
+    if not cyclic and runs:
+        if runs[0]["entry"] is None and runs[0]["interior"]:
+            runs[0]["entry"] = _endpoint_vert(
+                runs[0]["face"], runs[0]["interior"][0], snap_distance)
+            if runs[0]["entry"] is not None:
+                runs[0]["interior"] = runs[0]["interior"][1:]
+        last = runs[-1]
+        if last["exit"] is None and last["interior"]:
+            last["exit"] = _endpoint_vert(
+                last["face"], last["interior"][-1], snap_distance)
+            if last["exit"] is not None:
+                last["interior"] = last["interior"][:-1]
+
     # --- Split each face along its run.
     new_edges = []
     skipped_open = 0
@@ -342,3 +389,36 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
         crossings=len(crossings), open_ends=skipped_open,
         snap=snap_distance))
     return new_edges, skipped_open
+
+
+def cut_strokes(bm, strokes, snap_distance=0.0):
+    """Cut several strokes, one after another. Returns (edges, open_ends).
+
+    Order is what makes intersections work. A pattern maker crosses strokes on
+    purpose, because that is what closes a region into a piece -- and once the
+    first stroke has been cut, its line *is* mesh topology, so the second one
+    crossing it is an ordinary edge crossing with nothing special about it. The
+    junction needs no special case at all, as long as the strokes are not cut
+    simultaneously.
+
+    `strokes` is a sequence of (points, cyclic) pairs.
+    """
+    all_edges = []
+    open_ends = 0
+    for index, (points, cyclic) in enumerate(strokes):
+        try:
+            edges, ends = cut_stroke(bm, points, snap_distance=snap_distance,
+                                     cyclic=cyclic)
+        except StrokeCutError as exc:
+            # One bad stroke should not discard the rest of the pattern. Which
+            # one failed is worth knowing, so it is named rather than counted.
+            _log.warning(foam_log.summary(
+                "stroke_failed", index=index, points=len(points),
+                cyclic=cyclic, reason=str(exc)[:120]))
+            continue
+        all_edges.extend(edges)
+        open_ends += ends
+    _log.info(foam_log.summary(
+        "cut_strokes", strokes=len(strokes), edges=len(all_edges),
+        open_ends=open_ends, snap=snap_distance))
+    return all_edges, open_ends
