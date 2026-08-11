@@ -297,17 +297,25 @@ def _on_depsgraph_update(scene, depsgraph):
     mark_dirty()
 
 
-def _modal_running(context):
-    """True while an operator is mid-drag.
+# Only these count as "mid-drag". The UV editor keeps view navigation
+# operators such as IMAGE_OT_view_pan registered as modal handlers at all
+# times, so testing for any modal operator reports a drag permanently -- which
+# stopped the model ever rebuilding and the overlay ever drawing.
+_TRANSFORM_PREFIX = "TRANSFORM_OT_"
 
-    A transform mutates UVs continuously and the mesh itself is unchanged, so
-    there is nothing to re-derive until it finishes. Reading the mesh during it
-    is what crashes.
+
+def _modal_running(context):
+    """True while a transform is actually dragging.
+
+    A transform mutates UVs continuously while leaving the mesh unchanged, so
+    there is nothing to re-derive until it ends -- and reading the mesh during
+    it is what crashed Blender.
     """
     window = getattr(context, "window", None)
     if window is None:
         return False
-    return bool(getattr(window, "modal_operators", ()))
+    return any(op.bl_idname.startswith(_TRANSFORM_PREFIX)
+               for op in getattr(window, "modal_operators", ()))
 
 
 def _timer_tick():
@@ -377,6 +385,15 @@ def draw_callback():
     # instead is what corrupted geometry and crashed Blender during a modal
     # transform. This callback now only renders what the timer prepared.
     if not _cache.runs and not _cache.island_labels:
+        return
+
+    # Nothing is drawn while a drag is in progress. The cache cannot be
+    # refreshed mid-transform without reading the mesh at the moment that
+    # crashes, so the alternative is marks frozen where the geometry used to
+    # be -- an angle sitting over the wrong piece is worse than no angle at
+    # all. Blender still draws the islands themselves, so what is being moved
+    # stays visible; the marks return, correctly placed, on release.
+    if _modal_running(context):
         return
 
     view = region.view2d
