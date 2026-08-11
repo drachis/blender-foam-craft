@@ -162,6 +162,16 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
                     "ticks still show, so nothing is lost but the crowding. "
                     "Zoom in and they come back",
         default=34, min=0, max=400)
+    min_run_length: bpy.props.FloatProperty(
+        name="Shortest Cut",
+        description="Cut runs shorter than this along the real surface are "
+                    "flagged with a warning mark. This is a property of the "
+                    "piece, not of the view -- it is measured in millimetres "
+                    "on the sculpt, so zooming the UV editor or scaling the "
+                    "UVs never changes which edges are flagged. Set it to the "
+                    "shortest pass you can actually make on the saw",
+        default=0.006, min=0.0, max=0.2,
+        subtype='DISTANCE', unit='LENGTH')
     corner_angle_deg: bpy.props.FloatProperty(
         name="Corner Angle",
         description="Turn in the piece outline beyond which a vertex counts as "

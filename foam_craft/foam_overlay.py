@@ -78,6 +78,11 @@ class _RunMark(NamedTuple):
     # tangent and outward normal there, so the mark can be drawn as a T lying
     # along the boundary with its stem cut into the material.
     darts: tuple = ()
+    # Length of the run along the real surface, in metres of world space. This
+    # is a property of the sculpt, not of the unwrap or the viewport, so it is
+    # what the "too short to cut" warning keys on: scaling the UVs or zooming
+    # the editor must not change whether a cut is makeable.
+    length_3d: float = 0.0
 
 
 class _OverlayCache:
@@ -209,7 +214,8 @@ def _rebuild(pairs, s):
         for run in core.iter_boundary_dart_segments(
                 bm, uv_layer, s.max_chord_deviation, s.max_angle_variation_deg,
                 only_selected=s.only_selected, islands=islands,
-                corner_angle_deg=s.corner_angle_deg):
+                corner_angle_deg=s.corner_angle_deg,
+                matrix=obj.matrix_world):
             if run.has_dihedral:
                 bevel = core.compute_bevel(run.mean_angle_deg, s.foam_thickness,
                                            s.max_tilt_deg)
@@ -244,7 +250,7 @@ def _rebuild(pairs, s):
             runs.append(_RunMark(
                 run.uv_start.x, run.uv_start.y, run.uv_end.x, run.uv_end.y,
                 run.mean_angle_deg, per_side, run.has_dihedral, heat, ox, oy,
-                outline, darts))
+                outline, darts, run.length_3d))
 
         # Piece numbers come from the numbering operator's attribute when it
         # has been run; otherwise fall back to island order so the overlay
@@ -537,14 +543,23 @@ def draw_callback():
                     continue
                 dart_seen[key] = (tu, tv, nu, nv, color)
 
-        # Skip the number when the run is too short on screen to hold it.
-        # This is what stops a notch, where several short runs converge, from
-        # becoming a heap of overlapping digits.
+        # Two separate questions, deliberately kept apart.
+        #
+        # "Is there room on screen for the number?" is a legibility question.
+        # It depends on zoom and on how the UVs happen to be scaled, and the
+        # answer changes as you navigate. Failing it hides the number, and
+        # nothing more -- zoom in and it comes back.
+        #
+        # "Is this run too short to cut?" is a craftability question, and the
+        # warning mark belongs to it. It is measured along the real surface in
+        # metres, so it is the same answer at any zoom and at any UV scale.
+        # These were previously one test, which made the warning flicker on and
+        # off while zooming and moved it between edges when the UVs were scaled
+        # 10x or 0.1x -- reporting a property of the view as if it were a
+        # property of the work.
         run_px = ((bbx - bax) ** 2 + (bby - bay) ** 2) ** 0.5
         labelled = run.has_dihedral and abs(run.angle_deg) >= s.min_angle
-        if labelled and run_px < s.min_label_run_px:
-            # Mark the spot rather than dropping it silently: an angle that is
-            # simply absent looks like a run that needs no cut.
+        if labelled and run.length_3d < s.min_run_length:
             mid = len(bracket) // 2
             if len(bracket) % 2 == 0:
                 a_pt, b_pt = bracket[mid - 1], bracket[mid]
@@ -553,7 +568,10 @@ def draw_callback():
             else:
                 mx, my, _, _, nx, ny = bracket[mid]
             nlen = (nx * nx + ny * ny) ** 0.5 or 1.0
-            hidden.append((mx, my, nx / nlen, ny / nlen))
+            # Both marks anchor to the same point on the bracket, so note
+            # whether a number is also going to land here and needs clearing.
+            hidden.append((mx, my, nx / nlen, ny / nlen,
+                           run_px >= s.min_label_run_px))
         if labelled and run_px >= s.min_label_run_px:
             text = f"{abs(run.per_side_deg):.{s.decimals}f}°"
             # Sit the number against the middle of the bracket as drawn, which
@@ -596,13 +614,20 @@ def draw_callback():
 
     _draw_lines(segments, max(1.0, scale))
 
-    # Warn where a number was withheld for want of room.
+    # Warn where a run is too short to cut cleanly. This is about the piece,
+    # not about the view: the run is a few millimetres of real edge, and no
+    # amount of zooming will make it sawable.
     if hidden:
         warn_color = tuple(s.suppressed_color)
         blf.size(font_id, max(8, int(angle_px * 0.9)))
-        for ax0, ay0, nx, ny in hidden:
+        for ax0, ay0, nx, ny, numbered in hidden:
             width, height = blf.dimensions(font_id, "!")
             clear = abs(nx) * width * 0.5 + abs(ny) * height * 0.5 + tick * 0.35
+            if numbered:
+                # The number is drawing at this same anchor, so sit outboard of
+                # it rather than on top of it.
+                nwidth, nheight = blf.dimensions(font_id, "0.0°")
+                clear += abs(nx) * nwidth + abs(ny) * nheight
             blf.position(font_id, ax0 + nx * clear - width / 2,
                          ay0 + ny * clear - height / 2, 0)
             blf.color(font_id, *warn_color)
@@ -672,7 +697,12 @@ class FOAM_OT_check_craftability(bpy.types.Operator):
             max_angle_variation_deg=s.max_angle_variation_deg,
             sheet_width=s.sheet_width or None,
             sheet_height=s.sheet_height or None,
-            stretch_tolerance=s.stretch_tolerance)
+            stretch_tolerance=s.stretch_tolerance,
+            # Same threshold and same world matrix the overlay's warning mark
+            # uses, so a run flagged with a "!" in the UV editor is the same
+            # run counted in the fragmented-runs finding here.
+            min_run_length=s.min_run_length,
+            matrix=obj.matrix_world)
         blockers = sum(1 for f in _findings if f.severity == 'blocker')
         warnings = sum(1 for f in _findings if f.severity == 'warn')
         self.report({'INFO'},
@@ -756,6 +786,7 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         layout.prop(s, "decimals")
         layout.prop(s, "min_angle")
         layout.prop(s, "min_label_run_px")
+        layout.prop(s, "min_run_length")
         layout.prop(s, "convex_color")
         layout.prop(s, "concave_color")
         layout.prop(s, "suppressed_color")

@@ -340,7 +340,8 @@ def _run_deviation(points, i, j):
 
 def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
                            max_angle_variation_deg, island_index=0,
-                           corner_angle_deg=CORNER_ANGLE_DEG):
+                           corner_angle_deg=CORNER_ANGLE_DEG,
+                           matrix=None):
     """Split one boundary cycle into DartRuns.
 
     A run is one continuous pass at one blade tilt, so the angle staying put is
@@ -395,8 +396,15 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
             measured = measured[pivot:] + measured[:pivot]
 
     # points[k] is the start vertex of cycle[k]; the final entry closes the loop.
+    # Taken through the object's world matrix when one is given, because every
+    # length derived from them -- run length, chord deviation -- is compared
+    # against a real-world tolerance in metres. Vertex coordinates are
+    # object-local, so on an object scaled 10x they understate the piece by a
+    # factor of ten and the tolerances silently mean something else.
     points = [l.vert.co.copy() for l in cycle]
     points.append(cycle[-1].link_loop_next.vert.co.copy())
+    if matrix is not None:
+        points = [matrix @ p for p in points]
     uvs = [l[uv_layer].uv.copy() for l in cycle]
     uvs.append(cycle[-1].link_loop_next[uv_layer].uv.copy())
 
@@ -543,7 +551,8 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
 def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
                                 max_angle_variation_deg, only_selected=False,
                                 islands=None,
-                                corner_angle_deg=CORNER_ANGLE_DEG):
+                                corner_angle_deg=CORNER_ANGLE_DEG,
+                                matrix=None):
     """Yield a DartRun for every saw pass along every UV island boundary.
 
     This replaces per-mesh-edge iteration: foam flexes between darts, so a dart
@@ -557,7 +566,7 @@ def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
             for run in segment_boundary_cycle(
                     cycle, uv_layer, max_chord_deviation,
                     max_angle_variation_deg, island_index=index,
-                    corner_angle_deg=corner_angle_deg):
+                    corner_angle_deg=corner_angle_deg, matrix=matrix):
                 yield run
 
 
@@ -720,7 +729,7 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
                         max_angle_variation_deg=10.0,
                         sheet_width=None, sheet_height=None,
                         stretch_tolerance=0.25, min_run_length=0.006,
-                        islands=None):
+                        islands=None, matrix=None):
     """Check whether this mesh and unwrap can actually be built from foam.
 
     Returns a list of Findings, most severe first. Every warning carries the
@@ -860,7 +869,7 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
     # --- Cuts too short to make cleanly.
     runs = list(iter_boundary_dart_segments(
         bm, uv_layer, max_chord_deviation, max_angle_variation_deg,
-        islands=islands))
+        islands=islands, matrix=matrix))
     if runs:
         stubby = [r for r in runs if r.has_dihedral and r.length_3d < min_run_length]
         if len(stubby) > len(runs) * 0.25:
