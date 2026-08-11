@@ -44,6 +44,11 @@ from . import foam_log
 
 _log = foam_log.get_logger()
 
+# How many times a face may be subdivided to let a stroke drawn inside it cross
+# an edge. Each pass turns one face into 16, so this is a factor of 65536 -- far
+# past the point where the mesh, not the cutter, is the problem.
+_MAX_REFINE = 4
+
 
 class StrokeCutError(Exception):
     """The stroke could not be walked across the mesh.
@@ -77,6 +82,24 @@ def _shared_edge(face_a, face_b):
     for edge in face_a.edges:
         if face_b in edge.link_faces:
             return edge
+    return None
+
+
+def _shared_vert(face_a, face_b):
+    """The corner two faces meet at, when they share no edge.
+
+    On a quad grid this is the common case wherever a stroke passes close to a
+    grid vertex: the point before and the point after sit on diagonal
+    neighbours, which touch at one corner and share no edge at all. Treating
+    that as an error rejected an ordinary circle drawn on a plane.
+
+    The crossing is then the corner itself, and no edge needs splitting -- the
+    stroke goes through a vertex that is already there.
+    """
+    verts_b = set(face_b.verts)
+    for vert in face_a.verts:
+        if vert in verts_b:
+            return vert
     return None
 
 
@@ -189,6 +212,29 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
     bvh = BVHTree.FromBMesh(bm)
     assigned = _assign_faces(bvh, bm, points)
 
+    # A closed stroke lying wholly inside one face crosses no edge, so it has no
+    # entry or exit and face_split -- which joins two *boundary* vertices -- has
+    # nothing to work with. Left alone this returns silently having cut nothing,
+    # which is the worst outcome: the pattern looks applied and is not there.
+    #
+    # The mesh is simply too coarse for the piece being drawn, so the face is
+    # subdivided until the stroke crosses it. Refining where a line was drawn is
+    # what a modeller would do by hand, and it adds geometry only inside the
+    # face the stroke is already in.
+    refined = 0
+    while refined < _MAX_REFINE and len({f for f, _ in assigned}) == 1:
+        face = assigned[0][0]
+        bmesh.ops.subdivide_edges(bm, edges=list(face.edges), cuts=3,
+                                  use_grid_fill=True)
+        bm.faces.ensure_lookup_table()
+        bvh = BVHTree.FromBMesh(bm)
+        assigned = _assign_faces(bvh, bm, points)
+        refined += 1
+    if len({f for f, _ in assigned}) == 1:
+        raise StrokeCutError(
+            "the stroke stays inside a single face after %d subdivisions; it "
+            "is far smaller than the mesh it is drawn on" % refined)
+
     # --- Group the stroke into per-face runs, and note every crossing.
     #
     # A crossing is where the stroke leaves one face for the next. Each is
@@ -212,15 +258,20 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
                 current["interior"].append(surf_pt)
             continue
         edge = _shared_edge(current["face"], face)
-        if edge is None:
-            # The stroke jumped a face. Resampling finer is the fix, and
-            # guessing a route across the intervening faces would invent a line
-            # the user did not draw.
-            raise StrokeCutError(
-                "consecutive stroke points landed on faces that share no edge; "
-                "resample the stroke more finely")
-        fac = _crossing_on_edge(edge, assigned[i - 1][1], surf_pt)
-        crossings.append((edge, fac, len(runs)))
+        if edge is not None:
+            fac = _crossing_on_edge(edge, assigned[i - 1][1], surf_pt)
+            crossings.append(("edge", (edge, fac), len(runs)))
+        else:
+            corner = _shared_vert(current["face"], face)
+            if corner is None:
+                # The stroke jumped a face entirely. Resampling finer is the
+                # fix; guessing a route across the faces in between would put a
+                # cut where nothing was drawn.
+                raise StrokeCutError(
+                    "consecutive stroke points landed on faces that share "
+                    "neither an edge nor a corner; resample the stroke more "
+                    "finely")
+            crossings.append(("vert", corner, len(runs)))
         runs.append(current)
         if i == 0:
             # The closing segment landed back on the run the walk began in, so
@@ -244,8 +295,14 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
     # Order matters. edge_split on a shared edge changes both adjacent faces, so
     # doing it up front means each run finds its entry vertex already present.
     # Splitting faces first would invalidate the edges these crossings refer to.
-    for edge, fac, run_index in crossings:
-        vert = _vert_at(edge, fac, snap_distance)
+    for kind, payload, run_index in crossings:
+        if kind == "edge":
+            vert = _vert_at(payload[0], payload[1], snap_distance)
+        else:
+            # A corner the stroke passed through. It already exists, so there is
+            # nothing to split -- and splitting anything here would move a
+            # vertex the user never drew near.
+            vert = payload
         runs[run_index]["exit"] = vert
         # Wraps for a closed stroke, where the last run's exit is the first
         # run's entry. On an open stroke this index is always in range.

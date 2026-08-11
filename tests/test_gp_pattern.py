@@ -70,8 +70,33 @@ def _seam_report(me, projected):
     for point in projected:
         worst = max(worst, min((point - v.co).length for v in seam_verts))
 
+    # Regions the seam actually encloses: connected groups of faces you can walk
+    # between without crossing a seam. This is the cut's own job, and it is a
+    # different question from how well the unwrap flattens the result. A ring
+    # with a hole in it is one region but cannot be flattened without a further
+    # cut, so its UV island count is larger -- a fact about the unwrap, not about
+    # whether the stroke separated the surface.
+    seen = set()
+    regions = 0
+    for face in bm.faces:
+        if face in seen:
+            continue
+        regions += 1
+        stack = [face]
+        seen.add(face)
+        while stack:
+            current = stack.pop()
+            for loop in current.loops:
+                if loop.edge.seam:
+                    continue
+                for other in loop.edge.link_faces:
+                    if other not in seen:
+                        seen.add(other)
+                        stack.append(other)
+
     out = {
         "islands": len(islands),
+        "regions": regions,
         "seam_edges": len(seam_edges),
         "total_edges": len(bm.edges),
         "faces": len(bm.faces),
@@ -247,10 +272,72 @@ def test_density_does_not_change_the_line():
     return out
 
 
+# --- 4. A closed stroke that touches no existing edge -------------------
+def test_circle_inside_a_face():
+    """A circle drawn in the middle of a plane, crossing nothing.
+
+    Two ways this goes wrong. On a single quad the stroke crosses no edge at
+    all, so there is no entry or exit and ``face_split`` has nothing to join --
+    which returned silently having cut nothing, the worst outcome, because the
+    pattern looks applied and is not there. On a grid the circle passes close to
+    grid vertices, so consecutive points land on faces that meet at a *corner*
+    and share no edge; that was rejected as an error.
+
+    Both are ordinary things to draw, so both must work, and the result must be
+    two islands -- the disc and the sheet around it.
+    """
+    cases = {}
+    for label, cuts in (("one_quad", 0), ("grid_4x4", 3), ("grid_16x16", 15)):
+        _clear()
+        bpy.ops.mesh.primitive_plane_add(size=2.0)
+        me = bpy.context.object.data
+        if cuts:
+            bm0 = bmesh.new()
+            bm0.from_mesh(me)
+            bmesh.ops.subdivide_edges(bm0, edges=bm0.edges[:], cuts=cuts,
+                                      use_grid_fill=True)
+            bm0.to_mesh(me)
+            bm0.free()
+        faces_before = len(me.polygons)
+
+        points = [Vector((0.5 * math.cos(2 * math.pi * i / 48),
+                          0.5 * math.sin(2 * math.pi * i / 48), 0.0))
+                  for i in range(48)]
+        projected = _project(me, points)
+        n_new, open_ends = _cut_into(me, points, snap=0.0, cyclic=True)
+        rep = _seam_report(me, projected)
+        cases[label] = {
+            "faces_before": faces_before,
+            "faces_after": rep["faces"],
+            "new_edges": n_new,
+            "open_ends": open_ends,
+            "islands": rep["islands"],
+            "regions": rep["regions"],
+            "one_closed_loop": rep["one_closed_loop"],
+            "cut_vs_stroke": rep["cut_vs_stroke"],
+        }
+
+    out = dict(cases)
+    out["checks"] = {
+        # Two islands: the disc, and the sheet it was cut from.
+        "two_regions_everywhere":
+            all(c["regions"] == 2 for c in cases.values()),
+        "one_closed_loop_everywhere":
+            all(c["one_closed_loop"] for c in cases.values()),
+        "cut_something_everywhere":
+            all(c["new_edges"] > 0 for c in cases.values()),
+        "no_open_ends": all(c["open_ends"] == 0 for c in cases.values()),
+        "cut_lands_on_the_stroke":
+            all(c["cut_vs_stroke"] < 1e-4 for c in cases.values()),
+    }
+    return out
+
+
 TESTS = (
     test_face_split_follows_a_polyline,
     test_ring_splits_a_sphere_in_two,
     test_density_does_not_change_the_line,
+    test_circle_inside_a_face,
 )
 
 result = {}
