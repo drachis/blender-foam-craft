@@ -110,6 +110,56 @@ was in place can only be cleared by restarting. Restart when in doubt.
 
 ---
 
+## 4b. A renderer must not read the model
+
+The costliest bug in this project. With the overlay active, dragging UVs
+crashed Blender and corrupted geometry within about a frame. Two attempted
+fixes made it worse before the cause was understood.
+
+The rule is **not** "do less work in the draw callback". It is that the draw
+path must not touch live data at all. Reading is enough to do damage: a modal
+transform is mutating the same structures, and any call that rebuilds internal
+state — `ensure_lookup_table()` on a BMesh sequence, for instance — mutates
+while the operator is mid-write.
+
+Blender's own UV overlay is built exactly this way, and it is worth reading
+before inventing anything (`draw/engines/overlay/overlay_mesh.hh`,
+`MeshUVs::edit_object_sync`): it only submits GPU batches extracted earlier,
+and invalidation arrives as a dirty tag. Notably there is **no position-only
+fast path** — a UV transform tags `BKE_MESH_BATCH_DIRTY_ALL` and everything is
+re-extracted every frame. So the problem was never the volume of work. It was
+doing any of it at the wrong moment.
+
+Add-ons cannot hook that extraction pipeline, but the shape transfers:
+
+| Piece | Does | Touches the model |
+|---|---|---|
+| Draw handler | renders cached plain data | **never** |
+| `depsgraph_update_post` | raises a dirty flag, nothing else | **never** |
+| `bpy.app.timers` tick | rebuilds when dirty, never mid-drag | yes, at a safe point |
+
+A timer fires *between* operator executions rather than inside one, which is
+the closest thing Python has to a sync point.
+
+Two dead ends, so they are not retried: splitting the cache into cheap and
+expensive halves still read the model from the draw handler and turned a freeze
+into corruption; moving that read into a depsgraph handler was no better,
+because during a modal transform it fires every frame, mid-mutation.
+
+Three corollaries, each learned the same way:
+
+- **Never draw known-stale data.** A flag set by the timer cannot prevent a
+  stale frame — the draw beats the timer. Refuse to draw while dirty instead.
+  One frame late and correct beats one frame early and wrong.
+- **Detect the specific operator, not the general condition.** Testing for "any
+  modal operator running" reported a drag permanently, because the UV editor
+  keeps `IMAGE_OT_view_pan` registered as a modal handler at all times. The
+  overlay silently never rebuilt and would never have drawn. Match
+  `TRANSFORM_OT_`.
+- **Hold no live-data handles across frames.** See section 3.
+
+---
+
 ## 5. Rebuild the scene for every measurement
 
 Inherited scene state produces numbers that move between supposedly identical
@@ -146,6 +196,52 @@ what piece numbering depended on. **Test the property you actually rely on.**
 
 Use a worst case. A fully seamed cube makes every face equidistant from the
 origin, so ties are guaranteed and any order-dependence shows immediately.
+
+---
+
+## 6b. Interactive features can only be verified interactively
+
+This is why the project favours BDD over unit tests, and it is not a
+preference — it is the only thing that catches this class of bug.
+
+Every scripted check passed while the overlay was crashing Blender. None of
+them entered a modal loop, because **scripted operators do not drag**:
+`bpy.ops.transform.rotate(value=0.13)` executes immediately with an explicit
+value and never enters modal. Nudging coordinates and calling
+`bmesh.update_edit_mesh` is further still from a transform. Thirty-six real
+transform operators ran clean in a script while a single hand-drag crashed
+within a frame.
+
+So for anything interactive:
+
+- The scenario is *"given the overlay is on, when I drag a UV, then Blender
+  keeps running"*, and only a human or a UI-driving harness can execute it.
+- Until someone has done that, the fix is **not verified**. Say so plainly
+  rather than reporting a pass — claiming a fix from tests that never touched
+  the failing path is how a freeze became data corruption here.
+- "Blocked on: needs a hand test" is a useful, finished-sounding result.
+
+Scripted checks still earn their place for everything downstream of the
+interaction — geometry, counts, exported files — where ground truth is
+arithmetic. Just do not let them speak for the interaction itself.
+
+---
+
+## 6c. Verify the verification
+
+Three separate checks misreported the same draw path in one session:
+`inspect.getsource` served stale lines from `linecache` after a file edit, and
+two string slices ran past the end of the function and swept in code that was
+not being tested. Each returned a confident, wrong answer.
+
+- Prefer reading state back out of the running application over introspecting
+  source text.
+- If you must inspect source, extract real function bounds — not a slice
+  between two guessed markers.
+- Distrust a check that has never failed. Make it fail on purpose once.
+- When a result contradicts a previous measurement, suspect the measurement
+  before the code. A 13% "failure" in outward normals turned out to be a
+  centroid test that is simply invalid on concave shapes; the code was exact.
 
 ---
 
@@ -189,6 +285,37 @@ reader can tell a checked claim from an assumed one. Where something is
 unverified, the message says so.
 
 Agents get a worktree and a branch; collapse to main for linear history.
+
+---
+
+## 10. Drop a marker as each plan step completes
+
+Tags are cheap and finding your way back is not. Drop one whenever a plan step
+lands, so there is always a named point to return to when the next attempt goes
+wrong — as the overlay work did, twice.
+
+Two kinds, and keeping them distinct matters:
+
+| Kind | Moves | For |
+|---|---|---|
+| `v0.1`, `v0.2` … | **never** | Fixed release markers. Meaningful milestones only. |
+| `lastKnownGood` | every confirmation | The latest state confirmed working *by hand* |
+| `step-<n>-<slug>` | never | One per completed plan step, for navigation |
+
+Move `lastKnownGood` with `git tag -f`, and only after the state has actually
+been confirmed — for interactive features, that means a human tried it. It is
+the tag you reach for when something breaks and you need a floor to stand on.
+
+**A version number is a claim, so do not attach it to an unverified state.**
+`v0.1` was first cut at a commit that corrupted geometry on the first UV drag,
+because the automated checks all passed. Naming the moving marker
+`lastKnownGood` rather than a version keeps that distinction honest: one says
+"this is a release", the other says "this is the furthest point someone has
+actually confirmed".
+
+Annotate them. A tag message costs nothing and is the natural place to record
+what a state does and does not do — a good annotation lists what was verified,
+with numbers, and states plainly what was not.
 
 ---
 
