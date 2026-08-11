@@ -11,6 +11,18 @@ Nothing here computes anything -- the geometry lives in ``foam_angle_core``.
 import bpy
 
 from . import foam_angle_core as core
+from . import foam_log
+
+
+def _apply_log_level(settings):
+    """Push the chosen level into the logger.
+
+    Lives here rather than inline in the property so the lambda stays short and
+    the import of foam_log is at module level, where a failure shows up at
+    registration instead of the first time the dropdown is touched.
+    """
+    foam_log.set_level(settings.log_level)
+
 
 
 # Physical stock this project actually buys, in metres. Foam grade is a
@@ -162,6 +174,19 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
                     "ticks still show, so nothing is lost but the crowding. "
                     "Zoom in and they come back",
         default=34, min=0, max=400)
+    log_level: bpy.props.EnumProperty(
+        name="Log Detail",
+        description="How much FoamCraft writes to its log file. Debug adds a "
+                    "line for every overlay rebuild, which is one per timer "
+                    "tick while the mesh is changing -- useful when checking a "
+                    "number, far too noisy to leave on",
+        items=[
+            ('INFO', "Normal", "Operators and their results"),
+            ('DEBUG', "Debug", "Every overlay rebuild, with counts"),
+            ('WARNING', "Problems Only", "Warnings and errors"),
+        ],
+        default='INFO',
+        update=lambda self, ctx: _apply_log_level(self))
     min_run_length: bpy.props.FloatProperty(
         name="Shortest Cut",
         description="Cut runs shorter than this along the real surface are "

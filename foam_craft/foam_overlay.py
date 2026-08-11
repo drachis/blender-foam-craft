@@ -15,6 +15,7 @@ of them -- and a draw handler fires on every redraw, so results are cached and
 recomputed only when something that affects them actually changes.
 """
 
+import logging
 from math import acos, degrees
 from typing import NamedTuple
 
@@ -26,6 +27,9 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
 from . import foam_angle_core as core
+from . import foam_log
+
+_log = foam_log.get_logger()
 
 # 'UNIFORM_COLOR', not the pre-4.0 '2D_UNIFORM_COLOR': the 2D_-prefixed names
 # were removed and raise ValueError on 5.2. Verified live on 5.2.0.
@@ -283,6 +287,25 @@ def _rebuild(pairs, s):
     # Marking every affected run cluttered the sheet without telling the user
     # anything the piece-level flag does not.
     _cache.stretch_islands = flagged | heat_islands
+
+    # DEBUG, not INFO: the rebuild runs off a timer, so this is one line per
+    # tick whenever the mesh is dirty. Switch it on from the sidebar when a
+    # number needs checking, and leave it off otherwise.
+    if _log.isEnabledFor(logging.DEBUG):
+        lengths = [r.length_3d for r in runs]
+        short = sum(1 for r in runs
+                    if r.has_dihedral and r.length_3d < s.min_run_length)
+        _log.debug(foam_log.summary(
+            "rebuild",
+            objects=len(pairs),
+            runs=len(runs),
+            islands=len(labels),
+            bevelled=sum(1 for r in runs if r.has_dihedral),
+            flagged_short=short,
+            heat_islands=len(_cache.stretch_islands),
+            min_len=min(lengths) if lengths else 0.0,
+            max_len=max(lengths) if lengths else 0.0,
+            min_run_length=s.min_run_length))
 
 
 _dirty = True
@@ -705,6 +728,14 @@ class FOAM_OT_check_craftability(bpy.types.Operator):
             matrix=obj.matrix_world)
         blockers = sum(1 for f in _findings if f.severity == 'blocker')
         warnings = sum(1 for f in _findings if f.severity == 'warn')
+        # The status bar shows two totals and then goes away. The log keeps
+        # every finding's code, so two unwraps can be compared after the fact
+        # rather than remembered.
+        _log.info(foam_log.summary(
+            "craftability", object=obj.name,
+            blockers=blockers, warnings=warnings, findings=len(_findings),
+            min_run_length=s.min_run_length,
+            codes=",".join(f.code for f in _findings) or "none"))
         self.report({'INFO'},
                     f"{blockers} blocker(s), {warnings} warning(s)")
         for area in context.screen.areas:
@@ -787,6 +818,13 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         layout.prop(s, "min_angle")
         layout.prop(s, "min_label_run_px")
         layout.prop(s, "min_run_length")
+        layout.separator()
+        layout.prop(s, "log_level")
+        # Show where the log actually is. Otherwise the only way to find it is
+        # to already know, which makes the log useless to anyone debugging.
+        col = layout.column(align=True)
+        col.enabled = False
+        col.label(text=foam_log.log_path(), icon='TEXT')
         layout.prop(s, "convex_color")
         layout.prop(s, "concave_color")
         layout.prop(s, "suppressed_color")
