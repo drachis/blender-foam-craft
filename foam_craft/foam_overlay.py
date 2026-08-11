@@ -279,6 +279,65 @@ def _rebuild(pairs, s):
     _cache.stretch_islands = flagged | heat_islands
 
 
+_dirty = True
+# Seconds between checks for pending work. Fast enough to feel immediate,
+# slow enough that a busy mesh is not rebuilt on every mouse move.
+_TIMER_INTERVAL = 0.15
+
+
+def mark_dirty():
+    global _dirty
+    _dirty = True
+
+
+@bpy.app.handlers.persistent
+def _on_depsgraph_update(scene, depsgraph):
+    # Only raises a flag. Anything heavier here runs inside the depsgraph
+    # evaluation of a modal transform, which is exactly the unsafe moment.
+    mark_dirty()
+
+
+def _modal_running(context):
+    """True while an operator is mid-drag.
+
+    A transform mutates UVs continuously and the mesh itself is unchanged, so
+    there is nothing to re-derive until it finishes. Reading the mesh during it
+    is what crashes.
+    """
+    window = getattr(context, "window", None)
+    if window is None:
+        return False
+    return bool(getattr(window, "modal_operators", ()))
+
+
+def _timer_tick():
+    """Rebuild pending work at a safe point in the main loop.
+
+    Timers fire between operator executions, not inside one, which is the
+    closest Python equivalent to the sync point where Blender extracts its own
+    draw batches.
+    """
+    global _dirty
+    context = bpy.context
+    s = _settings(context)
+    if s is None or not s.show_overlay:
+        return _TIMER_INTERVAL
+    if not _dirty or _modal_running(context):
+        return _TIMER_INTERVAL
+    try:
+        _ensure_cache(context, s)
+        _dirty = False
+    except (ReferenceError, AttributeError, RuntimeError, IndexError):
+        _cache.signature = None
+        _cache.runs = []
+        _cache.island_labels = []
+        _dirty = False
+    for area in getattr(context.screen, "areas", ()):
+        if area.type == 'IMAGE_EDITOR':
+            area.tag_redraw()
+    return _TIMER_INTERVAL
+
+
 def _ensure_cache(context, s):
     pairs = _edit_meshes(context)
     if not pairs:
@@ -313,14 +372,11 @@ def draw_callback():
     region = context.region
     if region is None:
         return
-    try:
-        ready = _ensure_cache(context, s)
-    except (ReferenceError, AttributeError, RuntimeError):
-        # The edit mesh can be freed between the redraw request and the draw.
-        # Drop the cache rather than drawing from anything stale.
-        _cache.signature = None
-        return
-    if not ready:
+    # Blender's own UV overlay never walks BMesh while drawing -- it submits
+    # batches built earlier, at a controlled sync point. Doing mesh work here
+    # instead is what corrupted geometry and crashed Blender during a modal
+    # transform. This callback now only renders what the timer prepared.
+    if not _cache.runs and not _cache.island_labels:
         return
 
     view = region.view2d
@@ -793,11 +849,28 @@ def register():
         draw_callback, (), 'WINDOW', 'POST_PIXEL')
     bpy.app.driver_namespace[_HANDLE_KEY] = _draw_handle
 
+    handlers = bpy.app.handlers.depsgraph_update_post
+    for stale in [h for h in handlers if h.__name__ == "_on_depsgraph_update"]:
+        handlers.remove(stale)
+    handlers.append(_on_depsgraph_update)
+
+    if not bpy.app.timers.is_registered(_timer_tick):
+        bpy.app.timers.register(_timer_tick, first_interval=_TIMER_INTERVAL,
+                                persistent=True)
+    mark_dirty()
+
 
 def unregister():
     global _findings
+    if bpy.app.timers.is_registered(_timer_tick):
+        bpy.app.timers.unregister(_timer_tick)
+    handlers = bpy.app.handlers.depsgraph_update_post
+    for stale in [h for h in handlers if h.__name__ == "_on_depsgraph_update"]:
+        handlers.remove(stale)
     _drop_existing_handler()
     _findings = []
     _cache.signature = None
+    _cache.runs = []
+    _cache.island_labels = []
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
