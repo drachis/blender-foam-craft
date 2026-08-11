@@ -104,6 +104,24 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
         name="Dart Depth",
         description="Fraction of the foam thickness the dart cuts through",
         default=0.5, min=0.1, max=0.95)
+    show_darts: bpy.props.BoolProperty(
+        name="Relief Darts", default=True,
+        description="Place relief darts along curved cut runs")
+    dart_relief_deg: bpy.props.FloatProperty(
+        name="Bend Per Dart",
+        description="How much outline turning one relief dart absorbs. Darts "
+                    "are placed by curvature, not by distance: a run's dart "
+                    "count is its total turning divided by this, and they sit "
+                    "at equal shares of that turning, so they bunch where the "
+                    "edge bends hard and thin out where it runs straight. A "
+                    "straight run gets none however long it is. Lower values "
+                    "mean more, smaller relief cuts",
+        default=core.DART_RELIEF_DEG, min=0.0, max=90.0)
+    max_darts_per_run: bpy.props.IntProperty(
+        name="Max Darts Per Run",
+        description="Upper limit per cut run, whatever the spacing works out "
+                    "to. A safety net for a long run on a tight curve",
+        default=24, min=0, max=200)
 
     # --- Stock, for craftability checks
     sheet_width: bpy.props.FloatProperty(
@@ -214,8 +232,13 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
                                                default=20, min=6, max=120)
     decimals: bpy.props.IntProperty(name="Decimals", default=0, min=0, max=2)
     min_angle: bpy.props.FloatProperty(
-        name="Hide Below", default=1.0, min=0.0, max=180.0,
-        description="Runs bending less than this are not labelled")
+        name="Minimum Cut Angle",
+        default=core.MIN_BEVEL_ANGLE_DEG, min=0.0, max=180.0,
+        description="Below this the foam simply flexes, so no bevel is cut and "
+                    "no relief dart is placed. This is a property of the "
+                    "material, not of the model: a subdivided sculpt reports a "
+                    "degree or two across every edge, and cutting all of them "
+                    "would be meaningless work on a sheet that bends anyway")
 
     convex_color: bpy.props.FloatVectorProperty(
         name="Convex", default=(0.15, 0.45, 1.0, 1.0),

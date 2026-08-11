@@ -187,6 +187,10 @@ def _signature(pairs, s):
         round(s.max_tilt_deg, 4),
         round(s.stretch_tolerance, 4),
         round(s.corner_angle_deg, 4),
+        round(s.dart_relief_deg, 4),
+        s.max_darts_per_run,
+        round(s.min_angle, 4),
+        s.show_darts,
         s.only_selected,
     )
 
@@ -219,7 +223,9 @@ def _rebuild(pairs, s):
                 bm, uv_layer, s.max_chord_deviation, s.max_angle_variation_deg,
                 only_selected=s.only_selected, islands=islands,
                 corner_angle_deg=s.corner_angle_deg,
-                matrix=obj.matrix_world):
+                matrix=obj.matrix_world,
+                dart_relief_deg=s.dart_relief_deg,
+                max_darts_per_run=s.max_darts_per_run):
             if run.has_dihedral:
                 bevel = core.compute_bevel(run.mean_angle_deg, s.foam_thickness,
                                            s.max_tilt_deg)
@@ -559,7 +565,11 @@ def draw_callback():
         # along the edge, the stem goes into the material and never out of it.
         # Collected per vertex rather than per run so a vertex shared by two
         # runs gets one mark, not two crossing into an X.
-        if s.show_brackets:
+        # A run bending less than the minimum cut angle gets no darts, because
+        # it gets no cut: the foam simply flexes through it. Relief marks on a
+        # seam that is never opened are instructions to damage the piece.
+        if s.show_darts and run.has_dihedral \
+                and abs(run.angle_deg) >= s.min_angle:
             for u, v, tu, tv, nu, nv in run.darts:
                 key = (round(u, 6), round(v, 6))
                 if key in dart_seen:
@@ -816,6 +826,11 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
             layout.prop(s, "island_id_font_size")
         layout.prop(s, "decimals")
         layout.prop(s, "min_angle")
+        layout.prop(s, "show_darts")
+        col = layout.column(align=True)
+        col.enabled = s.show_darts
+        col.prop(s, "dart_relief_deg")
+        col.prop(s, "max_darts_per_run")
         layout.prop(s, "min_label_run_px")
         layout.prop(s, "min_run_length")
         layout.separator()

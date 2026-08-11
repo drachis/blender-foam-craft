@@ -20,6 +20,19 @@ UV_EPSILON = 1e-6
 # running it through a corner produces a mark that describes neither side.
 CORNER_ANGLE_DEG = 35.0
 
+# Below this dihedral the foam flexes and no cut is made. A property of the
+# material, not of the model: a subdivided sculpt reports a degree or two across
+# nearly every edge, and cutting all of those is meaningless work on a sheet
+# that bends to shape by itself. The reference patterns bottom out around 5.
+MIN_BEVEL_ANGLE_DEG = 5.0
+
+# How much outline turning one relief dart absorbs, in degrees. Dart count is
+# the run's total turning divided by this, so a straight run gets none however
+# long it is and a tight curve gets several however short. Darts once landed on
+# every vertex, which made their density a function of how finely the mesh was
+# subdivided rather than of anything physical.
+DART_RELIEF_DEG = 12.0
+
 
 def dihedral_angle_deg(edge):
     """Signed fold angle between the two 3D faces sharing this edge.
@@ -341,7 +354,8 @@ def _run_deviation(points, i, j):
 def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
                            max_angle_variation_deg, island_index=0,
                            corner_angle_deg=CORNER_ANGLE_DEG,
-                           matrix=None):
+                           matrix=None, dart_relief_deg=DART_RELIEF_DEG,
+                           max_darts_per_run=0):
     """Split one boundary cycle into DartRuns.
 
     A run is one continuous pass at one blade tilt, so the angle staying put is
@@ -439,6 +453,9 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
     # that suits neither edge and visually welds two separate brackets into
     # one, so each side keeps its own normal and the brackets stay distinct.
     normals_in, normals_out, corner_flags = [], [], []
+    # Turn at each boundary vertex, kept so relief darts can be distributed by
+    # how much the outline bends rather than by distance or by vertex count.
+    turns = []
     for k in range(len(uvs)):
         before = cycle_seg_normals[k - 1] if k > 0 else (
             cycle_seg_normals[-1] if closed else None)
@@ -449,9 +466,11 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
             normals_in.append(single)
             normals_out.append(single.copy())
             corner_flags.append(False)
+            turns.append(0.0)
             continue
         cosine = max(-1.0, min(1.0, before.dot(after)))
         turn = degrees(acos(cosine))
+        turns.append(turn)
         if turn >= corner_angle_deg:
             normals_in.append(before.copy())
             normals_out.append(after.copy())
@@ -526,8 +545,65 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
         # redundant. Convexity deliberately does not filter here -- a dart can
         # remove material to let a face close up, or open to give it room to
         # stretch, so it is wanted on either kind of bend.
-        darts = [(k - i) for k in range(i + 1, j)
-                 if not corner_flags[k]]
+        #
+        # How many, and where, are two separate questions.
+        #
+        # How many comes from stress. A dart exists because flat foam cannot
+        # follow a curve without the material somewhere having to give, and how
+        # much it has to give is how far the outline turns -- so the number of
+        # darts is the run's total turning divided by how much bend one dart
+        # relieves. A straight run gets none however long it is, and a tight
+        # curve gets several however short.
+        #
+        # Where is measured in turning too, not in distance. A spline's ticks
+        # are spaced by parameter rather than arc length, so they bunch where
+        # the curve is tight and spread where it is slack -- and that is exactly
+        # where the material needs relief. Spacing them evenly by distance would
+        # put just as many darts along the slack part of a run as along the
+        # tight part, which is even-looking and physically wrong.
+        #
+        # Placing one at every vertex, which is what this did before, made dart
+        # density a function of how finely the mesh was subdivided -- on a dense
+        # sculpt a relief cut every millimetre, which perforates the piece
+        # instead of patterning it. Neither the count nor the placement should
+        # know anything about topology.
+        span_turn = sum(turns[k] for k in range(i + 1, j))
+        n_darts = 0
+        if dart_relief_deg > 0.0:
+            n_darts = int(round(span_turn / dart_relief_deg))
+        if max_darts_per_run > 0:
+            n_darts = min(n_darts, max_darts_per_run)
+
+        darts = []
+        if n_darts > 0:
+            # Cumulative *turning* along the run. cumulative[k - i] is how far
+            # the outline has bent by the time it reaches vertex k, so stepping
+            # through it in equal shares puts a dart wherever an equal share of
+            # the bending has been used up.
+            cumulative = [0.0]
+            for k in range(i, j):
+                cumulative.append(cumulative[-1] +
+                                  (turns[k + 1] if k + 1 < len(turns) else 0.0))
+            total = cumulative[-1]
+            if total > 1e-9:
+                for m in range(n_darts):
+                    target = total * (m + 1) / float(n_darts + 1)
+                    # Nearest interior vertex to that point on the run. A dart
+                    # has to sit on a vertex to be cut, but which vertex is a
+                    # detail of the mesh, not of the pattern.
+                    best, best_gap = None, None
+                    for k in range(i + 1, j):
+                        # Corners are skipped: a corner already gets its shape
+                        # from the bevels meeting there, so relief on top of it
+                        # is redundant.
+                        if corner_flags[k]:
+                            continue
+                        gap = abs(cumulative[k - i] - target)
+                        if best_gap is None or gap < best_gap:
+                            best, best_gap = k - i, gap
+                    if best is not None and best not in darts:
+                        darts.append(best)
+                darts.sort()
         runs.append(DartRun(
             island_index=island_index,
             loops=seg,
@@ -552,7 +628,8 @@ def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
                                 max_angle_variation_deg, only_selected=False,
                                 islands=None,
                                 corner_angle_deg=CORNER_ANGLE_DEG,
-                                matrix=None):
+                                matrix=None, dart_relief_deg=DART_RELIEF_DEG,
+                           max_darts_per_run=0):
     """Yield a DartRun for every saw pass along every UV island boundary.
 
     This replaces per-mesh-edge iteration: foam flexes between darts, so a dart
@@ -566,7 +643,9 @@ def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
             for run in segment_boundary_cycle(
                     cycle, uv_layer, max_chord_deviation,
                     max_angle_variation_deg, island_index=index,
-                    corner_angle_deg=corner_angle_deg, matrix=matrix):
+                    corner_angle_deg=corner_angle_deg, matrix=matrix,
+                    dart_relief_deg=dart_relief_deg,
+                    max_darts_per_run=max_darts_per_run):
                 yield run
 
 
