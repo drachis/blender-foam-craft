@@ -26,6 +26,73 @@ back to the original was ever needed: the simplified boundary can be read
 directly from the evaluated mesh. The correct move was to ask, or to read the
 modifier's properties, before substituting a hand-rolled algorithm.
 
+**Never touch mesh data from a draw handler.** This crashed Blender and
+corrupted geometry, twice, before the cause was understood. The rule is not
+"do less work in the draw callback" — it is that a renderer must not read the
+model at all. Blender's own UV overlay obeys this: `MeshUVs::edit_object_sync`
+in `draw/engines/overlay/overlay_mesh.hh` only submits GPU batches built
+earlier by the extractors in `draw/intern/mesh_extractors/`, and invalidation
+happens through a dirty tag, never by inspecting the mesh mid-draw. There is
+also **no position-only fast path** — a UV transform tags
+`BKE_MESH_BATCH_DIRTY_ALL` through the depsgraph and everything is
+re-extracted. So the problem was never the *amount* of work; it was doing any
+of it at the wrong moment.
+
+The working shape in Python, since add-ons cannot hook the extraction pipeline:
+
+| Piece | Does | Touches mesh |
+|---|---|---|
+| Draw handler | renders cached plain data | **never** |
+| `depsgraph_update_post` | raises a dirty flag, nothing else | **never** |
+| `bpy.app.timers` tick | rebuilds when dirty, and never mid-drag | yes, at a safe point |
+
+Two dead ends worth not repeating: splitting the cache into cheap and expensive
+halves still read the mesh from the draw handler and turned a freeze into
+corruption; moving that read into a depsgraph handler was no better, because
+during a modal transform it fires every frame, mid-mutation. A timer fires
+*between* operator executions, which is the closest thing Python has to
+Blender's sync point.
+
+Related rules learned the same way:
+- **Never hold `BMFace`/`BMEdge`/`BMLoop` beyond the call that fetched them.**
+  Freed BMesh elements crash outright rather than raising, so `try/except`
+  cannot save you. Copy out floats.
+- **`ensure_lookup_table()` mutates the bmesh.** Calling it speculatively from
+  a draw or depsgraph callback during a transform is itself a corruption
+  source. Call it where topology actually changed.
+- **Never draw known-stale data.** A flag set by the timer cannot fix a stale
+  frame, because the draw beats the timer. Refuse to draw while dirty instead.
+- **Detect transforms, not modal operators.** The UV editor keeps
+  `IMAGE_OT_view_pan` registered as a modal handler permanently, so testing for
+  "any modal operator" reports a drag forever. Match `TRANSFORM_OT_`.
+
+**Interactive features can only be verified interactively.** This is why the
+project favours BDD over unit tests. Every scripted check passed while the
+overlay was crashing, because none of them entered a modal loop: scripted
+`bpy.ops.transform.rotate(value=...)` executes immediately and never drags.
+Nudging UV coordinates from a script is not a transform. Until a human has
+dragged a UV by hand, an interactive fix is not verified — say so plainly
+rather than reporting it fixed.
+
+**Verify the verification.** Three separate checks reported the draw path
+wrongly in one session: `inspect.getsource` served stale lines from `linecache`
+after a file edit, and two string slices ran past the end of the function. A
+claim of "fixed" survived a crash twice because the measurement was as broken
+as the code. Extract real function bounds, prefer reading state back out of
+Blender over introspecting source text, and distrust a check that has never
+failed.
+
+**Rebuild scene state for every measurement.** Inherited state produced wrong
+numbers twice. An object named `Torus` once held a 500-face Suzanne left by an
+earlier test, and run counts moved between supposedly identical runs. Delete
+everything and rebuild, then assert what you built — a 12x5 torus has 60 faces;
+if it says 500, stop.
+
+**Prefer documentation to reading the source tree.** A source-reading agent
+burned 106k tokens on questions the manual answers. Read the docs first; go to
+`blender/` (the submodule) only for questions documentation genuinely does not
+cover, and target exact files rather than grepping broadly.
+
 **Treat the pre-existing scripts as unverified.** `uv_fold_angle_overlay.py`
 and `export_paper_model_angles.py` were drafted by an LLM without access to
 Blender API references, so they contain outdated and hallucinated API usage.
