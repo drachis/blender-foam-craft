@@ -280,9 +280,15 @@ def _rebuild(pairs, s):
 
 
 _dirty = True
-# Seconds between checks for pending work. Fast enough to feel immediate,
-# slow enough that a busy mesh is not rebuilt on every mouse move.
-_TIMER_INTERVAL = 0.15
+# Set when a drag has just ended and the model has not caught up yet. The
+# overlay stays hidden until it has, so the frame after release never shows
+# marks at the positions the geometry has already left.
+_await_refresh = False
+_was_modal = False
+# Seconds between checks for pending work. Short enough that the marks
+# reappear promptly when a drag ends, long enough that a busy mesh is not
+# rebuilt on every mouse move.
+_TIMER_INTERVAL = 0.05
 
 
 def mark_dirty():
@@ -325,21 +331,35 @@ def _timer_tick():
     closest Python equivalent to the sync point where Blender extracts its own
     draw batches.
     """
-    global _dirty
+    global _dirty, _await_refresh, _was_modal
     context = bpy.context
     s = _settings(context)
     if s is None or not s.show_overlay:
         return _TIMER_INTERVAL
-    if not _dirty or _modal_running(context):
+
+    modal = _modal_running(context)
+    if modal:
+        _was_modal = True
+        return _TIMER_INTERVAL
+    if _was_modal:
+        # The drag just ended. Whatever is cached describes where the UVs used
+        # to be, so hold the overlay back until it has been rebuilt.
+        _was_modal = False
+        _await_refresh = True
+        _dirty = True
+
+    if not _dirty:
         return _TIMER_INTERVAL
     try:
         _ensure_cache(context, s)
         _dirty = False
+        _await_refresh = False
     except (ReferenceError, AttributeError, RuntimeError, IndexError):
         _cache.signature = None
         _cache.runs = []
         _cache.island_labels = []
         _dirty = False
+        _await_refresh = False
     for area in getattr(context.screen, "areas", ()):
         if area.type == 'IMAGE_EDITOR':
             area.tag_redraw()
@@ -393,7 +413,12 @@ def draw_callback():
     # be -- an angle sitting over the wrong piece is worse than no angle at
     # all. Blender still draws the islands themselves, so what is being moved
     # stays visible; the marks return, correctly placed, on release.
-    if _modal_running(context):
+    # Never draw known-stale marks. The depsgraph raises the dirty flag the
+    # moment UVs change -- including on the transform's final update -- so the
+    # first draw after a release finds it set and holds off until the timer
+    # has rebuilt. Without this the frame right after release showed the marks
+    # where the geometry used to be.
+    if _modal_running(context) or _dirty or _await_refresh:
         return
 
     view = region.view2d
