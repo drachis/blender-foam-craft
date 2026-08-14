@@ -28,7 +28,7 @@ TEST_FILES = (
     "tests/test_gp_pattern.py",
     "tests/test_curvature_darts.py",
     "tests/test_bake_pattern.py",
-    "tests/test_voronoi_pattern.py",
+    "tests/test_region_pattern.py",
 )
 
 

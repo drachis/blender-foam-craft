@@ -61,6 +61,54 @@ class StrokeCutError(Exception):
     """
 
 
+def _densify(bm, bvh, points, cyclic):
+    """Add points so no step is longer than the faces it crosses.
+
+    The walk needs consecutive points to land on faces that touch, because it
+    works out where the stroke leaves one face for the next. A stroke drawn with
+    long steps -- or a fine mesh under a coarse stroke -- skips faces entirely,
+    and the walk had no choice but to refuse it.
+
+    Refusing was the wrong answer. The error it raised said "resample the stroke
+    more finely", which is something this can simply do: the drawn line between
+    two points is a straight run on the surface, so filling it in adds no
+    information the user did not give and loses none either. Every stroke of a
+    Voronoi and of a ring-and-meridian pattern was being rejected outright for
+    want of this.
+
+    Step length is taken from the mesh, not from a constant, so it follows
+    whatever the sculpt's resolution happens to be.
+    """
+    if len(points) < 2:
+        return points
+    bm.faces.ensure_lookup_table()
+    out = []
+    last = len(points) if cyclic else len(points) - 1
+    for i in range(last):
+        a = points[i]
+        b = points[(i + 1) % len(points)]
+        out.append(a)
+        gap = (b - a).length
+        if gap < 1e-12:
+            continue
+        _loc, _nrm, index, _dist = bvh.find_nearest(a)
+        if index is None:
+            continue
+        face = bm.faces[index]
+        edges = face.edges
+        size = (sum(e.calc_length() for e in edges) / len(edges)) if edges else 0.0
+        if size <= 1e-12:
+            continue
+        # Half a face per step: enough that a step cannot cross a face without
+        # landing in it, without multiplying the point count needlessly.
+        steps = int(gap / (size * 0.5))
+        for k in range(1, steps):
+            out.append(a.lerp(b, k / float(steps)))
+    if not cyclic:
+        out.append(points[-1])
+    return out
+
+
 def _assign_faces(bvh, bm, points):
     """Which face does each stroke point sit on, and where exactly.
 
@@ -325,6 +373,7 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
 
     bm.faces.ensure_lookup_table()
     bvh = BVHTree.FromBMesh(bm)
+    points = _densify(bm, bvh, points, cyclic)
     assigned = _assign_faces(bvh, bm, points)
 
     # A closed stroke lying wholly inside one face crosses no edge, so it has no
@@ -545,10 +594,16 @@ def chain_strokes(strokes, tolerance):
     if tolerance <= 0.0:
         return list(strokes)
 
-    pending = [list(points) for points, cyclic in strokes if len(points) >= 2]
-    closed = {id(p): c for (p, c) in
-              ((list(pts), cyc) for pts, cyc in strokes)}
-    chains = []
+    # Closed strokes are passed straight through. A loop has no ends, so there
+    # is nothing to join -- and joining *to* one is actively destructive: an
+    # open stroke ending on a ring would absorb the ring into itself, turning a
+    # closed boundary into part of an open path. Measured on three rings crossed
+    # by six meridians, which should leave 14 pieces: chaining without this
+    # guard merged 9 strokes into 7 and left a single region.
+    chains = [(list(points), True)
+              for points, cyclic in strokes if cyclic and len(points) >= 2]
+    pending = [list(points) for points, cyclic in strokes
+               if not cyclic and len(points) >= 2]
     while pending:
         current = pending.pop(0)
         joined = True
