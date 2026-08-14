@@ -61,62 +61,80 @@ class StrokeCutError(Exception):
     """
 
 
-def _densify(bm, bvh, points, cyclic, max_depth=6):
-    """Add stroke samples, but only where the walk would otherwise fail.
+def _exit_crossing(face, p_from, p_to, min_along):
+    """The next boundary of `face` the segment meets, past `min_along`.
 
-    The walk works out where a stroke leaves one face for the next, so it needs
-    successive points on faces that touch. A stroke drawn with long steps -- or
-    a fine mesh under a coarse stroke -- skips faces, and the walk had no choice
-    but to refuse it. Its own error said "resample the stroke more finely",
-    which is something this can simply do: the line between two drawn points is
-    a straight run on the surface, so filling it in adds no information the user
-    did not give and loses none.
+    Returns ``(edge, factor, along)`` or None when nothing lies ahead.
 
-    Refined by bisection, and only on the segments that need it. Sampling the
-    whole stroke to a fixed fraction of a face was tried first and is the wrong
-    trade: every added sample becomes a vertex in the finished cut, so a blanket
-    pass litters the seam with detail nobody drew and nothing needs. Here a
-    segment is split only while its ends sit on faces that do not touch, so a
-    stroke already fine enough passes through untouched and cost is paid only
-    where the mesh is finer than the drawing.
+    The *next* crossing, not the furthest: a walk advances one face at a time,
+    and taking the furthest skips the faces in between -- which also strands the
+    walk when a point sits exactly on an edge, since the crossing it needs is at
+    zero distance and the far one belongs to a face it never reaches.
     """
-    if len(points) < 2:
-        return points
-    bm.faces.ensure_lookup_table()
-
-    def face_at(point):
-        _loc, _nrm, index, _dist = bvh.find_nearest(point)
-        return bm.faces[index] if index is not None else None
-
-    def touching(face_a, face_b):
-        if face_a is None or face_b is None or face_a is face_b:
-            return True
-        return (_shared_edge(face_a, face_b) is not None
-                or _shared_vert(face_a, face_b) is not None)
-
-    def refine(p0, p1, depth, out):
-        if depth >= max_depth or touching(face_at(p0), face_at(p1)):
-            return
-        middle = p0.lerp(p1, 0.5)
-        refine(p0, middle, depth + 1, out)
-        out.append(middle)
-        refine(middle, p1, depth + 1, out)
-
-    result = []
-    count = len(points)
-    last = count if cyclic else count - 1
-    for i in range(last):
-        a = points[i]
-        b = points[(i + 1) % count]
-        result.append(a)
-        if (b - a).length < 1e-12:
+    direction = p_to - p_from
+    span = direction.length
+    if span < 1e-12:
+        return None
+    best = None
+    for edge in face.edges:
+        a, b = edge.verts[0].co, edge.verts[1].co
+        hit = intersect_line_line(p_from, p_to, a, b)
+        if hit is None:
             continue
-        added = []
-        refine(a, b, 0, added)
-        result.extend(added)
-    if not cyclic:
-        result.append(points[-1])
-    return result
+        on_segment, on_edge = hit
+        edge_span = b - a
+        denom = edge_span.length_squared
+        if denom < 1e-18:
+            continue
+        edge_fac = (on_edge - a).dot(edge_span) / denom
+        if not (-1e-6 <= edge_fac <= 1.0 + 1e-6):
+            continue
+        along = (on_segment - p_from).dot(direction) / (span * span)
+        if along <= min_along + 1e-7 or along > 1.0 + 1e-9:
+            continue
+        # Skew lines: reject a "crossing" where the two never really meet.
+        if (on_segment - on_edge).length > span * 0.5:
+            continue
+        if best is None or along < best[0]:
+            best = (along, edge, max(0.0, min(1.0, edge_fac)))
+    if best is None:
+        return None
+    return best[1], best[2], best[0]
+
+
+def _walk_faces(face_from, p_from, face_to, p_to, limit=64):
+    """Every face boundary the segment crosses on its way from one face to another.
+
+    Returns a list of ``(edge, factor)``, in order.
+
+    This is the alternative to inventing extra stroke points. When two drawn
+    points land on faces that do not touch, the stroke really did pass through
+    the faces in between, and where it crossed each boundary is computable
+    rather than guessable. Sampling the stroke more finely and hoping the extra
+    points land conveniently was tried, and it is a workaround: the added points
+    become vertices in the finished cut, so it writes detail nobody drew into
+    the pattern. Walking the faces puts the cut exactly where the line goes and
+    adds nothing.
+
+    Returns None if the walk cannot reach the target, so the caller can refuse
+    rather than lay down a cut along a route the stroke never took.
+    """
+    crossings = []
+    current = face_from
+    along = 0.0
+    for _ in range(limit):
+        if current is face_to:
+            return crossings
+        step = _exit_crossing(current, p_from, p_to, along)
+        if step is None:
+            return None
+        edge, fac, along = step
+        crossings.append((edge, fac))
+        nxt = next((f for f in edge.link_faces if f is not current), None)
+        if nxt is None:
+            return None
+        current = nxt
+    return None
 
 
 def _assign_faces(bvh, bm, points):
@@ -383,7 +401,6 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
 
     bm.faces.ensure_lookup_table()
     bvh = BVHTree.FromBMesh(bm)
-    points = _densify(bm, bvh, points, cyclic)
     assigned = _assign_faces(bvh, bm, points)
 
     # A closed stroke lying wholly inside one face crosses no edge, so it has no
@@ -437,15 +454,35 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
             crossings.append(("edge", (edge, fac), len(runs)))
         else:
             corner = _shared_vert(current["face"], face)
-            if corner is None:
-                # The stroke jumped a face entirely. Resampling finer is the
-                # fix; guessing a route across the faces in between would put a
-                # cut where nothing was drawn.
-                raise StrokeCutError(
-                    "consecutive stroke points landed on faces that share "
-                    "neither an edge nor a corner; resample the stroke more "
-                    "finely")
-            crossings.append(("vert", corner, len(runs)))
+            if corner is not None:
+                crossings.append(("vert", corner, len(runs)))
+            else:
+                # The stroke crossed one or more faces between these two points.
+                # Walk them and take the real crossings rather than refusing, or
+                # inventing samples and hoping they land conveniently.
+                route = _walk_faces(current["face"], assigned[i - 1][1],
+                                    face, surf_pt)
+                if route is None:
+                    raise StrokeCutError(
+                        "could not follow the stroke between two points; it "
+                        "may leave the surface there")
+                if not route:
+                    raise StrokeCutError(
+                        "the stroke crosses faces that do not connect")
+                # Each boundary crossed closes the run before it and opens the
+                # next, exactly as a single-edge crossing does. The faces in
+                # between hold no drawn points -- the stroke passed straight
+                # over them -- so their runs are entry to exit and nothing else.
+                walking = current["face"]
+                for edge_hit, fac_hit in route[:-1]:
+                    crossings.append(("edge", (edge_hit, fac_hit), len(runs)))
+                    runs.append(current)
+                    walking = next((f for f in edge_hit.link_faces
+                                    if f is not walking), walking)
+                    current = {"face": walking, "interior": [],
+                               "entry": None, "exit": None}
+                last_edge, last_fac = route[-1]
+                crossings.append(("edge", (last_edge, last_fac), len(runs)))
         runs.append(current)
         if i == 0:
             # The closing segment landed back on the run the walk began in, so
@@ -539,6 +576,7 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
         # Same rule as everywhere else: two marks closer together than the width
         # of the drawn line were one mark.
         kept = []
+        face_verts = [v.co for v in run["face"].verts]             if run["face"].is_valid else []
         for point in run["interior"]:
             if snap_distance > 0.0:
                 if (point - entry.co).length <= snap_distance:
@@ -546,6 +584,16 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
                 if (point - exit_v.co).length <= snap_distance:
                     continue
                 if kept and (point - kept[-1]).length <= snap_distance:
+                    continue
+                # ...and against the vertices already on this face. Blender's
+                # own knife classifies every cut point as snapped to a vertex,
+                # snapped to an edge, or loose in a face, with a tolerance for
+                # each. Only the run's two ends were checked here, so a drawn
+                # point passing close to any other corner had a second vertex
+                # laid on top of it -- a zero-length edge, and the faces around
+                # it collapse.
+                if any((point - co).length <= snap_distance
+                       for co in face_verts):
                     continue
             kept.append(point)
         interior = [tuple(p) for p in kept]

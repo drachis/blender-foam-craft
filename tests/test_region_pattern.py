@@ -29,6 +29,11 @@ this from unusable to close. The remainder is the documented next step: split
 two branches of a junction as one through-path first, so the junction becomes a
 real vertex, then attach the rest.
 
+Where a stroke crosses faces between two of its points, the cutter walks those
+faces and takes the real crossings. It does not add samples of its own: an
+invented point becomes a vertex in the finished cut, which writes detail into
+the pattern that nobody drew.
+
 The same limitation shows in the designed Suzanne UVs, whose seams decompose
 into 135 open paths meeting at 88 junctions with only one closed loop.
 """
@@ -123,10 +128,15 @@ def _pattern():
     sphere, successive points landed on faces sharing neither an edge nor a
     corner and the stroke was refused outright.
     """
+    # 100 samples on a 96-segment sphere, deliberately not a divisor of it.
+    # Sampling a ring at exactly the mesh's own meridian count puts every point
+    # precisely on an edge, and which of the two adjacent faces it is judged to
+    # be in becomes arbitrary -- a degenerate alignment a drawn stroke never
+    # has, and a known limit recorded rather than designed around.
     strokes = []
     for theta in RINGS:
-        strokes.append(([_point(theta, 2 * math.pi * i / 96.0)
-                         for i in range(96)], True))
+        strokes.append(([_point(theta, 2 * math.pi * i / 100.0)
+                         for i in range(100)], True))
     for m in range(MERIDIANS):
         phi = 2 * math.pi * m / MERIDIANS
         span = RINGS[-1] - RINGS[0]
