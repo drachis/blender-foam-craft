@@ -50,6 +50,29 @@ Two rules the suite already enforces, both learned the hard way:
   about right" is exactly how the dart parameter came to be wrong three times
   running.
 
+**If you are rebuilding one of Blender's tools, copy its semantics too.**
+Not just "use the built-in where one exists" -- when there genuinely is no
+operator and the behaviour has to be assembled, the thing being assembled
+usually already exists somewhere in Blender, and its rules are worth reading
+before inventing new ones.
+
+This cutter is a knife. Blender's knife classifies every cut point as snapped
+to a **vertex**, snapped to an **edge**, or loose in a **face**, each with its
+own tolerance (`editmesh_knife.cc`, around lines 144 and 158, and the
+`KNIFE_FLT_EPS_PX_*` constants). Ours snapped only a run's own two ends, so any
+other corner the drawn line passed near got a second vertex laid on top of it
+-- a zero-length edge, and the faces around it collapse. Matching the knife's
+three-way classification fixed it outright.
+
+The same session produced two more of these: a hand-rolled convex/concave sign
+test where `BMEdge.calc_face_angle_signed` was correct and it was not, and a
+stroke-resampling pass invented to work around a walk that could not cross
+non-adjacent faces -- where walking the faces, which is what a knife does, was
+both exact and cheaper.
+
+The tell is inventing a *rule* -- a tolerance, a spacing, a fallback -- for a
+problem Blender solves daily. Go and read how it solves it.
+
 **Check the real API and docs before designing around a problem.** Blender
 almost always already has the feature. Read the current API reference or probe
 the live API before concluding something isn't possible. A "clever" workaround
