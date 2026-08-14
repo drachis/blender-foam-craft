@@ -116,6 +116,20 @@ _GRADE_STIFFNESS = {'L200': 0.6, 'L400': 1.0, 'L600': 1.6, 'EVA': 1.2,
 
 
 @dataclass
+class DefectSummary:
+    """Angle defect over a patch, split by sign. Radians.
+
+    Kept apart rather than summed because a positive defect and a negative one
+    call for opposite work -- one removes material, the other adds it -- and
+    they cancel in a total while both still have to be done.
+    """
+    total: float
+    positive: float
+    negative: float
+    absolute: float
+
+
+@dataclass
 class BevelResult:
     """Saw setup for one dart/seam. Angles in degrees, lengths in metres."""
     dihedral_deg: float
@@ -1068,20 +1082,39 @@ def vertex_angle_defect(vert, faces=None):
 
 
 def island_angle_defect(faces):
-    """Total interior angle defect of a patch, in radians, and per vertex.
+    """How badly a patch refuses to lie flat, and where.
 
-    Returns ``(total, {vert: defect})`` over the vertices strictly inside the
-    patch. By Gauss-Bonnet this total is how much material the patch's darts
-    have to remove between them -- a whole sphere comes to 4*pi, measured
-    12.5664 against 12.5664 at three densities.
+    Returns ``(summary, {vert: defect})`` with all angles in radians. The
+    summary carries four numbers because one is not enough:
 
-    Boundary vertices are reported but excluded from the total: their defect is
-    a statement about the outline's shape, not about the piece refusing to lie
-    flat, and counting it would double-charge a seam that the bevel already
-    handles.
+        total       signed sum. By Gauss-Bonnet this is what the patch owes
+                    overall, but see the warning below.
+        positive    where the surface is dome-like and material must be
+                    *removed* -- a V-wedge dart.
+        negative    where it is saddle-like and material must be *added*, or
+                    the sheet allowed to spread. Cutting a wedge here makes it
+                    worse.
+        absolute    positive - negative, the total relief work the piece needs
+                    whichever direction each bit of it goes in.
+
+    **Do not judge a piece by ``total`` alone.** Measured on the top half of a
+    torus of major radius 1.0 and minor 0.4, which is the annulus you get by
+    seaming at the inner and outer equators: total came to -0.0004 radians,
+    effectively zero, while the outer band carried +359.2 degrees and the inner
+    band -359.2. The two cancel exactly and the piece still needs 718.5 degrees
+    of relief -- more than any other shape tested here. A tool reading the total
+    would call that piece flat and hand the maker a sheet that cannot be made.
+
+    The signs do not merely add up; they call for opposite operations, so they
+    have to be kept apart.
+
+    Boundary vertices are reported in the per-vertex map but excluded from the
+    summary: their defect describes the outline's shape rather than the piece
+    failing to lie flat, and counting it would double-charge a seam the bevel
+    already handles.
     """
     faces = set(faces)
-    total = 0.0
+    total = positive = negative = 0.0
     per_vertex = {}
     seen = set()
     for face in faces:
@@ -1096,4 +1129,10 @@ def island_angle_defect(faces):
             per_vertex[vert] = defect
             if interior:
                 total += defect
-    return total, per_vertex
+                if defect > 0.0:
+                    positive += defect
+                else:
+                    negative += defect
+    summary = DefectSummary(total=total, positive=positive, negative=negative,
+                            absolute=positive - negative)
+    return summary, per_vertex
