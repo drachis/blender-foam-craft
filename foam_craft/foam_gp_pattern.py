@@ -36,10 +36,12 @@ the topology is made by Blender.
 """
 
 import bmesh
+import bpy
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 from mathutils.geometry import intersect_line_line
 
+from . import foam_angle_core as core
 from . import foam_log
 
 _log = foam_log.get_logger()
@@ -177,6 +179,35 @@ def _endpoint_vert(face, point, snap_distance):
     if best_edge is None or best_dist > snap_distance:
         return None
     return _vert_at(best_edge, best_fac, snap_distance)
+
+
+def _run_follows_edge(interior, entry, exit_v, snap_distance):
+    """Is this run actually lying along the edge joining its two ends?
+
+    Two ends being neighbours is not enough on its own. A stroke can enter and
+    leave a face through vertices that happen to be adjacent while bowing well
+    away from the edge between them, and taking that edge instead would move the
+    cut by up to half an edge length -- measured at 0.061 on a grid whose edges
+    are 0.125, against 0.005 when the path is cut properly.
+
+    So the run only counts as following the edge when every point of it stays
+    within the snap tolerance of that edge. Same tolerance as everywhere else:
+    the width of the drawn line.
+    """
+    if not interior:
+        return True
+    if snap_distance <= 0.0:
+        return False
+    a, b = entry.co, exit_v.co
+    span = b - a
+    denom = span.length_squared
+    if denom < 1e-18:
+        return True
+    for point in interior:
+        fac = max(0.0, min(1.0, (point - a).dot(span) / denom))
+        if (point - (a + span * fac)).length > snap_distance:
+            return False
+    return True
 
 
 def _cut_path_edges(face, entry, exit_v, n_interior):
@@ -372,6 +403,21 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
             # snap distance, which is the tolerance saying to treat it as one
             # point. Nothing to cut.
             continue
+
+        # The stroke may be running along an edge that is already there. Drawing
+        # down an obvious feature line is a normal thing to do, and on a UV
+        # sphere an equatorial stroke lands exactly on a ring of the mesh.
+        #
+        # face_split cannot help here -- there is no face to divide, because the
+        # two vertices are already neighbours -- so the earlier code fell through
+        # and cut nothing, silently. The line the user drew simply did not
+        # appear. Marking the existing edge is the whole job: the topology it
+        # would have created is present already.
+        shared = next((e for e in entry.link_edges if exit_v in e.verts), None)
+        if shared is not None and _run_follows_edge(run["interior"], entry,
+                                                    exit_v, snap_distance):
+            new_edges.append(shared)
+            continue
         interior = [tuple(p) for p in run["interior"]]
         try:
             new_face, _new_loop = bmesh.utils.face_split(
@@ -383,6 +429,22 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
             raise StrokeCutError("face_split returned no face")
         new_edges.extend(_cut_path_edges(new_face, entry, exit_v,
                                          len(interior)))
+
+    # Marked here rather than left to the caller, and this is not tidiness.
+    #
+    # Cutting a later stroke can edge_split an edge that this one produced --
+    # which is exactly what happens wherever two strokes cross, since the second
+    # stroke's crossing lands on the first stroke's line. Splitting an edge
+    # leaves the returned list holding one half while the other half is a new
+    # edge nobody has a reference to, so marking the accumulated list at the end
+    # of the whole pattern leaves gaps in every stroke that a later one crossed.
+    #
+    # Marking now means the flag is already on the edge when it is split, and
+    # both halves inherit it. Measured on a theta -- a circle crossed by a bar
+    # -- the old order gave 1, 3 or 2 regions depending on how far the bar
+    # overhung, where the answer is always 3.
+    for edge in new_edges:
+        edge.seam = True
 
     _log.debug(foam_log.summary(
         "cut_stroke", points=len(points), runs=len(runs),
@@ -422,3 +484,217 @@ def cut_strokes(bm, strokes, snap_distance=0.0):
         "cut_strokes", strokes=len(strokes), edges=len(all_edges),
         open_ends=open_ends, snap=snap_distance))
     return all_edges, open_ends
+
+
+# --- Reading strokes off a Grease Pencil object -------------------------
+
+def strokes_from_grease_pencil(gp_object, target_object, at_frame=None):
+    """Every stroke on `gp_object`, in `target_object`'s local space.
+
+    Returns ``[(points, cyclic)]``, ready for :func:`cut_strokes`.
+
+    Both objects carry their own transform and the cutter works in the target
+    mesh's local space, so each point goes out through the Grease Pencil's world
+    matrix and back in through the target's. Skipping that puts the pattern in
+    the wrong place the moment either object is moved -- a failure that looks
+    like nothing at all until the sculpt is not at the origin.
+
+    ``cyclic`` is a curve-domain *attribute* rather than a property on the
+    stroke, following Blender's Curves model, and it only exists once something
+    has set it. Absent means every stroke is open, which is the right default
+    for a line drawn by hand.
+
+    The Grease Pencil object is read and never written. Patterning must not
+    consume the drawing: the entire point of re-baking is to adjust a stroke and
+    try again.
+    """
+    if gp_object is None or gp_object.type != 'GREASEPENCIL':
+        raise StrokeCutError("no Grease Pencil object to pattern from")
+
+    to_local = target_object.matrix_world.inverted() @ gp_object.matrix_world
+    out = []
+    for layer in gp_object.data.layers:
+        if layer.hide:
+            continue
+        frames = list(layer.frames)
+        if not frames:
+            continue
+        if at_frame is None:
+            drawing = frames[0].drawing
+        else:
+            usable = [f for f in frames if f.frame_number <= at_frame] or frames
+            drawing = max(usable, key=lambda f: f.frame_number).drawing
+
+        cyclic_attr = drawing.attributes.get("cyclic")
+        for index, stroke in enumerate(drawing.strokes):
+            points = [to_local @ p.position for p in stroke.points]
+            if len(points) < 2:
+                continue
+            closed = False
+            if cyclic_attr is not None and index < len(cyclic_attr.data):
+                closed = bool(cyclic_attr.data[index].value)
+            out.append((points, closed))
+    if not out:
+        raise StrokeCutError(
+            "the Grease Pencil object has no strokes on a visible layer")
+    return out
+
+
+class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
+    """Cut the drawn strokes into a copy of this sculpt and unwrap the pieces"""
+
+    bl_idname = "object.foam_bake_pattern"
+    bl_label = "Bake Pattern"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    snap_distance: bpy.props.FloatProperty(
+        name="Snap Distance",
+        description="Crossings and stroke ends landing closer than this to an "
+                    "existing vertex reuse it rather than splitting again. A "
+                    "drawn line has the width of a marker tip while the curve "
+                    "taken from it is idealised to zero width, so marks a "
+                    "fraction of a millimetre apart were one line as drawn. "
+                    "Measured on the sculpt, so it means the same at any scale",
+        default=0.002, min=0.0, max=0.05,
+        subtype='DISTANCE', unit='LENGTH', precision=4)
+    unwrap_method: bpy.props.EnumProperty(
+        name="Unwrap",
+        items=[
+            ('MINIMUM_STRETCH', "Minimum Stretch", "Least distortion"),
+            ('ANGLE_BASED', "Angle Based", "Preserves angles"),
+            ('CONFORMAL', "Conformal", "Faster, more stretch"),
+        ],
+        default='MINIMUM_STRETCH')
+    unwrap_margin: bpy.props.FloatProperty(
+        name="Island Margin", default=0.02, min=0.0, max=0.5)
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == 'MESH'
+
+    def invoke(self, context, event):
+        settings = getattr(context.scene, "foam_craft", None)
+        if settings is not None:
+            self.snap_distance = settings.snap_distance
+        return self.execute(context)
+
+    def execute(self, context):
+        settings = getattr(context.scene, "foam_craft", None)
+        source = context.active_object
+        gp_object = getattr(settings, "gp_object", None) if settings else None
+        if gp_object is None:
+            self.report({'ERROR'},
+                        "Pick a Grease Pencil object in the Pattern panel")
+            return {'CANCELLED'}
+        if source.get("foam_pattern_source"):
+            self.report({'ERROR'},
+                        "That is already a pattern copy -- select the sculpt")
+            return {'CANCELLED'}
+        if context.object and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Counted before anything else so the promise that the inputs are left
+        # alone can be checked rather than asserted.
+        source_before = (len(source.data.vertices), len(source.data.edges),
+                         len(source.data.polygons))
+
+        # Built from the evaluated mesh, so the modifier stack is already
+        # applied and the unwrap has finished geometry to work with.
+        depsgraph = context.evaluated_depsgraph_get()
+        mesh = bpy.data.meshes.new_from_object(source.evaluated_get(depsgraph))
+
+        name = "%s_Pattern" % source.name
+        existing = bpy.data.objects.get(name)
+        if existing is not None and existing.get("foam_pattern_source"):
+            # Re-bake replaces in place. Leaving a second copy behind on every
+            # attempt would turn draw-bake-look-adjust into a cleanup chore, and
+            # that loop is the whole point of baking to a copy.
+            old_mesh = existing.data
+            existing.data = mesh
+            if old_mesh.users == 0:
+                bpy.data.meshes.remove(old_mesh)
+            pattern = existing
+        else:
+            pattern = bpy.data.objects.new(name, mesh)
+            context.collection.objects.link(pattern)
+        pattern.matrix_world = source.matrix_world.copy()
+        pattern["foam_pattern_source"] = source.name
+        pattern["foam_pattern_gp"] = gp_object.name
+
+        try:
+            strokes = strokes_from_grease_pencil(gp_object, pattern)
+        except StrokeCutError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            edges, open_ends = cut_strokes(bm, strokes,
+                                           snap_distance=self.snap_distance)
+            for edge in edges:
+                edge.seam = True
+            bm.to_mesh(mesh)
+            mesh.update()
+        except StrokeCutError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        finally:
+            bm.free()
+
+        # Unwrapping happens on the copy, in edit mode, because Unwrap reads
+        # seams from the original mesh rather than from evaluated modifier
+        # output -- which is the reason this is baked at all instead of living
+        # in a modifier.
+        for obj in list(context.selected_objects):
+            obj.select_set(False)
+        pattern.select_set(True)
+        context.view_layer.objects.active = pattern
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.uv.unwrap(method=self.unwrap_method, margin=self.unwrap_margin)
+        bm = bmesh.from_edit_mesh(mesh)
+        uv_layer = bm.loops.layers.uv.active
+        islands = len(core.uv_islands(bm, uv_layer)) if uv_layer else 0
+        seams = sum(1 for e in bm.edges if e.seam)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        source_after = (len(source.data.vertices), len(source.data.edges),
+                        len(source.data.polygons))
+        untouched = source_before == source_after
+
+        _log.info(foam_log.summary(
+            "bake_pattern", source=source.name, gp=gp_object.name,
+            strokes=len(strokes), seam_edges=seams, islands=islands,
+            open_ends=open_ends, snap=self.snap_distance,
+            pattern_verts=len(mesh.vertices), source_untouched=untouched))
+
+        if not untouched:
+            # Should be impossible: nothing here writes to the sculpt. Reported
+            # rather than trusted, because the damage would be silent and would
+            # only surface as drift several bakes later.
+            self.report({'WARNING'},
+                        "the source mesh changed during the bake")
+
+        message = "%d piece(s) from %d stroke(s), %d seam edge(s)" % (
+            islands, len(strokes), seams)
+        if open_ends:
+            message += "; %d loose end(s) not cut" % open_ends
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
+
+
+_classes = (
+    OBJECT_OT_foam_bake_pattern,
+)
+
+
+def register():
+    for cls in _classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(_classes):
+        bpy.utils.unregister_class(cls)

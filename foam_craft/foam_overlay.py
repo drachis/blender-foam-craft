@@ -831,6 +831,23 @@ class IMAGE_PT_foam_craft(bpy.types.Panel):
             layout.label(text="FoamCraft settings unavailable", icon='ERROR')
             return
 
+        # Patterning sits above everything else because it is the step that
+        # decides what the pieces are. Outside the overlay's enabled column, so
+        # a bake is still reachable with the overlay switched off.
+        box = layout.box()
+        box.label(text="Pattern", icon='GREASEPENCIL')
+        box.prop(s, "gp_object", text="Strokes")
+        row = box.row()
+        row.enabled = s.gp_object is not None
+        source = context.active_object
+        existing = (source is not None
+                    and bpy.data.objects.get("%s_Pattern" % source.name)
+                    is not None)
+        row.operator("object.foam_bake_pattern",
+                     text="Re-bake Pattern" if existing else "Bake Pattern",
+                     icon='MOD_BOOLEAN')
+        box.prop(s, "snap_distance")
+
         layout.prop(s, "show_overlay", toggle=True)
         col = layout.column()
         col.enabled = s.show_overlay

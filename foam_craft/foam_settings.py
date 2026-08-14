@@ -133,6 +133,21 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
                     "to. A safety net for a long run on a tight curve",
         default=24, min=0, max=200)
 
+    # --- Grease Pencil patterning
+    gp_object: bpy.props.PointerProperty(
+        name="Pattern Strokes", type=bpy.types.Object,
+        description="Grease Pencil object holding the drawn piece boundaries. "
+                    "Draw on the sculpt with stroke placement set to Surface",
+        poll=lambda self, obj: obj.type == 'GREASEPENCIL')
+    snap_distance: bpy.props.FloatProperty(
+        name="Snap Distance",
+        description="Default for the bake. A drawn line has the width of a "
+                    "marker tip while the curve taken from it is idealised to "
+                    "zero width, so cuts landing this close to an existing "
+                    "vertex reuse it rather than splitting again",
+        default=0.002, min=0.0, max=0.05,
+        subtype='DISTANCE', unit='LENGTH', precision=4)
+
     # --- Stock, for craftability checks
     sheet_width: bpy.props.FloatProperty(
         name="Sheet Width", default=0.6, min=0.0,
