@@ -680,6 +680,23 @@ def draw_callback():
             bucket.extend([(tipx - tdx * bar, tipy - tdy * bar),
                            (tipx + tdx * bar, tipy + tdy * bar)])
 
+    # Blockers, marked at the exact spot rather than only counted in the panel.
+    # A finding that says "island 42 cannot be made" leaves the user to hunt for
+    # which part of it is the problem; a saddle usually occupies one stretch of
+    # a boundary and the rest of the piece is fine.
+    if s.show_blockers and _findings:
+        cross = tick * 0.9
+        bucket = segments.setdefault(tuple(s.blocker_color), [])
+        for finding in _findings:
+            if finding.severity != 'blocker':
+                continue
+            for u, v in getattr(finding, "sites", ()):
+                x, y = view.view_to_region(u, v, clip=False)
+                if not all(abs(c) < 1e6 for c in (x, y)):
+                    continue
+                bucket.extend([(x - cross, y - cross), (x + cross, y + cross),
+                               (x - cross, y + cross), (x + cross, y - cross)])
+
     _draw_lines(segments, max(1.0, scale))
 
     # Warn where a run is too short to cut cleanly. This is about the piece,
@@ -862,6 +879,7 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         layout.prop(s, "decimals")
         layout.prop(s, "min_angle")
         layout.prop(s, "show_darts")
+        layout.prop(s, "show_blockers")
         col = layout.column(align=True)
         col.enabled = s.show_darts
         col.prop(s, "dart_wedge_deg")
@@ -877,6 +895,7 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         col.label(text=foam_log.log_path(), icon='TEXT')
         layout.prop(s, "convex_color")
         layout.prop(s, "concave_color")
+        layout.prop(s, "blocker_color")
         layout.prop(s, "suppressed_color")
         layout.prop(s, "heat_form_color")
         layout.prop(s, "island_id_color")

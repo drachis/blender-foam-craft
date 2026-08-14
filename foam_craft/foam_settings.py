@@ -246,6 +246,17 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
     concave_color: bpy.props.FloatVectorProperty(
         name="Concave", default=(1.0, 0.2, 0.55, 1.0),
         min=0, max=1, subtype='COLOR', size=4)
+    blocker_color: bpy.props.FloatVectorProperty(
+        name="Blocker",
+        description="Marks the exact places a piece cannot be made -- currently "
+                    "the saddled stretches of a boundary, where flat foam has "
+                    "too little material to reach",
+        default=(1.0, 0.15, 0.15, 1.0),
+        min=0, max=1, subtype='COLOR', size=4)
+    show_blockers: bpy.props.BoolProperty(
+        name="Blocker Marks", default=True,
+        description="Draw a cross at each place a craftability blocker was "
+                    "found, after running the check")
     suppressed_color: bpy.props.FloatVectorProperty(
         name="Hidden Label", default=(1.0, 0.85, 0.1, 1.0),
         min=0, max=1, subtype='COLOR', size=4)

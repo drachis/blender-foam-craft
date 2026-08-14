@@ -756,6 +756,10 @@ class Finding:
     detail: str            # what was measured
     advice: str            # what to do about it
     islands: list = field(default_factory=list)
+    # UV positions of the specific places that caused the finding, so the user
+    # can be pointed at the conflict rather than at the whole piece. An island
+    # index alone says "something here is wrong" and leaves the search to them.
+    sites: list = field(default_factory=list)
 
 
 def _island_metrics(faces, uv_layer):
@@ -973,28 +977,55 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
             f"{sum(1 for r in runs if r.has_dihedral)} need a bevel.",
             "Each run is one straight pass at one blade tilt."))
 
-    # --- Pieces that are short of material, not over-supplied with it.
+    # --- Pieces that cannot be made from flat stock at all.
     #
-    # A dart removes material where a piece domes. Where it saddles, the piece
-    # needs *more* material than the flat sheet has, and cutting a wedge there
-    # makes it worse. The two cancel in a total, so a piece can look flat and be
-    # the most work on the sheet -- measured on a torus seamed at both equators,
-    # total curvature zero and 671 degrees of actual relief.
+    # Where a piece domes, the flat sheet has too much material and a dart
+    # removes the excess. Where it saddles, the sheet has too *little*, and no
+    # cut can add material back. That is not a warning about a harder cut, it is
+    # a piece that cannot be made as mapped, so it blocks.
+    #
+    # A gore glued into a slit or a heat-formed stretch will rescue an
+    # individual piece, but both are repairs to a pattern that is wrong: the
+    # island has been drawn across ground that flat stock cannot take. The fix
+    # is to move the seam, and the tool should say so rather than teaching a
+    # workaround.
+    #
+    # The signs cancel in a total, so a piece can read as perfectly flat and
+    # still be unmakeable -- a torus seamed at both equators totals zero and
+    # needs 671 degrees of relief. Both the island and the offending stretch of
+    # its boundary are reported, because "island 42 is wrong" leaves the user
+    # hunting for which part of it.
     saddled = []
+    saddle_sites = []
     for index, faces in enumerate(islands):
-        summary, _ = island_angle_defect(faces)
-        if summary.negative < -radians(30.0):
-            saddled.append(index)
+        summary, per_vertex = island_angle_defect(faces)
+        if summary.negative >= -radians(30.0):
+            continue
+        saddled.append(index)
+        load = boundary_defect_load(faces)
+        # Sorted by load alone. Sorting (load, vert) pairs falls through to
+        # comparing BMVerts whenever two loads tie, which raises.
+        worst = sorted((v for v, l in load.items() if l < 0.0),
+                       key=lambda v: load[v])[:12]
+        for vert in worst:
+            loop = next((lp for f in faces for lp in f.loops
+                         if lp.vert is vert), None)
+            if loop is not None:
+                uv = loop[uv_layer].uv
+                saddle_sites.append((uv.x, uv.y))
     if saddled:
         findings.append(Finding(
-            'warn', 'needs_gore', "Some pieces need material added, not removed",
-            f"{len(saddled)} island(s) saddle somewhere along their edge.",
-            "Flat foam has too little material there, so no cut will fix it -- "
-            "a dart removes material the piece is already short of, and a "
-            "V-groove only hinges, which flat foam does for free. Add a gore "
-            "(glue a wedge into a slit), heat-form the piece, or move the seam "
-            "onto the flatter ground either side.",
-            islands=saddled))
+            'blocker', 'saddle_island',
+            "Some pieces cannot be cut from flat foam",
+            f"{len(saddled)} island(s) saddle along part of their edge, where "
+            f"flat stock has too little material to reach.",
+            "No cut fixes this -- a dart removes material the piece is already "
+            "short of, and a V-groove only hinges, which flat foam does for "
+            "free. Re-map the island: move the seam onto the flatter ground "
+            "either side, or split the piece so no single one spans the saddle. "
+            "A gore or a heat-formed stretch will rescue the piece as drawn, "
+            "but both are repairs to a pattern that is wrong.",
+            islands=saddled, sites=saddle_sites))
 
     # --- Open rims are worth stating so they are not mistaken for a bug.
     open_edges = sum(1 for e in bm.edges if len(e.link_faces) == 1)

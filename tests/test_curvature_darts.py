@@ -342,12 +342,81 @@ def test_relief_sign_is_carried_and_flagged():
     }
 
 
+# --- 6. A saddle blocks the build and names the offending edges ---------
+def test_saddle_is_a_blocker_with_sites():
+    """A piece that saddles cannot be cut from flat stock at all.
+
+    Not a warning about a harder cut: no cut adds material back, so the pattern
+    itself is wrong and the island has to be re-mapped. The finding therefore
+    has to block, and it has to name *where* along the boundary the conflict is
+    -- "island 42 is wrong" leaves the user hunting across a whole piece when
+    usually one stretch of its edge is the problem.
+    """
+    _clear()
+    bpy.ops.mesh.primitive_torus_add(major_radius=R_MAJOR,
+                                     minor_radius=R_MINOR,
+                                     major_segments=48, minor_segments=24)
+    obj = bpy.context.object
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    for edge in bm.edges:
+        for ring in (R_MAJOR + R_MINOR, R_MAJOR - R_MINOR):
+            if all(abs(math.hypot(v.co.x, v.co.y) - ring) < 1e-4
+                   for v in edge.verts):
+                edge.seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.02)
+    bm = bmesh.from_edit_mesh(obj.data)
+    uv_layer = bm.loops.layers.uv.active
+    findings = core.assess_craftability(bm, uv_layer,
+                                        matrix=obj.matrix_world)
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    saddle = [f for f in findings if f.code == 'saddle_island']
+    blockers = [f for f in findings if f.severity == 'blocker']
+
+    # A developable shape must NOT trip it, or the check proves nothing.
+    _clear()
+    bpy.ops.mesh.primitive_cylinder_add(vertices=48, radius=0.5, depth=2.0,
+                                        end_fill_type='NOTHING')
+    obj2 = bpy.context.object
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.02)
+    bm2 = bmesh.from_edit_mesh(obj2.data)
+    cyl_findings = core.assess_craftability(bm2, bm2.loops.layers.uv.active,
+                                            matrix=obj2.matrix_world)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    cyl_saddle = [f for f in cyl_findings if f.code == 'saddle_island']
+
+    return {
+        "saddle_findings": len(saddle),
+        "islands_flagged": len(saddle[0].islands) if saddle else 0,
+        "sites_marked": len(saddle[0].sites) if saddle else 0,
+        "severity": saddle[0].severity if saddle else None,
+        "total_blockers": len(blockers),
+        "cylinder_saddle_findings": len(cyl_saddle),
+        "checks": {
+            "torus_saddle_is_raised": len(saddle) == 1,
+            "it_blocks_rather_than_warns":
+                bool(saddle) and saddle[0].severity == 'blocker',
+            "the_island_is_named": bool(saddle) and len(saddle[0].islands) > 0,
+            # The conflicting places, not just the piece.
+            "the_conflict_is_located": bool(saddle) and len(saddle[0].sites) > 0,
+            # Control: a developable piece must not be blocked.
+            "cylinder_is_not_blocked": len(cyl_saddle) == 0,
+        },
+    }
+
+
 TESTS = (
     test_developable_surfaces_have_no_defect,
     test_closed_surfaces_match_gauss_bonnet,
     test_mixed_curvature_is_not_flat,
     test_darts_follow_curvature,
     test_relief_sign_is_carried_and_flagged,
+    test_saddle_is_a_blocker_with_sites,
 )
 
 
