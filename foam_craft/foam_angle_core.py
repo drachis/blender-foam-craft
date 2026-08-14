@@ -1031,3 +1031,69 @@ def estimate_flex_tolerance(foam_grade, thickness_m):
     deviation = max(0.0005, min(0.010, 0.003 / max(resistance, 0.05)))
     angle_limit = max(1.0, min(20.0, 5.0 / max(resistance ** 0.5, 0.2)))
     return deviation, angle_limit
+
+
+# --- Why a piece will not lie flat: Gaussian curvature -------------------
+
+def vertex_angle_defect(vert, faces=None):
+    """Angle defect at one vertex, in radians. Discrete Gaussian curvature.
+
+    ``2*pi`` minus the corner angles meeting at the vertex, which is literally
+    the gap that opens when those faces are flattened out onto a table. That gap
+    is the material a dart has to remove.
+
+    This is the quantity darts are actually about, and it is not the same as how
+    much the surface bends. A cylinder bends as hard as you like and its defect
+    is exactly zero, because a flat sheet wraps a cylinder without stretching
+    anywhere -- measured on a 64-sided open cylinder, 0.0 degrees total. A cone
+    is also flat everywhere except its tip, where the whole requirement piles up
+    into one wedge: measured 199.05 degrees on a cone of radius 0.5 and depth
+    1.0, against ``2*pi*(1 - r/slant)`` = 199.05. That wedge is precisely the pie
+    slice you cut from a paper disc to make a cone.
+
+    On a boundary vertex the reference is ``pi`` rather than ``2*pi``, since only
+    a half-turn of material is present.
+    """
+    linked = [f for f in vert.link_faces if faces is None or f in faces]
+    if not linked:
+        return 0.0
+    total = 0.0
+    for face in linked:
+        for loop in face.loops:
+            if loop.vert is vert:
+                total += loop.calc_angle()
+    interior = (not vert.is_boundary) and len(linked) == len(vert.link_faces)
+    from math import pi
+    return (2.0 * pi - total) if interior else (pi - total)
+
+
+def island_angle_defect(faces):
+    """Total interior angle defect of a patch, in radians, and per vertex.
+
+    Returns ``(total, {vert: defect})`` over the vertices strictly inside the
+    patch. By Gauss-Bonnet this total is how much material the patch's darts
+    have to remove between them -- a whole sphere comes to 4*pi, measured
+    12.5664 against 12.5664 at three densities.
+
+    Boundary vertices are reported but excluded from the total: their defect is
+    a statement about the outline's shape, not about the piece refusing to lie
+    flat, and counting it would double-charge a seam that the bevel already
+    handles.
+    """
+    faces = set(faces)
+    total = 0.0
+    per_vertex = {}
+    seen = set()
+    for face in faces:
+        for vert in face.verts:
+            if vert in seen:
+                continue
+            seen.add(vert)
+            linked = [f for f in vert.link_faces if f in faces]
+            interior = ((not vert.is_boundary)
+                        and len(linked) == len(vert.link_faces))
+            defect = vertex_angle_defect(vert, faces)
+            per_vertex[vert] = defect
+            if interior:
+                total += defect
+    return total, per_vertex
