@@ -341,9 +341,14 @@ class DartRun:
     # only, and only concave ones -- a convex vertex already has its material
     # falling away and needs nothing released.
     dart_indices: list = field(default_factory=list, repr=False)
-    # Signed angle defect each dart absorbs, in radians. Positive means the
-    # piece domes and a V-wedge is cut out; negative means it saddles and the
-    # sheet has to spread instead -- cutting a wedge there makes it worse.
+    # Signed angle defect each mark absorbs, in radians.
+    #
+    # Positive: the flat sheet has too much material, so a V-wedge is cut out
+    # and closed. That is a dart.
+    #
+    # Negative: the sheet has too little, so material must be *added* -- a gore
+    # glued into a slit, or heat forming. Not a dart with the sign flipped but
+    # the opposite operation, and cutting anything there makes it worse.
     dart_loads: tuple = ()
     # False when the run lies on an open mesh boundary (the rim of the sculpt)
     # rather than a seam against another panel. Such a run has no facing piece,
@@ -967,6 +972,29 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
             f"{len(runs)} run(s) across {len(islands)} island(s); "
             f"{sum(1 for r in runs if r.has_dihedral)} need a bevel.",
             "Each run is one straight pass at one blade tilt."))
+
+    # --- Pieces that are short of material, not over-supplied with it.
+    #
+    # A dart removes material where a piece domes. Where it saddles, the piece
+    # needs *more* material than the flat sheet has, and cutting a wedge there
+    # makes it worse. The two cancel in a total, so a piece can look flat and be
+    # the most work on the sheet -- measured on a torus seamed at both equators,
+    # total curvature zero and 671 degrees of actual relief.
+    saddled = []
+    for index, faces in enumerate(islands):
+        summary, _ = island_angle_defect(faces)
+        if summary.negative < -radians(30.0):
+            saddled.append(index)
+    if saddled:
+        findings.append(Finding(
+            'warn', 'needs_gore', "Some pieces need material added, not removed",
+            f"{len(saddled)} island(s) saddle somewhere along their edge.",
+            "Flat foam has too little material there, so no cut will fix it -- "
+            "a dart removes material the piece is already short of, and a "
+            "V-groove only hinges, which flat foam does for free. Add a gore "
+            "(glue a wedge into a slit), heat-form the piece, or move the seam "
+            "onto the flatter ground either side.",
+            islands=saddled))
 
     # --- Open rims are worth stating so they are not mistaken for a bug.
     open_edges = sum(1 for e in bm.edges if len(e.link_faces) == 1)

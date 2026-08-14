@@ -242,7 +242,7 @@ def _rebuild(pairs, s):
                 for p, n in zip(run.uv_points, run.uv_normals))
 
             dart_marks = []
-            for k in run.dart_indices:
+            for slot, k in enumerate(run.dart_indices):
                 pt = run.uv_points[k]
                 nrm = run.uv_normals[k]
                 nxt = run.uv_points[min(k + 1, len(run.uv_points) - 1)]
@@ -250,8 +250,14 @@ def _rebuild(pairs, s):
                 tangent = nxt - prv
                 if tangent.length > 1e-12:
                     tangent = tangent.normalized()
+                # Sign of the curvature this dart absorbs. Positive domes and
+                # wants a wedge cut out; negative saddles and wants the sheet
+                # to spread instead. Carried through so the two are never drawn
+                # as the same instruction.
+                load = (run.dart_loads[slot]
+                        if slot < len(run.dart_loads) else 0.0)
                 dart_marks.append((pt.x, pt.y, tangent.x, tangent.y,
-                                   nrm.x, nrm.y))
+                                   nrm.x, nrm.y, load))
             darts = tuple(dart_marks)
 
             if heat:
@@ -570,11 +576,17 @@ def draw_callback():
         # seam that is never opened are instructions to damage the piece.
         if s.show_darts and run.has_dihedral \
                 and abs(run.angle_deg) >= s.min_angle:
-            for u, v, tu, tv, nu, nv in run.darts:
+            for u, v, tu, tv, nu, nv, load in run.darts:
                 key = (round(u, 6), round(v, 6))
                 if key in dart_seen:
                     continue
-                dart_seen[key] = (tu, tv, nu, nv, color)
+                # A relief cut is coloured by what it does to the material, not
+                # by the run's fold direction: a piece can dome along one part
+                # of a boundary and saddle along another, and the two need
+                # opposite work.
+                dart_color = (tuple(s.concave_color) if load < 0.0
+                              else tuple(s.convex_color))
+                dart_seen[key] = (tu, tv, nu, nv, dart_color, load)
 
         # Two separate questions, deliberately kept apart.
         #
@@ -622,7 +634,7 @@ def draw_callback():
             # the piece, and that is only known once the font is measured.
             labels.append((mx, my, nx / nlen, ny / nlen, text, color))
 
-    for (u, v), (tu, tv, nu, nv, color) in dart_seen.items():
+    for (u, v), (tu, tv, nu, nv, color, load) in dart_seen.items():
         px0, py0 = view.view_to_region(u, v, clip=False)
         if not all(abs(c) < 1e6 for c in (px0, py0)):
             continue
@@ -643,7 +655,30 @@ def draw_callback():
         # a bar lying on the edge reads as part of the outline instead.
         bucket = segments.setdefault(color, [])
         stem = tick * 1.1
-        bucket.extend([(px0, py0), (px0 - ndx * stem, py0 - ndy * stem)])
+        tipx, tipy = px0 - ndx * stem, py0 - ndy * stem
+        bucket.extend([(px0, py0), (tipx, tipy)])
+        if load < 0.0:
+            # Not a dart at all -- a gore.
+            #
+            # A dart removes material where the flat sheet has too much. Here
+            # the sheet has too *little*: the piece saddles, and its boundary
+            # needs to be longer than flat stock provides. Nothing can be cut
+            # away to achieve that. The fixes are to add material (glue a wedge
+            # into a slit), to stretch it (heat forming, flagged separately), or
+            # to move the seam onto flatter ground.
+            #
+            # A V-groove scored partway through does not help either, however
+            # natural the idea: a groove is a hinge, and hinging is free --
+            # flat foam already wraps a cylinder with no cuts at all. A groove
+            # changes how the sheet *bends*, not how much material it has.
+            #
+            # Drawn with a bar across the inner tip, so it differs in shape as
+            # well as colour. The two call for opposite work, and a colour-blind
+            # reader, a greyscale print or a faded marker must not be able to
+            # confuse "cut this out" with "fill this in".
+            bar = tick * 0.45
+            bucket.extend([(tipx - tdx * bar, tipy - tdy * bar),
+                           (tipx + tdx * bar, tipy + tdy * bar)])
 
     _draw_lines(segments, max(1.0, scale))
 

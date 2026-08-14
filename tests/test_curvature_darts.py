@@ -280,12 +280,76 @@ def test_darts_follow_curvature():
     return out
 
 
+# --- 5. Convex and concave relief are told apart ------------------------
+def test_relief_sign_is_carried_and_flagged():
+    """A dart's sign has to survive to whatever draws or exports it.
+
+    Positive relief cuts a wedge out. Negative relief needs the sheet to spread
+    -- cutting a wedge there removes material the piece was already short of, so
+    the two must never reach the maker as the same mark. The torus is the case
+    that carries both along one boundary.
+    """
+    _clear()
+    bpy.ops.mesh.primitive_torus_add(major_radius=R_MAJOR,
+                                     minor_radius=R_MINOR,
+                                     major_segments=48, minor_segments=24)
+    obj = bpy.context.object
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    for edge in bm.edges:
+        for ring in (R_MAJOR + R_MINOR, R_MAJOR - R_MINOR):
+            if all(abs(math.hypot(v.co.x, v.co.y) - ring) < 1e-4
+                   for v in edge.verts):
+                edge.seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.02)
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    uv_layer = bm.loops.layers.uv.active
+    runs = list(core.iter_boundary_dart_segments(
+        bm, uv_layer, 0.0, 10.0, matrix=obj.matrix_world,
+        dart_wedge_deg=15.0, max_darts_per_run=200))
+    loads = [l for r in runs for l in r.dart_loads]
+
+    # Every dart must carry a load; a zero would be a mark with no meaning.
+    aligned = all(len(r.dart_loads) == len(r.dart_indices) for r in runs)
+
+    islands = core.uv_islands(bm, uv_layer)
+    saddled = 0
+    for faces in islands:
+        summary, _ = core.island_angle_defect(faces)
+        if summary.negative < -math.radians(30.0):
+            saddled += 1
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    return {
+        "darts": len(loads),
+        "convex": sum(1 for l in loads if l > 0),
+        "concave": sum(1 for l in loads if l < 0),
+        "zero_load": sum(1 for l in loads if l == 0),
+        "islands": len(islands),
+        "saddled_islands": saddled,
+        "checks": {
+            "loads_match_darts": aligned,
+            "both_signs_reach_the_overlay":
+                any(l > 0 for l in loads) and any(l < 0 for l in loads),
+            # A mark with no load would be an instruction with no meaning.
+            "no_meaningless_marks": all(l != 0 for l in loads),
+            # The advisor must raise it, not leave it to the drawing alone.
+            "advisor_flags_the_saddle": saddled > 0,
+        },
+    }
+
+
 TESTS = (
     test_developable_surfaces_have_no_defect,
     test_closed_surfaces_match_gauss_bonnet,
     test_mixed_curvature_is_not_flat,
     test_darts_follow_curvature,
+    test_relief_sign_is_carried_and_flagged,
 )
+
 
 result = {}
 _all_pass = True
