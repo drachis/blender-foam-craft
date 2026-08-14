@@ -61,52 +61,62 @@ class StrokeCutError(Exception):
     """
 
 
-def _densify(bm, bvh, points, cyclic):
-    """Add points so no step is longer than the faces it crosses.
+def _densify(bm, bvh, points, cyclic, max_depth=6):
+    """Add stroke samples, but only where the walk would otherwise fail.
 
-    The walk needs consecutive points to land on faces that touch, because it
-    works out where the stroke leaves one face for the next. A stroke drawn with
-    long steps -- or a fine mesh under a coarse stroke -- skips faces entirely,
-    and the walk had no choice but to refuse it.
+    The walk works out where a stroke leaves one face for the next, so it needs
+    successive points on faces that touch. A stroke drawn with long steps -- or
+    a fine mesh under a coarse stroke -- skips faces, and the walk had no choice
+    but to refuse it. Its own error said "resample the stroke more finely",
+    which is something this can simply do: the line between two drawn points is
+    a straight run on the surface, so filling it in adds no information the user
+    did not give and loses none.
 
-    Refusing was the wrong answer. The error it raised said "resample the stroke
-    more finely", which is something this can simply do: the drawn line between
-    two points is a straight run on the surface, so filling it in adds no
-    information the user did not give and loses none either. Every stroke of a
-    Voronoi and of a ring-and-meridian pattern was being rejected outright for
-    want of this.
-
-    Step length is taken from the mesh, not from a constant, so it follows
-    whatever the sculpt's resolution happens to be.
+    Refined by bisection, and only on the segments that need it. Sampling the
+    whole stroke to a fixed fraction of a face was tried first and is the wrong
+    trade: every added sample becomes a vertex in the finished cut, so a blanket
+    pass litters the seam with detail nobody drew and nothing needs. Here a
+    segment is split only while its ends sit on faces that do not touch, so a
+    stroke already fine enough passes through untouched and cost is paid only
+    where the mesh is finer than the drawing.
     """
     if len(points) < 2:
         return points
     bm.faces.ensure_lookup_table()
-    out = []
-    last = len(points) if cyclic else len(points) - 1
+
+    def face_at(point):
+        _loc, _nrm, index, _dist = bvh.find_nearest(point)
+        return bm.faces[index] if index is not None else None
+
+    def touching(face_a, face_b):
+        if face_a is None or face_b is None or face_a is face_b:
+            return True
+        return (_shared_edge(face_a, face_b) is not None
+                or _shared_vert(face_a, face_b) is not None)
+
+    def refine(p0, p1, depth, out):
+        if depth >= max_depth or touching(face_at(p0), face_at(p1)):
+            return
+        middle = p0.lerp(p1, 0.5)
+        refine(p0, middle, depth + 1, out)
+        out.append(middle)
+        refine(middle, p1, depth + 1, out)
+
+    result = []
+    count = len(points)
+    last = count if cyclic else count - 1
     for i in range(last):
         a = points[i]
-        b = points[(i + 1) % len(points)]
-        out.append(a)
-        gap = (b - a).length
-        if gap < 1e-12:
+        b = points[(i + 1) % count]
+        result.append(a)
+        if (b - a).length < 1e-12:
             continue
-        _loc, _nrm, index, _dist = bvh.find_nearest(a)
-        if index is None:
-            continue
-        face = bm.faces[index]
-        edges = face.edges
-        size = (sum(e.calc_length() for e in edges) / len(edges)) if edges else 0.0
-        if size <= 1e-12:
-            continue
-        # Half a face per step: enough that a step cannot cross a face without
-        # landing in it, without multiplying the point count needlessly.
-        steps = int(gap / (size * 0.5))
-        for k in range(1, steps):
-            out.append(a.lerp(b, k / float(steps)))
+        added = []
+        refine(a, b, 0, added)
+        result.extend(added)
     if not cyclic:
-        out.append(points[-1])
-    return out
+        result.append(points[-1])
+    return result
 
 
 def _assign_faces(bvh, bm, points):

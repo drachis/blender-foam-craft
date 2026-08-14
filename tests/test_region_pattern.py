@@ -57,6 +57,48 @@ MERIDIANS = 6
 EXPECTED = 2 + (len(RINGS) - 1) * MERIDIANS
 
 
+_TOOLS = "O:/Work/BlenderPlugin/FoamCraft/tools"
+
+
+def _shot(label, mesh_obj):
+    """Capture the cut in edit mode, where seams are actually drawn.
+
+    A solid object-mode view of a cut sphere is identical to an uncut one, so a
+    picture taken there looks like confirmation while showing nothing.
+    """
+    if bpy.app.background:
+        return None
+    if _TOOLS not in sys.path:
+        sys.path.insert(0, _TOOLS)
+    try:
+        from shot import next_path
+    except ImportError:
+        print("FoamCraft tests: cannot import shot from %r" % _TOOLS)
+        return None
+    screen = bpy.context.screen
+    if screen is None:
+        return None
+    for area in screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        if region is None:
+            continue
+        path = next_path("test_%s" % label)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.context.view_layer.objects.active = mesh_obj
+        mesh_obj.select_set(True)
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        with bpy.context.temp_override(area=area, region=region):
+            area.spaces.active.shading.type = 'SOLID'
+            bpy.ops.view3d.view_all()
+            bpy.ops.screen.screenshot_area(filepath=path)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return path
+    return None
+
+
 def _clear():
     if bpy.context.object and bpy.context.object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -126,11 +168,16 @@ def test_bands_and_columns_tile_a_sphere():
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=96, ring_count=48)
     mesh = bpy.context.object.data
 
+    obj = bpy.context.object
     bm = bmesh.new()
     bm.from_mesh(mesh)
     try:
         cut, open_ends = gp.cut_strokes(bm, _pattern(), snap_distance=0.006,
                                         chain_tolerance=0.02)
+        for edge in cut:
+            edge.seam = True
+        bm.to_mesh(mesh)
+        mesh.update()
         sizes = _regions(bm)
         report = {
             "expected_regions": EXPECTED,
@@ -145,6 +192,7 @@ def test_bands_and_columns_tile_a_sphere():
         }
     finally:
         bm.free()
+    report["shot"] = _shot("region_pattern", obj)
 
     report["checks"] = {
         "every_region_closed": report["regions"] == EXPECTED,
