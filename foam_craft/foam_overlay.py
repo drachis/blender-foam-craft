@@ -191,6 +191,7 @@ def _signature(pairs, s):
         s.max_darts_per_run,
         round(s.min_angle, 4),
         s.show_darts,
+        s.allow_gores,
         s.only_selected,
     )
 
@@ -580,6 +581,13 @@ def draw_callback():
                 key = (round(u, 6), round(v, 6))
                 if key in dart_seen:
                     continue
+                if load < 0.0 and not s.allow_gores:
+                    # A gore mark here would contradict the advisor, which is
+                    # blocking this piece as unmakeable from flat stock. The
+                    # blocker crosses mark the spot instead; drawing a "set
+                    # material in here" instruction as well would be telling the
+                    # maker to build something the tool has just refused.
+                    continue
                 # A relief cut is coloured by what it does to the material, not
                 # by the run's fold direction: a piece can dome along one part
                 # of a boundary and saddle along another, and the two need
@@ -787,7 +795,8 @@ class FOAM_OT_check_craftability(bpy.types.Operator):
             # uses, so a run flagged with a "!" in the UV editor is the same
             # run counted in the fragmented-runs finding here.
             min_run_length=s.min_run_length,
-            matrix=obj.matrix_world)
+            matrix=obj.matrix_world,
+            allow_gores=s.allow_gores)
         blockers = sum(1 for f in _findings if f.severity == 'blocker')
         warnings = sum(1 for f in _findings if f.severity == 'warn')
         # The status bar shows two totals and then goes away. The log keeps
@@ -879,6 +888,7 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         layout.prop(s, "decimals")
         layout.prop(s, "min_angle")
         layout.prop(s, "show_darts")
+        layout.prop(s, "allow_gores")
         layout.prop(s, "show_blockers")
         col = layout.column(align=True)
         col.enabled = s.show_darts

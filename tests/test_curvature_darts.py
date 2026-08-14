@@ -371,10 +371,17 @@ def test_saddle_is_a_blocker_with_sites():
     uv_layer = bm.loops.layers.uv.active
     findings = core.assess_craftability(bm, uv_layer,
                                         matrix=obj.matrix_world)
+    # The same mesh with gores permitted: the piece becomes buildable, at a
+    # cost the finding has to state rather than going quiet.
+    with_gores = core.assess_craftability(bm, uv_layer,
+                                          matrix=obj.matrix_world,
+                                          allow_gores=True)
     bpy.ops.object.mode_set(mode='OBJECT')
 
     saddle = [f for f in findings if f.code == 'saddle_island']
     blockers = [f for f in findings if f.severity == 'blocker']
+    gore = [f for f in with_gores if f.code == 'gore_required']
+    gore_blockers = [f for f in with_gores if f.severity == 'blocker']
 
     # A developable shape must NOT trip it, or the check proves nothing.
     _clear()
@@ -397,6 +404,8 @@ def test_saddle_is_a_blocker_with_sites():
         "severity": saddle[0].severity if saddle else None,
         "total_blockers": len(blockers),
         "cylinder_saddle_findings": len(cyl_saddle),
+        "with_gores_finding": len(gore),
+        "with_gores_blockers": len(gore_blockers),
         "checks": {
             "torus_saddle_is_raised": len(saddle) == 1,
             "it_blocks_rather_than_warns":
@@ -406,6 +415,12 @@ def test_saddle_is_a_blocker_with_sites():
             "the_conflict_is_located": bool(saddle) and len(saddle[0].sites) > 0,
             # Control: a developable piece must not be blocked.
             "cylinder_is_not_blocked": len(cyl_saddle) == 0,
+            # Allowing gores makes it buildable...
+            "gores_lift_the_block": len(gore) == 1 and len(gore_blockers) == 0,
+            # ...but it must still be reported, not silently accepted.
+            "gores_still_reported":
+                bool(gore) and gore[0].severity == 'warn'
+                and len(gore[0].sites) > 0,
         },
     }
 

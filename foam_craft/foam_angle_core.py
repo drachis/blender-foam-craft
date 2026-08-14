@@ -819,7 +819,7 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
                         max_angle_variation_deg=10.0,
                         sheet_width=None, sheet_height=None,
                         stretch_tolerance=0.25, min_run_length=0.006,
-                        islands=None, matrix=None):
+                        islands=None, matrix=None, allow_gores=False):
     """Check whether this mesh and unwrap can actually be built from foam.
 
     Returns a list of Findings, most severe first. Every warning carries the
@@ -1013,7 +1013,20 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
             if loop is not None:
                 uv = loop[uv_layer].uv
                 saddle_sites.append((uv.x, uv.y))
-    if saddled:
+    if saddled and allow_gores:
+        # The user has accepted the trade. Say what it costs rather than going
+        # quiet: a gore is not a relaxed tolerance, it is extra pieces, extra
+        # glue lines, and a seam crossing a piece instead of bounding it.
+        findings.append(Finding(
+            'warn', 'gore_required', "Some pieces need gores set in",
+            f"{len(saddled)} island(s) saddle and will need material added at "
+            f"{len(saddle_sites)} place(s).",
+            "Each gore is another piece to cut and another glue line to place "
+            "accurately, and it runs across the piece rather than around it. "
+            "Re-mapping the island so no piece spans the saddle avoids all of "
+            "that; turn Allow Gores off to see those pieces flagged instead.",
+            islands=saddled, sites=saddle_sites))
+    elif saddled:
         findings.append(Finding(
             'blocker', 'saddle_island',
             "Some pieces cannot be cut from flat foam",
@@ -1023,8 +1036,8 @@ def assess_craftability(bm, uv_layer, *, max_tilt_deg=45.0,
             "short of, and a V-groove only hinges, which flat foam does for "
             "free. Re-map the island: move the seam onto the flatter ground "
             "either side, or split the piece so no single one spans the saddle. "
-            "A gore or a heat-formed stretch will rescue the piece as drawn, "
-            "but both are repairs to a pattern that is wrong.",
+            "Enabling Allow Gores will build it instead by setting material in, "
+            "which works but changes what gets made.",
             islands=saddled, sites=saddle_sites))
 
     # --- Open rims are worth stating so they are not mistaken for a bug.

@@ -104,6 +104,16 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
         name="Dart Depth",
         description="Fraction of the foam thickness the dart cuts through",
         default=0.5, min=0.1, max=0.95)
+    allow_gores: bpy.props.BoolProperty(
+        name="Allow Gores",
+        description="Permit pieces that saddle, by adding material rather than "
+                    "removing it -- a wedge of foam glued into a slit. This "
+                    "changes the build, it does not just relax a check: every "
+                    "gore is another piece to cut, another glue line to place "
+                    "accurately, and a seam running across a piece rather than "
+                    "around it. Off by default, where a saddle blocks and the "
+                    "fix is to re-map the island so no piece spans it",
+        default=False)
     show_darts: bpy.props.BoolProperty(
         name="Relief Darts", default=True,
         description="Place relief darts along curved cut runs")
