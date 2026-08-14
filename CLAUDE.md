@@ -19,6 +19,37 @@ the whole detour and the bug in it.
 This generalises. Prefer, in order: ask the user, use the built-in, read the
 docs, read the source. Inventing is last, and it needs a stated reason.
 
+**Every check goes in `tests/`, never in a scratch file.**
+A measurement written to answer one question is worth keeping, because the
+next change to that code needs the same question asked again. Writing it
+fresh each time costs more than reading it, loses the reasoning about *why*
+that shape or that number was chosen, and leaves no record of what has
+actually been verified.
+
+So: no one-off probes. Add the case to the relevant file in `tests/`, with a
+comment saying what answer is expected and where that expectation comes from.
+When a check turns out to be wrong, fix it in place — the diff then shows how
+the understanding changed, which is usually the more valuable half.
+
+    python tools/launch_blender.py --port 9885
+    python tools/blender_bridge.py --port 9885 < tests/test_gp_pattern.py
+    python tools/blender_bridge.py --port 9885 < tests/test_curvature_darts.py
+
+Two rules the suite already enforces, both learned the hard way:
+
+- **State both bounds.** A check that can only fail in one direction is not a
+  check. "Two islands" is asserted `== 2`, never `> 1` — which an
+  all-edges-seamed mesh also satisfies — and never `< n_faces`, which anything
+  satisfies. This project once reported "2256 of 2256 edges selected" as a
+  pass, when the cutter had produced nothing and the measurement had fallen
+  through to the whole mesh.
+- **Prefer a shape with a known answer.** Assert against arithmetic, not
+  against an impression. A cylinder has zero Gaussian curvature, a sphere
+  totals 4π, a torus totals zero, a cone's defect is the pie slice you cut
+  from a paper disc. Those are checks a wrong result cannot survive; "looks
+  about right" is exactly how the dart parameter came to be wrong three times
+  running.
+
 **Check the real API and docs before designing around a problem.** Blender
 almost always already has the feature. Read the current API reference or probe
 the live API before concluding something isn't possible. A "clever" workaround
