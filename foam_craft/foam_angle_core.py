@@ -26,12 +26,13 @@ CORNER_ANGLE_DEG = 35.0
 # that bends to shape by itself. The reference patterns bottom out around 5.
 MIN_BEVEL_ANGLE_DEG = 5.0
 
-# How much outline turning one relief dart absorbs, in degrees. Dart count is
-# the run's total turning divided by this, so a straight run gets none however
-# long it is and a tight curve gets several however short. Darts once landed on
-# every vertex, which made their density a function of how finely the mesh was
-# subdivided rather than of anything physical.
-DART_RELIEF_DEG = 12.0
+# The widest wedge one relief dart may take out, in degrees. Darts are emitted
+# along a run each time this much accumulated angle defect has been carried out
+# to the boundary, so a piece's total relief is fixed by its curvature and this
+# only decides how many cuts it is divided into. Darts once landed on every
+# vertex, which made their density a function of how finely the mesh happened to
+# be subdivided rather than of anything physical.
+DART_WEDGE_DEG = 15.0
 
 
 def dihedral_angle_deg(edge):
@@ -340,6 +341,10 @@ class DartRun:
     # only, and only concave ones -- a convex vertex already has its material
     # falling away and needs nothing released.
     dart_indices: list = field(default_factory=list, repr=False)
+    # Signed angle defect each dart absorbs, in radians. Positive means the
+    # piece domes and a V-wedge is cut out; negative means it saddles and the
+    # sheet has to spread instead -- cutting a wedge there makes it worse.
+    dart_loads: tuple = ()
     # False when the run lies on an open mesh boundary (the rim of the sculpt)
     # rather than a seam against another panel. Such a run has no facing piece,
     # so there is no dihedral to split and no saw bevel to set -- distinct from
@@ -368,8 +373,8 @@ def _run_deviation(points, i, j):
 def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
                            max_angle_variation_deg, island_index=0,
                            corner_angle_deg=CORNER_ANGLE_DEG,
-                           matrix=None, dart_relief_deg=DART_RELIEF_DEG,
-                           max_darts_per_run=0):
+                           matrix=None, dart_wedge_deg=DART_WEDGE_DEG,
+                           max_darts_per_run=0, defect_load=None):
     """Split one boundary cycle into DartRuns.
 
     A run is one continuous pass at one blade tilt, so the angle staying put is
@@ -560,64 +565,41 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
         # remove material to let a face close up, or open to give it room to
         # stretch, so it is wanted on either kind of bend.
         #
-        # How many, and where, are two separate questions.
+        # Darts come from curvature, not from how the outline bends.
         #
-        # How many comes from stress. A dart exists because flat foam cannot
-        # follow a curve without the material somewhere having to give, and how
-        # much it has to give is how far the outline turns -- so the number of
-        # darts is the run's total turning divided by how much bend one dart
-        # relieves. A straight run gets none however long it is, and a tight
-        # curve gets several however short.
+        # A flat sheet wraps a cylinder however tightly with no relief at all,
+        # so bending is the wrong quantity -- the earlier version summed the
+        # outline's turning and emitted nothing, which was correct behaviour for
+        # a measurement that had no bearing on the problem. What forces a dart
+        # is Gaussian curvature: the piece refusing to lie flat. Its discrete
+        # form is angle defect, and defect_load carries each interior vertex's
+        # share out to the boundary vertex a cut could actually reach it from.
         #
-        # Where is measured in turning too, not in distance. A spline's ticks
-        # are spaced by parameter rather than arc length, so they bunch where
-        # the curve is tight and spread where it is slack -- and that is exactly
-        # where the material needs relief. Spacing them evenly by distance would
-        # put just as many darts along the slack part of a run as along the
-        # tight part, which is even-looking and physically wrong.
-        #
-        # Placing one at every vertex, which is what this did before, made dart
-        # density a function of how finely the mesh was subdivided -- on a dense
-        # sculpt a relief cut every millimetre, which perforates the piece
-        # instead of patterning it. Neither the count nor the placement should
-        # know anything about topology.
-        span_turn = sum(turns[k] for k in range(i + 1, j))
-        n_darts = 0
-        if dart_relief_deg > 0.0:
-            n_darts = int(round(span_turn / dart_relief_deg))
-        if max_darts_per_run > 0:
-            n_darts = min(n_darts, max_darts_per_run)
-
+        # Walking the run and emitting a dart each time an equal share of that
+        # load has accumulated puts them where the curvature is: crowded through
+        # a dome, absent along a stretch that happens to be developable however
+        # curved it looks.
         darts = []
-        if n_darts > 0:
-            # Cumulative *turning* along the run. cumulative[k - i] is how far
-            # the outline has bent by the time it reaches vertex k, so stepping
-            # through it in equal shares puts a dart wherever an equal share of
-            # the bending has been used up.
-            cumulative = [0.0]
-            for k in range(i, j):
-                cumulative.append(cumulative[-1] +
-                                  (turns[k + 1] if k + 1 < len(turns) else 0.0))
-            total = cumulative[-1]
-            if total > 1e-9:
-                for m in range(n_darts):
-                    target = total * (m + 1) / float(n_darts + 1)
-                    # Nearest interior vertex to that point on the run. A dart
-                    # has to sit on a vertex to be cut, but which vertex is a
-                    # detail of the mesh, not of the pattern.
-                    best, best_gap = None, None
-                    for k in range(i + 1, j):
-                        # Corners are skipped: a corner already gets its shape
-                        # from the bevels meeting there, so relief on top of it
-                        # is redundant.
-                        if corner_flags[k]:
-                            continue
-                        gap = abs(cumulative[k - i] - target)
-                        if best_gap is None or gap < best_gap:
-                            best, best_gap = k - i, gap
-                    if best is not None and best not in darts:
-                        darts.append(best)
-                darts.sort()
+        dart_loads = []
+        wedge = radians(dart_wedge_deg) if dart_wedge_deg > 0.0 else 0.0
+        if wedge > 0.0 and defect_load:
+            carried = 0.0
+            for k in range(i + 1, j):
+                carried += defect_load.get(cycle[k].vert, 0.0)
+                if corner_flags[k]:
+                    # A corner already gets its shape from the bevels meeting
+                    # there, so relief on top of it is redundant -- but the load
+                    # is kept, to be spent at the next vertex along.
+                    continue
+                if abs(carried) >= wedge:
+                    darts.append(k - i)
+                    dart_loads.append(carried)
+                    carried = 0.0
+            if max_darts_per_run > 0 and len(darts) > max_darts_per_run:
+                step = len(darts) / float(max_darts_per_run)
+                keep = [int(n * step) for n in range(max_darts_per_run)]
+                darts = [darts[n] for n in keep]
+                dart_loads = [dart_loads[n] for n in keep]
         runs.append(DartRun(
             island_index=island_index,
             loops=seg,
@@ -633,6 +615,7 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
             uv_points=pts,
             uv_normals=normals,
             dart_indices=darts,
+            dart_loads=tuple(dart_loads),
         ))
         i = j
     return runs
@@ -642,8 +625,8 @@ def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
                                 max_angle_variation_deg, only_selected=False,
                                 islands=None,
                                 corner_angle_deg=CORNER_ANGLE_DEG,
-                                matrix=None, dart_relief_deg=DART_RELIEF_DEG,
-                           max_darts_per_run=0):
+                                matrix=None, dart_wedge_deg=DART_WEDGE_DEG,
+                           max_darts_per_run=0, defect_load=None):
     """Yield a DartRun for every saw pass along every UV island boundary.
 
     This replaces per-mesh-edge iteration: foam flexes between darts, so a dart
@@ -653,13 +636,18 @@ def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
     if islands is None:
         islands = uv_islands(bm, uv_layer, only_selected)
     for index, faces in enumerate(islands):
+        # Once per island: where each interior vertex's curvature drains to.
+        # Computed here rather than per cycle because an island's inner and
+        # outer boundaries compete for the same interior defect.
+        load = boundary_defect_load(faces) if dart_wedge_deg > 0.0 else {}
         for cycle in island_boundary_cycles(faces, uv_layer):
             for run in segment_boundary_cycle(
                     cycle, uv_layer, max_chord_deviation,
                     max_angle_variation_deg, island_index=index,
                     corner_angle_deg=corner_angle_deg, matrix=matrix,
-                    dart_relief_deg=dart_relief_deg,
-                    max_darts_per_run=max_darts_per_run):
+                    dart_wedge_deg=dart_wedge_deg,
+                    max_darts_per_run=max_darts_per_run,
+                    defect_load=load):
                 yield run
 
 
@@ -1136,3 +1124,58 @@ def island_angle_defect(faces):
     summary = DefectSummary(total=total, positive=positive, negative=negative,
                             absolute=positive - negative)
     return summary, per_vertex
+
+
+def boundary_defect_load(faces):
+    """Route each interior vertex's angle defect out to a boundary vertex.
+
+    Returns ``{boundary_vert: signed_defect_radians}``.
+
+    A dart is a boundary feature -- it is cut inward from a free edge -- while
+    the curvature it relieves lives in the middle of the piece. So the defect
+    has to be carried out to an edge before it can be turned into a cut, and the
+    edge it belongs to is the nearest one across the surface.
+
+    "Nearest" is measured by walking the mesh, not through space: a multi-source
+    breadth-first search out from every boundary vertex at once, so each interior
+    vertex is claimed by the boundary vertex whose relief cut would actually
+    reach it. Straight-line distance would happily route a defect to a boundary
+    on the far side of a fold.
+    """
+    from collections import deque
+
+    faces = set(faces)
+    _summary, per_vertex = island_angle_defect(faces)
+    island_verts = {v for f in faces for v in f.verts}
+
+    def on_boundary(vert):
+        linked = [f for f in vert.link_faces if f in faces]
+        return vert.is_boundary or len(linked) != len(vert.link_faces)
+
+    boundary = {v for v in island_verts if on_boundary(v)}
+    if not boundary:
+        # A closed piece has nowhere to drain to. It cannot be cut from one
+        # sheet at all, which is the advisor's problem, not the dart code's.
+        return {}
+
+    owner = {v: v for v in boundary}
+    queue = deque(boundary)
+    while queue:
+        vert = queue.popleft()
+        for edge in vert.link_edges:
+            if not any(f in faces for f in edge.link_faces):
+                continue
+            other = edge.other_vert(vert)
+            if other in owner or other not in island_verts:
+                continue
+            owner[other] = owner[vert]
+            queue.append(other)
+
+    load = {v: 0.0 for v in boundary}
+    for vert, defect in per_vertex.items():
+        if vert in boundary:
+            continue
+        home = owner.get(vert)
+        if home is not None:
+            load[home] = load.get(home, 0.0) + defect
+    return load

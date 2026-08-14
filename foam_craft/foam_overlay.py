@@ -187,7 +187,7 @@ def _signature(pairs, s):
         round(s.max_tilt_deg, 4),
         round(s.stretch_tolerance, 4),
         round(s.corner_angle_deg, 4),
-        round(s.dart_relief_deg, 4),
+        round(s.dart_wedge_deg, 4),
         s.max_darts_per_run,
         round(s.min_angle, 4),
         s.show_darts,
@@ -224,7 +224,7 @@ def _rebuild(pairs, s):
                 only_selected=s.only_selected, islands=islands,
                 corner_angle_deg=s.corner_angle_deg,
                 matrix=obj.matrix_world,
-                dart_relief_deg=s.dart_relief_deg,
+                dart_wedge_deg=s.dart_wedge_deg,
                 max_darts_per_run=s.max_darts_per_run):
             if run.has_dihedral:
                 bevel = core.compute_bevel(run.mean_angle_deg, s.foam_thickness,
@@ -829,7 +829,7 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         layout.prop(s, "show_darts")
         col = layout.column(align=True)
         col.enabled = s.show_darts
-        col.prop(s, "dart_relief_deg")
+        col.prop(s, "dart_wedge_deg")
         col.prop(s, "max_darts_per_run")
         layout.prop(s, "min_label_run_px")
         layout.prop(s, "min_run_length")

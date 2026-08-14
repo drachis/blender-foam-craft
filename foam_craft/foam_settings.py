@@ -107,16 +107,16 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
     show_darts: bpy.props.BoolProperty(
         name="Relief Darts", default=True,
         description="Place relief darts along curved cut runs")
-    dart_relief_deg: bpy.props.FloatProperty(
-        name="Bend Per Dart",
-        description="How much outline turning one relief dart absorbs. Darts "
-                    "are placed by curvature, not by distance: a run's dart "
-                    "count is its total turning divided by this, and they sit "
-                    "at equal shares of that turning, so they bunch where the "
-                    "edge bends hard and thin out where it runs straight. A "
-                    "straight run gets none however long it is. Lower values "
-                    "mean more, smaller relief cuts",
-        default=core.DART_RELIEF_DEG, min=0.0, max=90.0)
+    dart_wedge_deg: bpy.props.FloatProperty(
+        name="Widest Dart",
+        description="The largest wedge one relief dart may take out. A piece's "
+                    "total relief is fixed by its curvature -- how far it "
+                    "refuses to lie flat -- so this only decides how many cuts "
+                    "that total is divided into. Smaller values give more, "
+                    "narrower darts. Darts land where the curvature is, not at "
+                    "even spacing: a stretch that is developable gets none "
+                    "however curved it looks, and a dome gets several",
+        default=core.DART_WEDGE_DEG, min=0.0, max=90.0)
     max_darts_per_run: bpy.props.IntProperty(
         name="Max Darts Per Run",
         description="Upper limit per cut run, whatever the spacing works out "
