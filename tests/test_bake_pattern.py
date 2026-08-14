@@ -38,13 +38,26 @@ importlib.reload(core)
 
 
 def _clear():
+    """Empty the scene *and* the orphaned data behind it.
+
+    Deleting objects is not enough. Their meshes and Grease Pencil data linger
+    with no users, so the next `Sculpt` becomes `Sculpt.001` and the bake's
+    lookup for `Sculpt_Pattern` finds a copy left by an earlier test. That made
+    these tests pass alone and fail when run after the others -- inherited state
+    has produced wrong numbers in this project more than once.
+    """
     if bpy.context.object and bpy.context.object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete(use_global=False)
-    for block in list(bpy.data.objects):
-        if block.users == 0:
-            bpy.data.objects.remove(block)
+    settings = getattr(bpy.context.scene, "foam_craft", None)
+    if settings is not None:
+        settings.gp_object = None
+    for collection in (bpy.data.objects, bpy.data.meshes,
+                       bpy.data.grease_pencils):
+        for block in list(collection):
+            if block.users == 0:
+                collection.remove(block)
 
 
 def _build_scene(ring_z=0.3137, n=160, offset=(0.0, 0.0, 0.0)):

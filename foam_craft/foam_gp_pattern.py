@@ -631,10 +631,13 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         bm = bmesh.new()
         try:
             bm.from_mesh(mesh)
+            # cut_strokes marks each stroke's edges as it goes, which it has to
+            # -- a later stroke splits edges an earlier one made, and only the
+            # half still referenced would be marked if it were left until now.
+            # Unwrapping is the step that waits for the end, once every cut is
+            # in and the seams are complete.
             edges, open_ends = cut_strokes(bm, strokes,
                                            snap_distance=self.snap_distance)
-            for edge in edges:
-                edge.seam = True
             bm.to_mesh(mesh)
             mesh.update()
         except StrokeCutError as exc:

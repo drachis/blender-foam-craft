@@ -383,11 +383,20 @@ def test_crossing_strokes_make_regions():
         "no_unresolved_ends": open_ends == 0,
         "seams_neither_empty_nor_all":
             0 < rep["seam_edges"] < rep["total_edges"],
-        # Bounded by the snap tolerance, not by zero. The two loose ends of each
-        # stroke are deliberately pulled onto the nearest boundary within that
-        # distance -- that is what the tolerance is for, and a marker line has
-        # width anyway. Everything between the ends is still exact.
-        "cut_within_snap_of_the_strokes": rep["cut_vs_stroke"] <= 0.01,
+        # Bounded by half an edge, not by zero, and not by the snap tolerance.
+        #
+        # Two effects put the seam off the drawn line on purpose. Loose ends are
+        # pulled onto the nearest boundary within the snap distance, because a
+        # marker line has width. And where a run follows an edge that already
+        # exists, that edge is tagged rather than a near-duplicate cut being
+        # made beside it -- which lands the seam on existing vertices, up to
+        # half an edge away.
+        #
+        # This grid is 2 units across with 16 divisions, so an edge is 0.125 and
+        # half of one is 0.0625. Measured 0.061.
+        "cut_within_half_an_edge": rep["cut_vs_stroke"] <= 0.0625,
+        # A cut that landed *exactly* on every point would mean neither effect
+        # was happening, so the bound is two-sided.
         "snap_did_not_run_wild": rep["cut_vs_stroke"] > 0.0,
     }
     return rep
