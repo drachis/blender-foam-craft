@@ -256,7 +256,40 @@ def _cut_path_edges(face, entry, exit_v, n_interior):
         "found %d forward and %d back" % (want, len(forward), len(backward)))
 
 
-def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
+def on_surface_runs(bm, points, tolerance):
+    """Split a stroke into the stretches that actually lie on the surface.
+
+    A drawn line does not stop politely at the edge of the sculpt. It runs off
+    into space, past a rim, or across a gap and back on again -- and the part
+    that did land on the surface is still a cut the maker meant to make.
+
+    Without this, a point that missed found its "nearest" surface somewhere
+    arbitrary -- the far rim of a cylinder, the other side of a torus -- and the
+    cut was dragged there with it. Silently, and nowhere near anything drawn.
+    That is worse than not cutting: it is a cut in the wrong place, which in
+    foam is a ruined piece.
+
+    Returns a list of point lists, each at least two points long. A stroke that
+    never leaves the surface comes back as a single run, unchanged.
+    """
+    bvh = BVHTree.FromBMesh(bm)
+    runs, current = [], []
+    for point in points:
+        _loc, _nrm, index, distance = bvh.find_nearest(point)
+        on = index is not None and (tolerance <= 0.0 or distance <= tolerance)
+        if on:
+            current.append(point)
+            continue
+        if len(current) >= 2:
+            runs.append(current)
+        current = []
+    if len(current) >= 2:
+        runs.append(current)
+    return runs
+
+
+def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
+               project_tolerance=0.0):
     """Cut `points` into `bm` as real edges. Returns the new edge list.
 
     `points` are in the mesh's own space and are expected to lie on or near its
@@ -270,6 +303,25 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
     """
     if len(points) < 2:
         raise StrokeCutError("a stroke needs at least two points")
+
+    # Drop anything that missed the surface, and cut what is left. A stroke
+    # broken into pieces is no longer closed, whatever it was drawn as: the part
+    # that ran off took the closure with it.
+    if project_tolerance > 0.0:
+        runs_on = on_surface_runs(bm, points, project_tolerance)
+        if not runs_on:
+            raise StrokeCutError(
+                "no part of the stroke lies within %.4g of the surface"
+                % project_tolerance)
+        if len(runs_on) != 1 or len(runs_on[0]) != len(points):
+            collected, open_ends = [], 0
+            for piece in runs_on:
+                edges, ends = cut_stroke(bm, piece,
+                                         snap_distance=snap_distance,
+                                         cyclic=False)
+                collected.extend(edges)
+                open_ends += ends
+            return collected, open_ends
 
     bm.faces.ensure_lookup_table()
     bvh = BVHTree.FromBMesh(bm)
@@ -453,7 +505,7 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False):
     return new_edges, skipped_open
 
 
-def cut_strokes(bm, strokes, snap_distance=0.0):
+def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0):
     """Cut several strokes, one after another. Returns (edges, open_ends).
 
     Order is what makes intersections work. A pattern maker crosses strokes on
@@ -470,7 +522,8 @@ def cut_strokes(bm, strokes, snap_distance=0.0):
     for index, (points, cyclic) in enumerate(strokes):
         try:
             edges, ends = cut_stroke(bm, points, snap_distance=snap_distance,
-                                     cyclic=cyclic)
+                                     cyclic=cyclic,
+                                     project_tolerance=project_tolerance)
         except StrokeCutError as exc:
             # One bad stroke should not discard the rest of the pattern. Which
             # one failed is worth knowing, so it is named rather than counted.
