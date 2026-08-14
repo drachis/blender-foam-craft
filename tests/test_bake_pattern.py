@@ -37,6 +37,75 @@ importlib.reload(gp)
 importlib.reload(core)
 
 
+_TOOLS = "O:/Work/BlenderPlugin/FoamCraft/tools"
+
+
+def _shot(label, show_seams_on=None):
+    """Capture the viewport, so a run can be checked by eye as well as by count.
+
+    A test reporting "3 regions" proves nothing if the scene it built was not
+    the one intended -- and several cases here were measuring a shape that had
+    projected onto a rim rather than the surface, while still returning a
+    confident number. The picture is what catches that.
+
+    Headless runs skip silently: there is no window to capture and the counts
+    are still worth having. Use ``tools/run_tests.py --gui`` to collect them.
+    """
+    if bpy.app.background:
+        return None
+    if _TOOLS not in sys.path:
+        sys.path.insert(0, _TOOLS)
+    try:
+        from shot import next_path
+    except ImportError:
+        # Loud, not silent. This failed for a whole run because the path to
+        # tools/ had a stray tab in it, and because the capture is optional the
+        # tests went on passing while producing no pictures at all.
+        print("FoamCraft tests: cannot import shot from %r" % _TOOLS)
+        return None
+
+    # The splash sits over the viewport and would be most of the picture.
+    try:
+        bpy.ops.wm.splash_close()
+    except Exception:                                  # noqa: BLE001
+        pass
+    screen = bpy.context.screen
+    if screen is None:
+        return None
+    for area in screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        # view_all polls for a view3d *region*, not merely the area, so the
+        # override has to name both. Overriding the area alone raised
+        # "Expected a view3d region" -- and only once framing was added, which
+        # is why a bare screenshot had worked.
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        if region is None:
+            continue
+        path = next_path("test_%s" % label)
+        # Seams are only drawn in edit mode. A solid object-mode view of a cut
+        # sphere is identical to an uncut one, which makes the picture worse
+        # than useless -- it looks like confirmation while showing nothing.
+        entered = False
+        if show_seams_on is not None:
+            bpy.ops.object.mode_set(mode='OBJECT')
+            for obj in list(bpy.context.selected_objects):
+                obj.select_set(False)
+            show_seams_on.select_set(True)
+            bpy.context.view_layer.objects.active = show_seams_on
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            entered = True
+        with bpy.context.temp_override(area=area, region=region):
+            area.spaces.active.shading.type = 'SOLID'
+            bpy.ops.view3d.view_all()
+            bpy.ops.screen.screenshot_area(filepath=path)
+        if entered:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        return path
+    return None
+
+
 def _clear():
     """Empty the scene *and* the orphaned data behind it.
 
@@ -294,6 +363,9 @@ def _gp_from_strokes(strokes, name="PatternStrokes"):
     return gp_obj
 
 
+_LABEL = ["shape"]
+
+
 def _bake_strokes_on_sphere(strokes, segments=64, rings=32):
     """Build a sphere, draw `strokes` on it, bake, and report the pieces."""
     _clear()
@@ -305,10 +377,12 @@ def _bake_strokes_on_sphere(strokes, segments=64, rings=32):
     bpy.context.scene.foam_craft.gp_object = gp_obj
     bpy.context.view_layer.objects.active = sculpt
 
+    shots = [_shot("%s_drawn" % _LABEL[0])]
     outcome = bpy.ops.object.foam_bake_pattern(snap_distance=0.004)
     pattern = bpy.data.objects.get("Sculpt_Pattern")
     if pattern is None:
-        return {"failed": list(outcome)}, None
+        return {"failed": list(outcome), "shots": shots}, None
+    shots.append(_shot("%s_cut" % _LABEL[0], show_seams_on=pattern))
 
     bpy.context.view_layer.objects.active = pattern
     bpy.ops.object.mode_set(mode='EDIT')
@@ -339,12 +413,21 @@ def _bake_strokes_on_sphere(strokes, segments=64, rings=32):
         sizes.append(size)
     seams = sum(1 for e in bm.edges if e.seam)
     faces = len(bm.faces)
+    # Cutting must not leave rubbish behind. A vertex placed on top of one that
+    # is already there gives a zero-length edge and collapses the faces around
+    # it -- visible in the viewport as a pinched black wedge, and in a pattern
+    # as a piece with a spike no saw can follow.
+    degenerate = sum(1 for f in bm.faces if f.calc_area() < 1e-8)
+    zero_edges = sum(1 for e in bm.edges if e.calc_length() < 1e-6)
     bpy.ops.object.mode_set(mode='OBJECT')
     return {
         "regions": regions,
         "region_sizes": sorted(sizes, reverse=True),
         "seam_edges": seams,
         "faces": faces,
+        "degenerate_faces": degenerate,
+        "zero_length_edges": zero_edges,
+        "shots": [s for s in shots if s],
     }, pattern
 
 
@@ -365,6 +448,7 @@ def test_hash_grid_encloses_one_square():
         strokes.append(([_sphere_point(1.15 + 0.84 * i / 47.0, phi)
                          for i in range(48)], False))
 
+    _LABEL[0] = "hash"
     report, _pattern = _bake_strokes_on_sphere(strokes)
     sizes = report.get("region_sizes", [])
     return {
@@ -377,6 +461,9 @@ def test_hash_grid_encloses_one_square():
                 len(sizes) == 2 and sizes[0] > sizes[1] > 20,
             "seams_neither_empty_nor_all":
                 0 < report.get("seam_edges", 0) < report.get("faces", 1) * 2,
+            "no_degenerate_geometry":
+                report.get("degenerate_faces") == 0
+                and report.get("zero_length_edges") == 0,
         },
     }
 
@@ -393,6 +480,7 @@ def test_figure_eight_encloses_two_discs():
         (_sphere_circle(1.30, 0.0, 0.20), True),
         (_sphere_circle(1.84, 0.0, 0.20), True),
     ]
+    _LABEL[0] = "eight"
     report, _pattern = _bake_strokes_on_sphere(strokes)
     sizes = report.get("region_sizes", [])
     return {
@@ -407,6 +495,9 @@ def test_figure_eight_encloses_two_discs():
             "discs_are_similar":
                 len(sizes) == 3 and abs(sizes[1] - sizes[2]) <= max(
                     4, 0.25 * sizes[1]),
+            "no_degenerate_geometry":
+                report.get("degenerate_faces") == 0
+                and report.get("zero_length_edges") == 0,
         },
     }
 
@@ -427,6 +518,7 @@ def test_theta_splits_its_circle_in_two():
     # The bar runs past the circle on both sides, so the crossings are
     # unambiguous. The overhanging ends enclose nothing and must not count.
     bar = [_sphere_point(1.5708, -0.34 + 0.68 * i / 39.0) for i in range(40)]
+    _LABEL[0] = "theta"
     report, _pattern = _bake_strokes_on_sphere([(circle, True), (bar, False)])
     sizes = report.get("region_sizes", [])
     return {
@@ -442,6 +534,9 @@ def test_theta_splits_its_circle_in_two():
                 and abs(sizes[1] - sizes[2]) <= max(4, 0.3 * sizes[1]),
             "hull_is_the_largest":
                 len(sizes) == 3 and sizes[0] > sizes[1] + sizes[2],
+            "no_degenerate_geometry":
+                report.get("degenerate_faces") == 0
+                and report.get("zero_length_edges") == 0,
         },
     }
 

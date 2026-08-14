@@ -470,7 +470,26 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
                                                     exit_v, snap_distance):
             new_edges.append(shared)
             continue
-        interior = [tuple(p) for p in run["interior"]]
+        # Thin out points that sit on top of one another, or on top of the
+        # vertices the cut runs between. face_split places one vertex per coord
+        # regardless, so a duplicate becomes a zero-length edge and the faces
+        # around it collapse -- measured as 4 zero-length edges and 3 degenerate
+        # faces on a bar drawn along a sphere's equator, showing up as a pinched
+        # black wedge in the viewport.
+        #
+        # Same rule as everywhere else: two marks closer together than the width
+        # of the drawn line were one mark.
+        kept = []
+        for point in run["interior"]:
+            if snap_distance > 0.0:
+                if (point - entry.co).length <= snap_distance:
+                    continue
+                if (point - exit_v.co).length <= snap_distance:
+                    continue
+                if kept and (point - kept[-1]).length <= snap_distance:
+                    continue
+            kept.append(point)
+        interior = [tuple(p) for p in kept]
         try:
             new_face, _new_loop = bmesh.utils.face_split(
                 run["face"], entry, exit_v, coords=interior)
@@ -533,6 +552,27 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0):
             continue
         all_edges.extend(edges)
         open_ends += ends
+    # Weld the leftovers. Splitting an edge at a point that already has a vertex
+    # a fraction away leaves a zero-length edge, and the faces around it
+    # collapse -- a pinched wedge in the viewport, a spike no saw can follow in
+    # the pattern. Guarding every split against every case it could arise from
+    # is a losing game; merging by distance afterwards is Blender's own answer
+    # and it is one call.
+    #
+    # Restricted to the vertices the cut produced. Run over the whole mesh it
+    # would weld the sculpt's own detail, which is far worse than the slivers
+    # it came to remove.
+    if snap_distance > 0.0 and all_edges:
+        # The cut's own vertices only. Widening this to their neighbours was
+        # tried and made things worse -- theta went from 3 collapsed faces to 5
+        # -- because pulling in surrounding geometry drags faces together
+        # rather than tidying the strays.
+        touched = {v for e in all_edges if e.is_valid for v in e.verts}
+        if touched:
+            bmesh.ops.remove_doubles(bm, verts=list(touched),
+                                     dist=snap_distance)
+            all_edges = [e for e in all_edges if e.is_valid]
+
     _log.info(foam_log.summary(
         "cut_strokes", strokes=len(strokes), edges=len(all_edges),
         open_ends=open_ends, snap=snap_distance))

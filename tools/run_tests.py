@@ -50,6 +50,9 @@ def main():
     parser.add_argument("--keep", action="store_true",
                         help="leave Blender running when finished")
     parser.add_argument("--only", help="run just one file by substring")
+    parser.add_argument("--gui", action="store_true",
+                        help="start Blender with a window, so tests that can "
+                             "capture screenshots do. Headless runs skip them")
     args = parser.parse_args()
 
     launcher = ROOT / "tools" / "launch_blender.py"
@@ -58,8 +61,10 @@ def main():
         blender_bridge.execute("result = {'ok': True}", port=args.port)
     except Exception:                              # noqa: BLE001
         print("starting blender on port %d ..." % args.port)
-        subprocess.run([sys.executable, str(launcher), "--port",
-                        str(args.port)], check=True)
+        cmd = [sys.executable, str(launcher), "--port", str(args.port)]
+        if args.gui:
+            cmd.append("--gui")
+        subprocess.run(cmd, check=True)
         started = True
 
     files = [f for f in TEST_FILES

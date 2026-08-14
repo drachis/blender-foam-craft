@@ -35,10 +35,18 @@ def _start():
         print('FoamCraft launcher: MCP add-on is not enabled')
         return None
     prefs = bpy.context.preferences.addons[addon].preferences
-    # The splash covers the viewport and would land in every screenshot.
+    # The splash covers the viewport and lands in every screenshot.
+    #
+    # bpy.ops.wm.splash_close exists as an attribute but is not callable --
+    # "could not be found" -- so it was silently doing nothing here. Turning the
+    # preference off only affects the next launch, since the splash is already
+    # up by the time this runs. Reloading the home file clears it now, and
+    # wiping the scene costs nothing in a throwaway test instance that builds
+    # its own.
+    bpy.context.preferences.view.show_splash = False
     try:
-        bpy.ops.wm.splash_close()
-    except (AttributeError, RuntimeError):
+        bpy.ops.wm.read_homefile(use_empty=True)
+    except RuntimeError:
         pass
     prefs.host, prefs.port = 'localhost', {port}
     if not getattr(prefs, 'use_online_access', True):
