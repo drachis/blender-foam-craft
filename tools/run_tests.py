@@ -55,6 +55,8 @@ import blender_bridge  # noqa: E402
 # Explicit rather than globbed: a file that fails to import should be a visible
 # failure, not a silently skipped test.
 TEST_FILES = (
+    # First, because it is the one that says whether the rest can be believed.
+    "tests/test_determinism.py",
     "tests/test_gp_pattern.py",
     "tests/test_curvature_darts.py",
     "tests/test_bake_pattern.py",

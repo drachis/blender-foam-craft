@@ -93,12 +93,39 @@ def _regions(bm):
     return sorted(sizes, reverse=True)
 
 
+def _canonical_faces(bm):
+    """Put the faces in a known order, so two identical spheres really are.
+
+    ``primitive_uv_sphere_add`` returns the same vertices and a *different* face
+    table on every call -- measured in tests/test_determinism.py, which exists
+    because of what that cost. Anything resolving a tie between two equally near
+    faces resolves it by index, so an unstable face table makes an unstable cut,
+    and these sweeps were reporting different answers for identical input.
+
+    The vertices are stable, so ordering faces by the vertices they are made of
+    is stable too. bmesh's sort wants a number, hence the packing.
+    """
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    base = len(bm.verts) + 1
+
+    def _key(face):
+        idx = sorted(v.index for v in face.verts)[:4]
+        idx += [0] * (4 - len(idx))
+        return ((idx[0] * base + idx[1]) * base + idx[2]) * base + idx[3]
+
+    bm.faces.sort(key=_key)
+    bm.faces.ensure_lookup_table()
+    bm.faces.index_update()
+
+
 def _cut(strokes):
     _clear()
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=SEGMENTS,
                                          ring_count=RINGS)
     bm = bmesh.new()
     bm.from_mesh(bpy.context.object.data)
+    _canonical_faces(bm)
     try:
         edges, open_ends = gp.cut_strokes(bm, strokes, snap_distance=SNAP)
         sizes = _regions(bm)

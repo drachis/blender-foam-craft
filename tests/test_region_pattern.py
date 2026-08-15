@@ -156,6 +156,22 @@ def test_bands_and_columns_tile_a_sphere():
     obj = bpy.context.object
     bm = bmesh.new()
     bm.from_mesh(mesh)
+    # Order the faces before cutting. The sphere primitive hands back the same
+    # vertices with a different face table every call, and the cutter breaks
+    # ties between equally near faces by index -- so without this the same
+    # pattern cuts differently run to run. See tests/test_determinism.py.
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    _base = len(bm.verts) + 1
+
+    def _face_key(face):
+        idx = sorted(v.index for v in face.verts)[:4]
+        idx += [0] * (4 - len(idx))
+        return ((idx[0] * _base + idx[1]) * _base + idx[2]) * _base + idx[3]
+
+    bm.faces.sort(key=_face_key)
+    bm.faces.ensure_lookup_table()
+    bm.faces.index_update()
     try:
         cut, open_ends = gp.cut_strokes(bm, _pattern(), snap_distance=0.006,
                                         chain_tolerance=0.02)

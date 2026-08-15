@@ -121,7 +121,17 @@ def _walk_faces(face_from, p_from, face_to, p_to, limit=64):
     """
     crossings = []
     current = face_from
-    along = 0.0
+    # Just below zero, so the *first* step may cross at the very start of the
+    # segment. A stroke running along a crease begins each segment sitting on
+    # the boundary it is about to cross, so its first exit is at zero distance;
+    # requiring progress before the first crossing rejected it and stranded the
+    # walk with nowhere to go. Measured: a circle of angular radius 0.9 on a
+    # sphere failed at point 90 of 120 and the whole stroke was dropped.
+    #
+    # Only the first step is affected. Once a crossing is taken, `along` becomes
+    # its own position and every later crossing must be strictly beyond it, so
+    # the walk still cannot sit on one boundary or turn back on itself.
+    along = -1e-6
     for _ in range(limit):
         if current is face_to:
             return crossings
@@ -137,6 +147,41 @@ def _walk_faces(face_from, p_from, face_to, p_to, limit=64):
     return None
 
 
+# How close a landed point has to be to an edge or a corner before it counts as
+# being *on* it. This is a geometric epsilon for resolving an exact tie, not a
+# tolerance for how wide a marker tip is -- that is `snap_distance`, and mixing
+# the two would make a modelling decision out of a rounding question.
+_ON_ELEMENT_EPS = 1e-6
+
+
+def _candidate_faces(face, loc):
+    """Every face that is equally entitled to claim this landed point.
+
+    One face when the point is loose in its interior; two when it sits on an
+    edge; all of them round a corner when it sits on a vertex. Returned in index
+    order so a caller with no better reason has a stable one to fall back on.
+
+    This is Blender's own knife classification -- snapped to a vertex, snapped
+    to an edge, or loose in a face -- rather than resolving everything to a
+    single face and hoping the choice does not matter.
+    """
+    for vert in face.verts:
+        if (loc - vert.co).length <= _ON_ELEMENT_EPS:
+            return sorted(vert.link_faces, key=lambda f: f.index)
+    for edge in face.edges:
+        a, b = edge.verts[0].co, edge.verts[1].co
+        span = b - a
+        denom = span.length_squared
+        if denom < 1e-18:
+            continue
+        t = max(0.0, min(1.0, (loc - a).dot(span) / denom))
+        if (loc - (a + span * t)).length <= _ON_ELEMENT_EPS:
+            if len(edge.link_faces) < 2:
+                return [face]
+            return sorted(edge.link_faces, key=lambda f: f.index)
+    return [face]
+
+
 def _assign_faces(bvh, bm, points):
     """Which face does each stroke point sit on, and where exactly.
 
@@ -144,15 +189,40 @@ def _assign_faces(bvh, bm, points):
     points are only approximately on it, so each is pulled to the real nearest
     point -- otherwise a point hovering microscopically above a face would land
     the cut on the wrong side of an edge.
+
+    Where the landed point sits on a shared edge or corner it has no single
+    owning face, and the walk is carried forward instead: if the face the stroke
+    is already in is one of the candidates, it stays in it. This is the physical
+    reading -- a knife travelling along a crease does not hop from one side to
+    the other and back at every millimetre, it stays where it is until the line
+    actually leaves.
+
+    It matters more than tidiness. Choosing by a fixed rule instead -- lowest
+    index, say -- is stable but geometrically arbitrary, so it can name the face
+    on the *wrong side* of the direction of travel; the face walk then has to
+    cross back over the line it is following and gives up, and a whole stroke is
+    dropped. Measured: a circle of angular radius 0.9 on a sphere cut nothing at
+    all, reporting "could not follow the stroke between two points".
+
+    Index order remains the tie-break for the first point, and for any point
+    whose candidates do not include where the stroke already was.
     """
     bm.faces.ensure_lookup_table()
+    # The fallback tie-break is by face index, so the indices have to mean
+    # something. They go stale as soon as the cutter splits anything.
+    bm.faces.index_update()
     out = []
+    previous = None
     for p in points:
         loc, _nrm, index, _dist = bvh.find_nearest(p)
         if index is None:
             raise StrokeCutError(
                 "a stroke point found no surface; is the stroke near the mesh?")
-        out.append((bm.faces[index], loc.copy()))
+        loc = loc.copy()
+        candidates = _candidate_faces(bm.faces[index], loc)
+        face = previous if previous in candidates else candidates[0]
+        previous = face
+        out.append((face, loc))
     return out
 
 
@@ -533,9 +603,15 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
                 route = _walk_faces(current["face"], assigned[i - 1][1],
                                     face, surf_pt)
                 if route is None:
+                    # Named, not just reported. "Could not follow the stroke"
+                    # gives nothing to act on -- which point, how far apart, and
+                    # how big the faces are is the difference between a stroke
+                    # that left the surface and one that outran the walk.
+                    gap = (surf_pt - assigned[i - 1][1]).length
                     raise StrokeCutError(
-                        "could not follow the stroke between two points; it "
-                        "may leave the surface there")
+                        "could not follow the stroke from point %d to %d "
+                        "(gap %.4g, faces %d and %d)"
+                        % (i - 1, i, gap, current["face"].index, face.index))
                 if not route:
                     raise StrokeCutError(
                         "the stroke crosses faces that do not connect")
