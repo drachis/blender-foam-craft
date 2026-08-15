@@ -1005,16 +1005,32 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class VIEW3D_PT_foam_pattern(bpy.types.Panel):
-    """Patterning lives in the 3D viewport, not the UV editor.
+class IMAGE_PT_foam_pattern(bpy.types.Panel):
+    """One panel, in the UV editor, alongside the rest of FoamCraft.
 
-    Baking reads a sculpt and a set of drawn strokes and writes a new object.
-    That is object-level work, and Blender users look for it where objects are
-    -- it was in the UV editor's sidebar, which is where the *result* is
-    inspected, not where the work is started.
+    A modifier would be the natural home -- this is mesh modification with
+    iteration, which is exactly what modifiers are for, and it would carry the
+    stack, the toggles and the non-destructive re-evaluation for free.
+
+    It cannot be one. Modifiers are not registrable from Python; the attempt
+    fails outright with
+
+        ValueError: register_class(...): expected a subclass of a registerable
+        RNA type (Modifier does not support registration)
+
+    The single exception is a Geometry Nodes group, which *is* a modifier and
+    *is* reachable from Python -- but Geometry Nodes has no mesh-cutting
+    primitive to build this on, which is what ruled that route out earlier.
+    Writing a real one means C, and a patched Blender cannot be distributed as
+    an extension, so the feature would not reach anyone.
+
+    Failing that, it belongs with the other FoamCraft panels rather than in a
+    second place in the 3D viewport. It sat there briefly on the argument that
+    baking is object-level work; one sidebar the user already has open beats a
+    tidier taxonomy split across two editors.
     """
 
-    bl_space_type = 'VIEW_3D'
+    bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "FoamCraft"
     bl_label = "Pattern"
@@ -1051,7 +1067,7 @@ class VIEW3D_PT_foam_pattern(bpy.types.Panel):
 
 _classes = (
     OBJECT_OT_foam_bake_pattern,
-    VIEW3D_PT_foam_pattern,
+    IMAGE_PT_foam_pattern,
 )
 
 
