@@ -257,6 +257,76 @@ def _endpoint_vert(face, point, snap_distance):
     return _vert_at(best_edge, best_fac, snap_distance)
 
 
+def _near_polyline(point, poly):
+    """Closest approach from a point to a polyline."""
+    best = None
+    for i in range(len(poly) - 1):
+        a, b = poly[i], poly[i + 1]
+        span = b - a
+        denom = span.length_squared
+        fac = 0.0 if denom < 1e-18 else             max(0.0, min(1.0, (point - a).dot(span) / denom))
+        gap = (point - (a + span * fac)).length
+        if best is None or gap < best:
+            best = gap
+    return best if best is not None else float("inf")
+
+
+def _existing_path(entry, exit_v, poly, snap_distance, limit=32):
+    """Edges already in the mesh that this run lies along, entry to exit.
+
+    A cut is a mixture: it reuses the geometry that is already where the line
+    goes, and cuts new geometry where none is. Drawing down a feature line, or
+    along an edge loop, is ordinary -- and cutting a parallel line a fraction
+    away from an existing edge leaves a hairline quad trapped between the two,
+    which is the collinear sliver this had been leaving behind. Worse, past a
+    certain length the run stopped cutting at all: a theta whose bar lay on a
+    sphere's equator gave 2 regions instead of 3 at radius 0.45.
+
+    Checked in **both** directions, which is what an earlier attempt missed.
+    Requiring only that the path stay near the stroke let a greedy walk wander
+    off down any chain of edges that happened to pass nearby and claim runs that
+    needed real cutting, which broke every shape test and was reverted. The
+    stroke must also stay near the path, or the drawn line is not what is being
+    reused.
+    """
+    if snap_distance <= 0.0 or len(poly) < 2:
+        return None
+
+    path, current, seen = [], entry, {entry}
+    for _ in range(limit):
+        if current is exit_v:
+            break
+        best_edge, best_gap = None, None
+        for edge in current.link_edges:
+            other = edge.other_vert(current)
+            if other in seen and other is not exit_v:
+                continue
+            gap = _near_polyline(other.co, poly)
+            if gap > snap_distance:
+                continue
+            if best_gap is None or gap < best_gap:
+                best_edge, best_gap = edge, gap
+        if best_edge is None:
+            return None
+        path.append(best_edge)
+        current = best_edge.other_vert(current)
+        seen.add(current)
+    if current is not exit_v or not path:
+        return None
+
+    # ...and now the other direction: every point the user drew has to be close
+    # to the edges being reused, or this is a detour rather than the same line.
+    walked = [entry.co]
+    node = entry
+    for edge in path:
+        node = edge.other_vert(node)
+        walked.append(node.co)
+    for point in poly:
+        if _near_polyline(point, walked) > snap_distance:
+            return None
+    return path
+
+
 def _run_follows_edge(interior, entry, exit_v, snap_distance):
     """Is this run actually lying along the edge joining its two ends?
 
@@ -561,10 +631,10 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
         # and cut nothing, silently. The line the user drew simply did not
         # appear. Marking the existing edge is the whole job: the topology it
         # would have created is present already.
-        shared = next((e for e in entry.link_edges if exit_v in e.verts), None)
-        if shared is not None and _run_follows_edge(run["interior"], entry,
-                                                    exit_v, snap_distance):
-            new_edges.append(shared)
+        poly = [entry.co] + list(run["interior"]) + [exit_v.co]
+        along = _existing_path(entry, exit_v, poly, snap_distance)
+        if along is not None:
+            new_edges.extend(along)
             continue
         # Thin out points that sit on top of one another, or on top of the
         # vertices the cut runs between. face_split places one vertex per coord
