@@ -709,6 +709,110 @@ def chain_strokes(strokes, tolerance):
     return chains
 
 
+def _nearest_on_polyline(point, points, cyclic):
+    """Nearest point of a polyline to `point`.
+
+    Returns ``(distance, segment_index, factor, location)`` or None.
+    """
+    best = None
+    count = len(points) if cyclic else len(points) - 1
+    if count < 1:
+        return None
+    for j in range(count):
+        a = points[j]
+        b = points[(j + 1) % len(points)]
+        span = b - a
+        denom = span.length_squared
+        t = 0.0 if denom < 1e-18 \
+            else max(0.0, min(1.0, (point - a).dot(span) / denom))
+        q = a + span * t
+        d = (point - q).length
+        if best is None or d < best[0]:
+            best = (d, j, t, q)
+    return best
+
+
+def snap_stroke_ends(strokes, tolerance):
+    """Pin each open stroke's ends onto the line they were drawn to meet.
+
+    This copies the knife's division of labour, which it took two wrong designs
+    to appreciate. The knife treats a cut's *intermediate* crossings exactly --
+    a fraction-of-a-pixel tolerance -- and its *endpoints* generously, snapping
+    them onto nearby geometry with a user-scale threshold and moving the point
+    onto whatever it snapped to (editmesh_knife.cc: KNIFE_FLT_EPS_PX_EDGE for
+    hits, `knife_snap_size` for endpoints, and the snapped vert rewriting the
+    mouse position). Ends are where the hand is imprecise; the middle of a line
+    is wherever it was drawn.
+
+    Applying one pen-width tolerance to *every* segment pair instead was tried,
+    and it failed in both directions at once: mid-line meetings wiggled the
+    stroke through each near-approach, trapping single-face slivers at real
+    crossings, while the deduplication needed to control that kept unmaking the
+    T junctions it existed to serve.
+
+    So: only ends move. An open stroke's end within reach of another stroke is
+    moved onto it, and the landing point is inserted into the other stroke too,
+    so both lines pass through the meeting whichever is cut first. Reach is the
+    two pens' summed half-widths -- ink touching ink -- with `tolerance` as the
+    floor for strokes that carry no width.
+
+    Genuine mid-line crossings need none of this: strokes are cut one after
+    another, so a later stroke crossing an earlier one meets real topology and
+    the crossing is an ordinary edge crossing.
+
+    A stroke's end near its own middle (a P shape) is not handled -- the end is
+    trivially at zero distance from its own adjacent segments, and telling
+    "near my own middle" from "near my own tail" needs arc-length bookkeeping
+    this does not yet have. Ends meeting *ends* are `chain_strokes`.
+    """
+    strokes = [(list(s[0]), s[1], s[2] if len(s) > 2 else 0.0)
+               for s in strokes]
+    inserts = [{} for _ in strokes]
+    moved = 0
+    for i, (points, cyclic, width) in enumerate(strokes):
+        if cyclic or len(points) < 2:
+            continue
+        for end_index in (0, len(points) - 1):
+            tip = points[end_index]
+            best = None
+            for j, (other, other_cyclic, other_width) in enumerate(strokes):
+                if j == i:
+                    continue
+                reach = max(tolerance, width + other_width)
+                found = _nearest_on_polyline(tip, other, other_cyclic)
+                if found is None or found[0] > reach:
+                    continue
+                if best is None or found[0] < best[1][0]:
+                    best = (j, found)
+            if best is None:
+                continue
+            j, (d, seg, fac, q) = best
+            if d > 1e-9:
+                points[end_index] = q.copy()
+                moved += 1
+            inserts[j].setdefault(seg, []).append((fac, q))
+
+    out = []
+    for index, (points, cyclic, width) in enumerate(strokes):
+        if not inserts[index]:
+            out.append((points, cyclic, width))
+            continue
+        grown = []
+        for i, point in enumerate(points):
+            grown.append(point)
+            for _fac, q in sorted(inserts[index].get(i, []),
+                                  key=lambda item: item[0]):
+                # Two stems landing on the same spot insert it once.
+                if (q - grown[-1]).length > 1e-9:
+                    grown.append(q.copy())
+        out.append((grown, cyclic, width))
+
+    if moved:
+        _log.info(foam_log.summary(
+            "stroke_ends_snapped", ends=moved, tolerance=tolerance))
+    return out
+
+
 def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
                 chain_tolerance=0.0):
     """Cut several strokes, one after another. Returns (edges, open_ends).
@@ -720,8 +824,20 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
     junction needs no special case at all, as long as the strokes are not cut
     simultaneously.
 
-    `strokes` is a sequence of (points, cyclic) pairs.
+    `strokes` is a sequence of (points, cyclic) pairs, or (points, cyclic,
+    width) triples as `strokes_from_grease_pencil` returns them -- `width` is
+    the drawn line's half-width and feeds the crossing tolerance.
     """
+    # Ends first, while each stroke still knows its own drawn width -- chaining
+    # merges strokes and the widths would not survive it. Mid-line crossings
+    # need no pass of their own: a stroke crossing one already cut meets real
+    # topology, and the crossing is an ordinary edge crossing.
+    pen = max((s[2] for s in strokes if len(s) > 2), default=0.0)
+    strokes = snap_stroke_ends(strokes, snap_distance)
+    strokes = [(s[0], s[1]) for s in strokes]
+    # Ends meeting *ends* is the same judgement at a corner: two marks within a
+    # pen width of each other were one mark.
+    chain_tolerance = max(chain_tolerance, 2.0 * pen)
     if chain_tolerance > 0.0:
         strokes = chain_strokes(strokes, chain_tolerance)
 
@@ -783,10 +899,21 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
 
 # --- Reading strokes off a Grease Pencil object -------------------------
 
-def strokes_from_grease_pencil(gp_object, target_object, at_frame=None):
+def strokes_from_grease_pencil(gp_object, target_object, at_frame=None,
+                               depsgraph=None):
     """Every stroke on `gp_object`, in `target_object`'s local space.
 
-    Returns ``[(points, cyclic)]``, ready for :func:`cut_strokes`.
+    Returns ``[(points, cyclic, width)]``, ready for :func:`cut_strokes` --
+    `width` is the stroke's mean drawn radius, read off its own points.
+
+    Pass `depsgraph` to read the *evaluated* strokes, and the bake always does.
+    The workshop setup keeps a Shrinkwrap modifier on the Grease Pencil object
+    to pin strokes to the sculpt's surface after drawing -- and modifier output
+    only exists on the evaluated object. Reading the original data reads the
+    strokes where the hand left them, hovering off the mesh, and the Shrinkwrap
+    silently does nothing. The same mistake was made once already with
+    Decimate, where the answer was likewise "the evaluated mesh has what you
+    need" (see CLAUDE.md).
 
     Both objects carry their own transform and the cutter works in the target
     mesh's local space, so each point goes out through the Grease Pencil's world
@@ -805,8 +932,15 @@ def strokes_from_grease_pencil(gp_object, target_object, at_frame=None):
     """
     if gp_object is None or gp_object.type != 'GREASEPENCIL':
         raise StrokeCutError("no Grease Pencil object to pattern from")
+    if depsgraph is not None:
+        gp_object = gp_object.evaluated_get(depsgraph)
 
     to_local = target_object.matrix_world.inverted() @ gp_object.matrix_world
+    # Radii are lengths in the Grease Pencil's own space and must cross into the
+    # target's with the points, or a scaled object changes what "the width the
+    # user drew with" means. median_scale is exact for uniform scaling, which is
+    # the practical case.
+    radius_scale = to_local.median_scale
     out = []
     for layer in gp_object.data.layers:
         if layer.hide:
@@ -828,7 +962,15 @@ def strokes_from_grease_pencil(gp_object, target_object, at_frame=None):
             closed = False
             if cyclic_attr is not None and index < len(cyclic_attr.data):
                 closed = bool(cyclic_attr.data[index].value)
-            out.append((points, closed))
+            # The drawn line's real half-width, off the points themselves --
+            # each carries a `radius` in object units. This is what decides
+            # whether two strokes that pass close were meant as one line: the
+            # marker has width even though the polyline does not, so the right
+            # tolerance is the width the user actually drew with, not a scene
+            # setting standing in for it.
+            radii = [p.radius for p in stroke.points]
+            width = (sum(radii) / len(radii)) * radius_scale if radii else 0.0
+            out.append((points, closed, width))
     if not out:
         raise StrokeCutError(
             "the Grease Pencil object has no strokes on a visible layer")
@@ -940,7 +1082,10 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         pattern["foam_pattern_gp"] = gp_object.name
 
         try:
-            strokes = strokes_from_grease_pencil(gp_object, pattern)
+            # Through the depsgraph, so the Shrinkwrap that pins strokes to the
+            # sculpt is included. The original data is where the hand drew.
+            strokes = strokes_from_grease_pencil(gp_object, pattern,
+                                                 depsgraph=depsgraph)
         except StrokeCutError as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
@@ -953,8 +1098,14 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
             # half still referenced would be marked if it were left until now.
             # Unwrapping is the step that waits for the end, once every cut is
             # in and the seams are complete.
+            # Chaining was written and then never switched on: the bake passed
+            # only snap_distance, so strokes drawn end-to-end at a piece corner
+            # were cut as separate lines with a gap between them and the piece
+            # never closed. The marker width is the right tolerance for it --
+            # it is the same judgement, that two marks this close were one mark.
             edges, open_ends = cut_strokes(bm, strokes,
-                                           snap_distance=self.snap_distance)
+                                           snap_distance=self.snap_distance,
+                                           chain_tolerance=self.snap_distance)
             bm.to_mesh(mesh)
             mesh.update()
         except StrokeCutError as exc:

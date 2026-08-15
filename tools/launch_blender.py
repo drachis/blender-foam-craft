@@ -166,7 +166,18 @@ def main():
             cmd.append(args.blend)
         cmd += ["--command", "blender_mcp", "--port", str(args.port)]
 
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Show the window without activating it (SW_SHOWNOACTIVATE). The suite
+    # starts a fresh Blender per test file, and each one stealing the keyboard
+    # made the machine unusable while tests ran. Not minimised and not
+    # off-screen, deliberately: a window that is not composited does not draw,
+    # and the screenshot tests read what the window drew.
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 4          # SW_SHOWNOACTIVATE
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     startupinfo=startupinfo)
     if wait_for_port(args.port):
         print(f"blender serving on port {args.port} ({'gui' if args.gui else 'headless'})")
         return 0

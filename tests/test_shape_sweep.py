@@ -119,6 +119,26 @@ def _canonical_faces(bm):
     bm.faces.index_update()
 
 
+def _cut_with(strokes, snap):
+    """_cut, with the tolerance named rather than fixed."""
+    _clear()
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=SEGMENTS,
+                                         ring_count=RINGS)
+    bm = bmesh.new()
+    bm.from_mesh(bpy.context.object.data)
+    _canonical_faces(bm)
+    try:
+        edges, open_ends = gp.cut_strokes(bm, strokes, snap_distance=snap,
+                                          chain_tolerance=snap)
+        sizes = _regions(bm)
+        return {"regions": len(sizes), "sizes": sizes[:6],
+                "open_ends": open_ends, "seam_edges": len(edges),
+                "degenerate": sum(1 for f in bm.faces
+                                  if f.calc_area() < 1e-8)}
+    finally:
+        bm.free()
+
+
 def _cut(strokes):
     _clear()
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=SEGMENTS,
@@ -239,10 +259,82 @@ def test_circle_scaled_about_its_centre():
     return out
 
 
+
+# --- 4. The three T junctions from the drawing pass ----------------------
+def test_t_junctions_join_by_pen_width():
+    """A T that overlaps by pen width joins; a T with a real gap stays open.
+
+    Straight from a hand-drawn pass on a sphere (2026-08-15). Three T
+    junctions came out three ways:
+
+        one crossed both visually and by centreline   -- always worked
+        one overlapped visibly but the centrelines missed -- never joined
+        one had a real gap, visible on screen         -- correctly apart
+
+    The middle case is the defect: a drawn line has the width of a marker, the
+    polyline taken from it has none, and a stem landing on a bar by its *ink*
+    should join it. The pen's own radius -- which Grease Pencil records per
+    point -- is what says so. The third case is the two-sided half: a gap wider
+    than the ink is a gap the maker drew, and the cutter must not helpfully
+    close it. A junction invented where none was drawn becomes a cut in foam.
+
+    A T encloses nothing, so region counts cannot see any of this. What a
+    joined T *does* create is a vertex with three seam edges, so that is what
+    is measured, in both directions.
+    """
+    def measure(stem_gap, width):
+        bar = [_point(1.5708, -0.3 + 0.6 * i / 39.0) for i in range(40)]
+        # The stem descends toward the bar and stops `stem_gap` short of it.
+        stem = [_point(1.5708 - 0.3 + (0.3 - stem_gap) * i / 39.0, 0.0)
+                for i in range(40)]
+        _clear()
+        bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=SEGMENTS,
+                                             ring_count=RINGS)
+        bm = bmesh.new()
+        bm.from_mesh(bpy.context.object.data)
+        _canonical_faces(bm)
+        try:
+            edges, open_ends = gp.cut_strokes(
+                bm, [(bar, False, width), (stem, False, width)],
+                snap_distance=SNAP)
+            junctions = sum(
+                1 for v in bm.verts
+                if sum(1 for e in v.link_edges if e.seam) >= 3)
+            return {"junctions": junctions, "open_ends": open_ends,
+                    "seam_edges": len(edges),
+                    "degenerate": sum(1 for f in bm.faces
+                                      if f.calc_area() < 1e-8)}
+        finally:
+            bm.free()
+
+    width = 0.012
+    # Ink overlaps: the stem stops short by less than the two half-widths.
+    overlapping = measure(stem_gap=width * 1.5, width=width)
+    # A real gap: several pen widths of clean surface between stem and bar.
+    apart = measure(stem_gap=width * 6.0, width=width)
+
+    return {
+        "ink_overlap": overlapping,
+        "real_gap": apart,
+        "checks": {
+            # The stem must join the bar: one vertex carries three seam edges.
+            "ink_overlap_joins": overlapping["junctions"] >= 1,
+            # ...and the join must be the only such place.
+            "exactly_one_junction": overlapping["junctions"] == 1,
+            # A gap the maker drew stays a gap, reported as a loose end.
+            "real_gap_stays_open": apart["junctions"] == 0,
+            "both_actually_cut": overlapping["seam_edges"] > 0
+                and apart["seam_edges"] > 0,
+            "no_degenerate_geometry": overlapping["degenerate"] == 0
+                and apart["degenerate"] == 0,
+        },
+    }
+
 TESTS = (
     test_theta_at_several_radii,
     test_two_circles_through_tangency,
     test_circle_scaled_about_its_centre,
+    test_t_junctions_join_by_pen_width,
 )
 
 result = {}

@@ -183,7 +183,8 @@ def test_strokes_convert_between_object_spaces():
     gp_obj.location = (3.5, -2.0, 1.5)      # deliberately not the sculpt's
 
     points = gp.strokes_from_grease_pencil(gp_obj, sculpt)
-    flat = [p for pts, _cyclic in points for p in pts]
+    # (points, cyclic, width) -- the width is the stroke's own drawn radius.
+    flat = [p for pts, _cyclic, _width in points for p in pts]
     # In the sculpt's local space the ring should sit on the unit sphere.
     radii = [p.length for p in flat]
 
