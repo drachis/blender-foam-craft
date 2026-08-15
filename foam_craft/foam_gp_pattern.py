@@ -153,6 +153,40 @@ def _walk_faces(face_from, p_from, face_to, p_to, limit=64):
 # the two would make a modelling decision out of a rounding question.
 _ON_ELEMENT_EPS = 1e-6
 
+# Two tolerances, doing two different jobs. Keeping them apart is the point.
+#
+#   snap_distance  -- the width of the marker tip. A user setting, in metres.
+#                     It decides when two *separate* parts of the pattern were
+#                     meant as one line: a stroke doubling back on itself, two
+#                     strokes meeting at a piece corner, a line drawn down an
+#                     edge that is already there.
+#
+#   the weld below  -- purely to stop a cut making geometry with no size. It is
+#                     a fraction of the face being cut, so it scales with the
+#                     mesh instead of meaning something different on a sculpt
+#                     modelled in millimetres and one modelled in metres.
+#
+# Every drawn point cuts where it projects. Thinning a run with the marker width
+# instead threw away real drawn detail -- on a unit sphere that discarded
+# anything within 4mm of a neighbour, which is most of a finely drawn curve --
+# and moved the cut off the line the user drew. The only points worth dropping
+# are the ones that would otherwise produce a zero-length edge and the collapsed
+# faces around it.
+_WELD_FRACTION = 1e-3
+
+
+def _weld_eps(face):
+    """The smallest separation worth keeping inside `face`.
+
+    Measured against the face's own shortest edge, so a dense sculpt and a
+    coarse one both get a tolerance in proportion to what they are made of.
+    """
+    if not face.is_valid:
+        return _ON_ELEMENT_EPS
+    lengths = [edge.calc_length() for edge in face.edges]
+    shortest = min(lengths) if lengths else 1.0
+    return max(_ON_ELEMENT_EPS, shortest * _WELD_FRACTION)
+
 
 def _candidate_faces(face, loc):
     """Every face that is equally entitled to claim this landed point.
@@ -213,14 +247,51 @@ def _assign_faces(bvh, bm, points):
     bm.faces.index_update()
     out = []
     previous = None
-    for p in points:
+    for position, p in enumerate(points):
         loc, _nrm, index, _dist = bvh.find_nearest(p)
         if index is None:
             raise StrokeCutError(
                 "a stroke point found no surface; is the stroke near the mesh?")
         loc = loc.copy()
         candidates = _candidate_faces(bm.faces[index], loc)
-        face = previous if previous in candidates else candidates[0]
+        if previous in candidates:
+            face = previous
+        elif len(candidates) == 1:
+            face = candidates[0]
+        else:
+            # Nothing to carry forward -- the first point of a stroke, or one
+            # that jumped. Pick the face the stroke is heading *into*, by which
+            # candidate centre the next drawn point is nearest.
+            #
+            # Geometric on purpose. Choosing the lowest-indexed candidate is
+            # stable for a given mesh but says nothing about direction, and the
+            # numbering it relies on is not something a mesh keeps: Blender's
+            # own sphere primitive finishes with a remove_doubles weld
+            # (bmo_create_uvsphere_exec), and welds and cuts both renumber. A
+            # cutter that reads differently after a renumber is reading the
+            # wrong thing.
+            # Measured to the face's nearest corner, not its centre. A cut made
+            # earlier in the same pattern leaves long thin faces behind, and a
+            # sliver's centre can sit far from every part of it that the stroke
+            # actually passes near -- which picked a face the stroke was leaving
+            # rather than entering, and stranded the walk two points later.
+            # The first key is geometric and does nearly all the work. The
+            # second is the face index, and it is a compromise worth naming:
+            # numbering is not something a mesh keeps, so relying on it means
+            # the same shape can cut differently after an edit that only welded
+            # or renumbered. Settling the remaining tie geometrically instead --
+            # by centre distance -- was tried and reintroduced a real defect,
+            # dropping the bar of a theta at radius 0.45 entirely, because two
+            # candidates round a corner can be genuinely indistinguishable by
+            # any local measure.
+            #
+            # tests/test_determinism.py::test_face_numbering_does_not_change_
+            # the_cut fails on exactly this, deliberately, rather than the gap
+            # going unrecorded.
+            ahead = points[position + 1] if position + 1 < len(points) else p
+            face = min(candidates,
+                       key=lambda f: (min((v.co - ahead).length
+                                          for v in f.verts), f.index))
         previous = face
         out.append((face, loc))
     return out
@@ -276,20 +347,30 @@ def _crossing_on_edge(edge, p_from, p_to):
 
 
 def _vert_at(edge, fac, snap_distance):
-    """Put a vertex on `edge` at `fac`, or reuse an endpoint if close enough.
+    """Put a vertex on `edge` at `fac`, or reuse an endpoint if it is already there.
 
-    Reuse matters. A drawn line has the width of a marker tip while the curve
-    derived from it is idealised to zero width, so a crossing that lands a
-    fraction of a millimetre from an existing corner was, as drawn, *on* that
-    corner. Splitting there anyway litters the mesh with near-duplicate vertices
-    and zero-length edges, which then become unsawable slivers in the pattern.
+    The crossing cuts where it lands. An endpoint is reused only when splitting
+    would leave an edge with no length -- that is, when the crossing *is* the
+    corner to within rounding -- because a zero-length edge collapses the faces
+    around it into a spike no saw can follow.
+
+    Reuse used to be governed by the marker width instead, which is a much
+    larger number: on a unit sphere it pulled any crossing within 4mm of a
+    corner onto that corner, moving the cut off the drawn line to tidy up a
+    problem that only arises in the last few decimal places. Marker width is the
+    right tolerance for deciding that two separate lines were meant as one; it
+    is the wrong one for deciding where a single line crosses an edge.
+
+    `snap_distance` is still accepted so callers read the same, and is used only
+    as a ceiling -- a caller asking for no snapping at all still gets none.
     """
     a, b = edge.verts[0], edge.verts[1]
     length = (b.co - a.co).length
     if length > 1e-12 and snap_distance > 0.0:
-        if fac * length <= snap_distance:
+        weld = min(snap_distance, max(_ON_ELEMENT_EPS, length * _WELD_FRACTION))
+        if fac * length <= weld:
             return a
-        if (1.0 - fac) * length <= snap_distance:
+        if (1.0 - fac) * length <= weld:
             return b
     _new_edge, new_vert = bmesh.utils.edge_split(edge, a, fac)
     return new_vert
@@ -722,14 +803,16 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
         # Same rule as everywhere else: two marks closer together than the width
         # of the drawn line were one mark.
         kept = []
-        face_verts = [v.co for v in run["face"].verts]             if run["face"].is_valid else []
+        face_verts = [v.co for v in run["face"].verts] \
+            if run["face"].is_valid else []
+        weld = _weld_eps(run["face"])
         for point in run["interior"]:
-            if snap_distance > 0.0:
-                if (point - entry.co).length <= snap_distance:
+            if weld > 0.0:
+                if (point - entry.co).length <= weld:
                     continue
-                if (point - exit_v.co).length <= snap_distance:
+                if (point - exit_v.co).length <= weld:
                     continue
-                if kept and (point - kept[-1]).length <= snap_distance:
+                if kept and (point - kept[-1]).length <= weld:
                     continue
                 # ...and against the vertices already on this face. Blender's
                 # own knife classifies every cut point as snapped to a vertex,
@@ -738,8 +821,7 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
                 # point passing close to any other corner had a second vertex
                 # laid on top of it -- a zero-length edge, and the faces around
                 # it collapse.
-                if any((point - co).length <= snap_distance
-                       for co in face_verts):
+                if any((point - co).length <= weld for co in face_verts):
                     continue
             kept.append(point)
         interior = [tuple(p) for p in kept]

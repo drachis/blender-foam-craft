@@ -395,12 +395,82 @@ def test_the_sphere_is_rebuilt_identically():
     }
 
 
+# --- 6. Renumber the faces and cut again --------------------------------
+def test_face_numbering_does_not_change_the_cut():
+    """The same mesh, its faces numbered differently, must cut the same.
+
+    This is the property that matters, and it is stronger than "two runs agree".
+    Meshes get renumbered constantly in Blender -- every cut does it, and so does
+    every weld, including the remove_doubles that ``bmo_create_uvsphere_exec``
+    finishes the sphere primitive with. A cutter whose output depends on face
+    numbering is reading something the mesh does not promise to keep, and it will
+    read differently on a sculpt that has merely been edited since.
+
+    Rather than hope no two faces ever tie, the tie is forced: the same geometry
+    is presented in three different face orders -- as built, sorted, and reversed
+    -- and all three must give the same cut. Sorting the fixture makes runs
+    repeatable; this says the cutter did not need it.
+
+    Two-sided: identical outputs would also be produced by a cutter that did
+    nothing at all, so the cut is asserted to have happened and to have made the
+    three regions a theta makes.
+    """
+    strokes = _theta(0.28)
+    results = {}
+    for label in ("as_built", "sorted", "reversed"):
+        _clear()
+        bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=SEGMENTS,
+                                             ring_count=RINGS)
+        bm = bmesh.new()
+        bm.from_mesh(bpy.context.object.data)
+        try:
+            bm.verts.ensure_lookup_table()
+            bm.verts.index_update()
+            base = len(bm.verts) + 1
+
+            def _key(face):
+                idx = sorted(v.index for v in face.verts)[:4]
+                idx += [0] * (4 - len(idx))
+                return ((idx[0] * base + idx[1]) * base + idx[2]) * base + idx[3]
+
+            if label == "sorted":
+                bm.faces.sort(key=_key)
+            elif label == "reversed":
+                bm.faces.sort(key=_key, reverse=True)
+            bm.faces.ensure_lookup_table()
+            bm.faces.index_update()
+
+            edges, _ends = gp.cut_strokes(bm, strokes, snap_distance=SNAP)
+            sizes = _regions(bm)
+            results[label] = {
+                "regions": len(sizes),
+                "sizes": sizes[:6],
+                "seam_edges": len(edges),
+                "verts": len(bm.verts),
+                "faces": len(bm.faces),
+            }
+        finally:
+            bm.free()
+
+    first = results["sorted"]
+    agree = all(r == first for r in results.values())
+    return {
+        "results": results,
+        "checks": {
+            "numbering_does_not_matter": agree,
+            "the_cut_happened": first["seam_edges"] > 0,
+            "three_regions": first["regions"] == 3,
+        },
+    }
+
+
 TESTS = (
     test_theta_cuts_identically_every_time,
     test_circle_cuts_identically_every_time,
     test_each_theta_stroke_alone_is_stable,
     test_points_on_an_edge_land_on_the_same_face_every_time,
     test_the_sphere_is_rebuilt_identically,
+    test_face_numbering_does_not_change_the_cut,
 )
 
 result = {}
