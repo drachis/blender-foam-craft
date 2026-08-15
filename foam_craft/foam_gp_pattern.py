@@ -737,8 +737,21 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
         # rather than tidying the strays.
         touched = {v for e in all_edges if e.is_valid for v in e.verts}
         if touched:
-            bmesh.ops.remove_doubles(bm, verts=list(touched),
-                                     dist=snap_distance)
+            # Sorted, because the order decides the outcome and a set has none.
+            #
+            # BMesh elements hash by identity, so iterating a set of them comes
+            # out in a different order on every run. remove_doubles keeps the
+            # first vertex of each cluster it finds and welds the rest onto it,
+            # so a different order welds different survivors and the finished
+            # mesh differs run to run. Measured: three identical runs of the
+            # same test gave three different results.
+            #
+            # This project has been here before -- uv_islands seeded its flood
+            # fill from set.pop() and numbered the same mesh differently each
+            # time it was processed.
+            bm.verts.index_update()
+            ordered = sorted(touched, key=lambda v: v.index)
+            bmesh.ops.remove_doubles(bm, verts=ordered, dist=snap_distance)
             all_edges = [e for e in all_edges if e.is_valid]
 
     _log.info(foam_log.summary(

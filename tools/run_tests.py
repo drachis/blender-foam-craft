@@ -1,9 +1,15 @@
 """Run the FoamCraft test suite against a live Blender and print a summary.
 
     python tools/run_tests.py                  # a fresh Blender per test file
-    python tools/run_tests.py --gui            # with a window, so shots happen
     python tools/run_tests.py --only theta     # one file
+    python tools/run_tests.py --headless       # no window; skips what needs one
     python tools/run_tests.py --share          # one instance for the lot
+
+Blender is started **with a window** by default. This is a tool for drawing on
+a sculpt and looking at the result, so the parts that only exist on screen --
+the overlay, the captures -- are not an optional extra to be checked when
+someone remembers a flag. Running headless silently skipped them, and a check
+that quietly does not run is the kind this project has been bitten by.
 
 Each test file assigns a ``result`` dict of {test_name: {..., "checks": {...},
 "PASS": bool}} plus an ``ALL_PASS``. This runner sends each file through the
@@ -121,9 +127,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9885)
     parser.add_argument("--only", help="run just one file by substring")
-    parser.add_argument("--gui", action="store_true",
-                        help="start Blender with a window, so tests that can "
-                             "capture screenshots do. Headless runs skip them")
+    parser.add_argument("--headless", action="store_true",
+                        help="start Blender without a window. Faster, but the "
+                             "overlay and screenshot checks cannot run and will "
+                             "say so rather than passing")
     parser.add_argument("--share", action="store_true",
                         help="one Blender for every file, the old behaviour. "
                              "Quicker while writing a test, but results depend "
@@ -131,6 +138,7 @@ def main():
     parser.add_argument("--keep", action="store_true",
                         help="with --share, leave Blender running afterwards")
     args = parser.parse_args()
+    args.gui = not args.headless
 
     files = [f for f in TEST_FILES if not args.only or args.only in f]
     if not files:
