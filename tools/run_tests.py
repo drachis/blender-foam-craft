@@ -53,6 +53,7 @@ TEST_FILES = (
     "tests/test_curvature_darts.py",
     "tests/test_bake_pattern.py",
     "tests/test_region_pattern.py",
+    "tests/test_shape_sweep.py",
     "tests/test_overlay_gui.py",
 )
 
