@@ -45,72 +45,23 @@ _TOOLS = "O:/Work/BlenderPlugin/FoamCraft/tools"
 
 
 def _shot(label, show_seams_on=None):
-    """Capture the viewport, so a run can be checked by eye as well as by count.
+    """Capture a cut, looking straight down it.
 
-    A test reporting "3 regions" proves nothing if the scene it built was not
-    the one intended -- and several cases here were measuring a shape that had
-    projected onto a rim rather than the surface, while still returning a
-    confident number. The picture is what catches that.
-
-    Headless runs skip silently: there is no window to capture and the counts
-    are still worth having. Use ``tools/run_tests.py --gui`` to collect them.
+    All of the framing, mode switching and object hiding lives in tools/shot.py
+    now. Each test file had grown its own copy with slightly different
+    behaviour, which is how they drifted into producing pictures of the wrong
+    thing -- one named as the cut showed the Grease Pencil in object mode.
     """
-    if bpy.app.background:
+    if bpy.app.background or show_seams_on is None:
         return None
     if _TOOLS not in sys.path:
         sys.path.insert(0, _TOOLS)
     try:
-        from shot import next_path
+        from shot import capture_cut
     except ImportError:
-        # Loud, not silent. This failed for a whole run because the path to
-        # tools/ had a stray tab in it, and because the capture is optional the
-        # tests went on passing while producing no pictures at all.
         print("FoamCraft tests: cannot import shot from %r" % _TOOLS)
         return None
-
-    # The splash sits over the viewport and would be most of the picture.
-    try:
-        bpy.ops.wm.splash_close()
-    except Exception:                                  # noqa: BLE001
-        pass
-    screen = bpy.context.screen
-    if screen is None:
-        return None
-    hidden = []
-    for area in screen.areas:
-        if area.type != 'VIEW_3D':
-            continue
-        # view_all polls for a view3d *region*, not merely the area, so the
-        # override has to name both. Overriding the area alone raised
-        # "Expected a view3d region" -- and only once framing was added, which
-        # is why a bare screenshot had worked.
-        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
-        if region is None:
-            continue
-        path = next_path("test_%s" % label)
-        # Seams are only drawn in edit mode. A solid object-mode view of a cut
-        # sphere is identical to an uncut one, which makes the picture worse
-        # than useless -- it looks like confirmation while showing nothing.
-        entered = False
-        if show_seams_on is not None:
-            bpy.ops.object.mode_set(mode='OBJECT')
-            for obj in list(bpy.context.selected_objects):
-                obj.select_set(False)
-            show_seams_on.select_set(True)
-            bpy.context.view_layer.objects.active = show_seams_on
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='DESELECT')
-            entered = True
-        with bpy.context.temp_override(area=area, region=region):
-            area.spaces.active.shading.type = 'SOLID'
-            bpy.ops.view3d.view_all()
-            bpy.ops.screen.screenshot_area(filepath=path)
-        if entered:
-            bpy.ops.object.mode_set(mode='OBJECT')
-        for other in hidden:
-            other.hide_set(False)
-        return path
-    return None
+    return capture_cut(show_seams_on, "test_%s" % label)
 
 
 def _clear():
@@ -404,7 +355,7 @@ def _bake_strokes_on_sphere(strokes, segments=64, rings=32):
     bpy.context.scene.foam_craft.pattern_source = sculpt
     bpy.context.view_layer.objects.active = gp_obj
 
-    shots = [_shot("%s_drawn" % _LABEL[0])]
+    shots = []
     outcome = bpy.ops.object.foam_bake_pattern(snap_distance=0.004)
     pattern = _pattern_of(sculpt)
     if pattern is None:
