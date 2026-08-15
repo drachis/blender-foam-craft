@@ -1,13 +1,36 @@
 """Run the FoamCraft test suite against a live Blender and print a summary.
 
-    python tools/run_tests.py                  # start Blender, run, stop it
-    python tools/run_tests.py --port 9885      # reuse one already serving
-    python tools/run_tests.py --keep           # leave Blender running after
+    python tools/run_tests.py                  # a fresh Blender per test file
+    python tools/run_tests.py --gui            # with a window, so shots happen
+    python tools/run_tests.py --only theta     # one file
+    python tools/run_tests.py --share          # one instance for the lot
 
 Each test file assigns a ``result`` dict of {test_name: {..., "checks": {...},
 "PASS": bool}} plus an ``ALL_PASS``. This runner sends each file through the
 bridge and collects those, so the files stay the specification and this stays
 plumbing.
+
+EVERY FILE GETS ITS OWN BLENDER
+
+Sharing one instance made the suite lie. Tests passed alone and failed after
+others, and the same test flipped both ways in a session with no change to the
+code under test -- so a green run was not evidence, which is worse than a red
+one. Three causes, none of them fixable from inside a test:
+
+  Leftover datablocks rename what comes next. A stale object called Sculpt
+  makes the next one Sculpt.001, and anything looking for a name finds the
+  wrong thing or nothing.
+
+  Test files purge foam_craft from sys.modules to pick up edits, which orphans
+  the add-on's registration -- the draw handler keeps running from a module
+  object nothing can reach any more.
+
+  Scene settings persist. One file's choice of stroke object is the next
+  file's starting state.
+
+A process boundary fixes all three at once and cannot be forgotten. It costs a
+Blender launch per file, which is the price of the result meaning something.
+--share restores the old behaviour for a quick loop while writing a test.
 
 Exits non-zero if anything failed, so it can gate a commit.
 """
@@ -15,6 +38,7 @@ Exits non-zero if anything failed, so it can gate a commit.
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,12 +56,36 @@ TEST_FILES = (
     "tests/test_overlay_gui.py",
 )
 
+LAUNCHER = ROOT / "tools" / "launch_blender.py"
+
+
+def serving(port):
+    try:
+        blender_bridge.execute("result = {'ok': True}", port=port)
+        return True
+    except Exception:                                  # noqa: BLE001
+        return False
+
+
+def start(port, gui):
+    cmd = [sys.executable, str(LAUNCHER), "--port", str(port)]
+    if gui:
+        cmd.append("--gui")
+    subprocess.run(cmd, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop(port):
+    subprocess.run([sys.executable, str(LAUNCHER), "--port", str(port),
+                    "--stop"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 def run_file(path, port):
     code = (ROOT / path).read_text(encoding="utf-8")
     try:
         response = blender_bridge.execute(code, port=port)
-    except Exception as exc:                       # noqa: BLE001
+    except Exception as exc:                           # noqa: BLE001
         return {"__error__": "%s: %s" % (type(exc).__name__, exc)}
     if not isinstance(response, dict):
         return {"__error__": "unexpected response: %r" % (response,)}
@@ -46,58 +94,79 @@ def run_file(path, port):
     return {"__error__": response.get("message") or str(response)[:400]}
 
 
+def report_on(path, report):
+    """Print one file's results. Returns (tests, failures)."""
+    if "__error__" in report:
+        print("  ERROR: %s" % report["__error__"])
+        return 0, 1
+    total = failures = 0
+    for name, entry in report.items():
+        if name == "ALL_PASS" or not isinstance(entry, dict):
+            continue
+        total += 1
+        passed = entry.get("PASS")
+        print("  %-46s %s" % (name, "pass" if passed else "FAIL"))
+        if not passed:
+            failures += 1
+            for check, ok in (entry.get("checks") or {}).items():
+                if not ok:
+                    print("      failed check: %s" % check)
+            for line in entry.get("ERROR") or []:
+                print("      %s" % line)
+    return total, failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9885)
-    parser.add_argument("--keep", action="store_true",
-                        help="leave Blender running when finished")
     parser.add_argument("--only", help="run just one file by substring")
     parser.add_argument("--gui", action="store_true",
                         help="start Blender with a window, so tests that can "
                              "capture screenshots do. Headless runs skip them")
+    parser.add_argument("--share", action="store_true",
+                        help="one Blender for every file, the old behaviour. "
+                             "Quicker while writing a test, but results depend "
+                             "on what ran before them")
+    parser.add_argument("--keep", action="store_true",
+                        help="with --share, leave Blender running afterwards")
     args = parser.parse_args()
 
-    launcher = ROOT / "tools" / "launch_blender.py"
-    started = False
-    try:
-        blender_bridge.execute("result = {'ok': True}", port=args.port)
-    except Exception:                              # noqa: BLE001
-        print("starting blender on port %d ..." % args.port)
-        cmd = [sys.executable, str(launcher), "--port", str(args.port)]
-        if args.gui:
-            cmd.append("--gui")
-        subprocess.run(cmd, check=True)
-        started = True
+    files = [f for f in TEST_FILES if not args.only or args.only in f]
+    if not files:
+        print("no test files match %r" % args.only)
+        return 1
 
-    files = [f for f in TEST_FILES
-             if not args.only or args.only in f]
-    failures = 0
-    total = 0
-    for path in files:
-        print("\n=== %s" % path)
-        report = run_file(path, args.port)
-        if "__error__" in report:
-            print("  ERROR: %s" % report["__error__"])
-            failures += 1
-            continue
-        for name, entry in report.items():
-            if name == "ALL_PASS" or not isinstance(entry, dict):
-                continue
-            total += 1
-            passed = entry.get("PASS")
-            print("  %-46s %s" % (name, "pass" if passed else "FAIL"))
-            if not passed:
-                failures += 1
-                for check, ok in (entry.get("checks") or {}).items():
-                    if not ok:
-                        print("      failed check: %s" % check)
-                for line in entry.get("ERROR") or []:
-                    print("      %s" % line)
+    total = failures = 0
+    started_at = time.time()
 
-    print("\n%d test(s), %d failure(s)" % (total, failures))
-    if started and not args.keep:
-        subprocess.run([sys.executable, str(launcher), "--port",
-                        str(args.port), "--stop"], check=False)
+    if args.share:
+        started = False
+        if not serving(args.port):
+            print("starting blender on port %d ..." % args.port)
+            start(args.port, args.gui)
+            started = True
+        for path in files:
+            print("\n=== %s" % path)
+            counted, failed = report_on(path, run_file(path, args.port))
+            total += counted
+            failures += failed
+        if started and not args.keep:
+            stop(args.port)
+    else:
+        for index, path in enumerate(files):
+            port = args.port + index
+            print("\n=== %s   (fresh blender on %d)" % (path, port))
+            stop(port)                 # in case one was left behind
+            start(port, args.gui)
+            try:
+                counted, failed = report_on(path, run_file(path, port))
+            finally:
+                stop(port)
+            total += counted
+            failures += failed
+
+    print("\n%d test(s), %d failure(s) in %.0fs"
+          % (total, failures, time.time() - started_at))
     return 1 if failures else 0
 
 
