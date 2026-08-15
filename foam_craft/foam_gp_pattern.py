@@ -585,25 +585,292 @@ def on_surface_runs(bm, points, tolerance):
     return runs
 
 
+# --- The cut, as Blender's knife makes it -------------------------------
+#
+# Five steps, matching editmesh_knife.cc:2056-2292:
+#
+#   1. classify every drawn point as a vertex, an edge, or a face
+#   2. realise the edge points as real vertices, in order along each edge
+#   3. realise the face points as loose vertices
+#   4. join consecutive points into a net of edges, reusing any that exist
+#   5. hand each face its share of the net and let Blender split it
+#
+# What is absent is the point: no per-face runs, no entry/exit pairing, no
+# recovery of the cut afterwards, and no walk that has to succeed end to end or
+# lose the whole stroke. face_split_edgenet takes an unordered *set* of edges
+# and works out the regions itself.
+
+
+VERT, EDGE, FACE = "VERT", "EDGE", "FACE"
+
+
+def _classify(bm, bvh, points):
+    """Land each drawn point on the surface and say what it landed on.
+
+    Returns a list of dicts with `kind` (VERT/EDGE/FACE), `elem`, `fac` (along
+    the edge, for EDGE), `loc` and `face`.
+
+    This is the knife's own classification -- "Exactly one of kfe, v, or f
+    should be non-null, saying whether cut line crosses an edge, is snapped to a
+    vert, or is in the middle of some face" (editmesh_knife.cc:136-152). The
+    tolerance is `_weld_eps`, a fraction of the face, so a point cuts where it
+    projects and snaps only far enough to avoid geometry with no size.
+
+    Note what is *not* decided here: an edge or vertex point is not given an
+    owning face. It genuinely has none, and the old code's need to name one is
+    what made the finished cut depend on face numbering.
+    """
+    hits = []
+    for p in points:
+        loc, _nrm, index, _dist = bvh.find_nearest(p)
+        if index is None:
+            raise StrokeCutError(
+                "a stroke point found no surface; is the stroke near the mesh?")
+        face = bm.faces[index]
+        loc = loc.copy()
+        weld = _weld_eps(face)
+
+        hit = {"kind": FACE, "elem": face, "fac": 0.0, "loc": loc,
+               "face": face}
+        near_vert = min(face.verts, key=lambda v: (v.co - loc).length)
+        if (near_vert.co - loc).length <= weld:
+            hit["kind"], hit["elem"] = VERT, near_vert
+        else:
+            for edge in face.edges:
+                a, b = edge.verts[0].co, edge.verts[1].co
+                span = b - a
+                denom = span.length_squared
+                if denom < 1e-18:
+                    continue
+                t = max(0.0, min(1.0, (loc - a).dot(span) / denom))
+                if (loc - (a + span * t)).length <= weld:
+                    hit["kind"], hit["elem"], hit["fac"] = EDGE, edge, t
+                    break
+        hits.append(hit)
+    return hits
+
+
+def _hit_faces(hit):
+    """Every face the hit could be said to lie in."""
+    if hit["kind"] == FACE:
+        return {hit["elem"]}
+    return set(hit["elem"].link_faces)
+
+
+def _bridge(hits):
+    """Insert the crossings between points that share no face.
+
+    Two consecutive drawn points can land on faces that do not touch, because
+    the stroke passed straight over the faces between them. Those crossings are
+    computable rather than guessable, so they are walked and inserted as EDGE
+    hits -- after which every consecutive pair shares a face and the net can be
+    built with no further special cases.
+
+    A walk that fails no longer costs the stroke. The pair is left alone and
+    counted; the net has a gap there and every other part of the line still
+    cuts. Losing a whole drawn line because one segment was awkward was the
+    worst behaviour of the previous design.
+    """
+    out, missed = [hits[0]], 0
+    for previous, hit in zip(hits, hits[1:]):
+        if _hit_faces(previous) & _hit_faces(hit):
+            out.append(hit)
+            continue
+
+        # Neighbouring faces first, and by far the commonest case: the stroke
+        # simply stepped over one edge. Where the two faces share an edge the
+        # crossing is that edge and no walk is needed. Sending this through the
+        # walk instead was measured to fail on four to nine segments of a single
+        # circle -- the walk is for faces that genuinely do not touch, and using
+        # it where the answer is already known just adds ways to be wrong.
+        edge = _shared_edge(previous["face"], hit["face"])
+        if edge is not None:
+            fac = _crossing_on_edge(edge, previous["loc"], hit["loc"])
+            a, b = edge.verts[0].co, edge.verts[1].co
+            out.append({"kind": EDGE, "elem": edge, "fac": fac,
+                        "loc": a + (b - a) * fac,
+                        "face": previous["face"]})
+            out.append(hit)
+            continue
+
+        # Diagonal neighbours, touching at one corner only. The crossing is the
+        # corner itself and nothing needs splitting -- the stroke went through a
+        # vertex that is already there.
+        corner = _shared_vert(previous["face"], hit["face"])
+        if corner is not None:
+            out.append({"kind": VERT, "elem": corner, "fac": 0.0,
+                        "loc": corner.co.copy(), "face": previous["face"]})
+            out.append(hit)
+            continue
+
+        route = _walk_faces(previous["face"], previous["loc"],
+                            hit["face"], hit["loc"])
+        if not route:
+            missed += 1
+            out.append(hit)
+            continue
+        for edge, fac in route:
+            a, b = edge.verts[0].co, edge.verts[1].co
+            out.append({"kind": EDGE, "elem": edge, "fac": fac,
+                        "loc": a + (b - a) * fac,
+                        "face": edge.link_faces[0]})
+        out.append(hit)
+    return out, missed
+
+
+def _realise_on_edge(edge, targets, weld):
+    """Put every cut point on one edge, in order. Returns {index: BMVert}.
+
+    `targets` is [(index, fac)] sorted by `fac`. Splitting in order along the
+    edge is what the knife does (sort_verts_by_dist_cb then BM_edge_split,
+    editmesh_knife.cc:2273-2282), and the order matters: each split shortens
+    what is left, so a factor measured against the original edge has to be
+    re-expressed against the remaining part.
+
+    A point closer to either end than `weld` reuses that end instead of
+    splitting, because splitting there leaves an edge with no length and the
+    faces around it collapse.
+    """
+    found = {}
+    segment = edge
+    base, far = edge.verts[0], edge.verts[1]
+    total = (far.co - base.co).length
+    done = 0.0                      # where `base` now sits along the original
+    for index, fac in targets:
+        if total <= 1e-12:
+            found[index] = base
+            continue
+        if (fac - done) * total <= weld:
+            found[index] = base
+            continue
+        if (1.0 - fac) * total <= weld:
+            found[index] = far
+            continue
+        remaining = (1.0 - done) * total
+        _new_edge, new_vert = bmesh.utils.edge_split(
+            segment, base, ((fac - done) * total) / remaining)
+        found[index] = new_vert
+        # Carry on down the part that still ends at the original far vertex.
+        segment = next((e for e in new_vert.link_edges if far in e.verts),
+                       segment)
+        base, done = new_vert, fac
+    return found
+
+
+def _realise(bm, hits, snap_distance):
+    """Turn every hit into a real BMVert. Returns a list aligned to `hits`."""
+    by_edge = {}
+    for index, hit in enumerate(hits):
+        if hit["kind"] == EDGE:
+            by_edge.setdefault(hit["elem"], []).append((index, hit["fac"]))
+
+    verts = [None] * len(hits)
+    for edge, targets in by_edge.items():
+        if not edge.is_valid:
+            continue
+        natural = edge.calc_length() * _WELD_FRACTION
+        weld = min(snap_distance, max(_ON_ELEMENT_EPS, natural)) \
+            if snap_distance > 0.0 else natural
+        for index, vert in _realise_on_edge(
+                edge, sorted(targets, key=lambda t: t[1]), weld).items():
+            verts[index] = vert
+
+    for index, hit in enumerate(hits):
+        if verts[index] is not None:
+            continue
+        if hit["kind"] == VERT:
+            verts[index] = hit["elem"]
+        else:
+            verts[index] = bm.verts.new(hit["loc"])
+    return verts
+
+
+def _net_edges(bm, hits, verts, cyclic):
+    """Join consecutive points into edges. Returns ([(edge, face)], reused).
+
+    An existing edge between two consecutive points is reused rather than
+    duplicated -- the knife does the same (BM_edge_exists,
+    editmesh_knife.cc:2098) -- which is the whole of what `_existing_path` was
+    written to do, for free, and without a greedy search that can go wrong.
+
+    An edge already belonging to the face being split must not go into that
+    face's net. bmesh_polygon_edgenet.cc:519-528 asserts against it, and the
+    assert compiles out of a release build, so nothing would report a mistake.
+    """
+    pairs = list(zip(range(len(verts)), range(1, len(verts))))
+    if cyclic and len(verts) > 2:
+        pairs.append((len(verts) - 1, 0))
+
+    net, reused, seen = [], [], set()
+    for i, j in pairs:
+        va, vb = verts[i], verts[j]
+        if va is vb or not (va.is_valid and vb.is_valid):
+            continue
+        existing = bm.edges.get((va, vb))
+        if existing is not None:
+            # Already topology. It is part of the cut, but handing it to
+            # face_split_edgenet as part of that face's net is forbidden.
+            reused.append(existing)
+            continue
+        shared = _hit_faces(hits[i]) & _hit_faces(hits[j])
+        if not shared:
+            continue
+        face = min(shared, key=lambda f: f.index)
+        edge = bm.edges.new((va, vb))
+        if edge in seen:
+            continue
+        seen.add(edge)
+        net.append((edge, face))
+    return net, reused
+
+
+def _split_faces(bm, net):
+    """Hand each face its share of the net and let Blender split it.
+
+    One call per face with all of that face's edges at once, exactly as the
+    knife groups them before splitting (the `fhash` pass,
+    editmesh_knife.cc:2219). Splitting one face does not invalidate another, so
+    no ordering between faces is needed.
+    """
+    by_face = {}
+    for edge, face in net:
+        by_face.setdefault(face, []).append(edge)
+
+    made_total = 0
+    for face, edges in by_face.items():
+        if not face.is_valid:
+            continue
+        own = set(face.edges)
+        live = [e for e in edges if e.is_valid and e not in own]
+        if not live:
+            continue
+        try:
+            made = bmesh.utils.face_split_edgenet(face=face, edgenet=live)
+        except ValueError as exc:
+            _log.warning(foam_log.summary(
+                "face_split_edgenet_refused", edges=len(live),
+                reason=str(exc)[:100]))
+            continue
+        made_total += len(made)
+    return made_total
+
+
 def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
                project_tolerance=0.0):
-    """Cut `points` into `bm` as real edges. Returns the new edge list.
+    """Cut `points` into `bm` as real edges. Returns (edges, open_ends).
 
     `points` are in the mesh's own space and are expected to lie on or near its
     surface. Nothing is deleted and no face is moved; the mesh gains vertices
     along the drawn line and the faces it crosses are split by it.
 
-    `cyclic` closes the stroke, joining its last point back to its first. A
-    closed pattern line is the normal case -- a piece boundary is a loop -- and
-    it is also the only shape that leaves no loose ends, since a cut stopping
-    inside a face cannot be made.
+    `cyclic` closes the stroke, joining its last point back to its first.
     """
     if len(points) < 2:
         raise StrokeCutError("a stroke needs at least two points")
 
     # Drop anything that missed the surface, and cut what is left. A stroke
-    # broken into pieces is no longer closed, whatever it was drawn as: the part
-    # that ran off took the closure with it.
+    # broken into pieces is no longer closed, whatever it was drawn as: the
+    # part that ran off took the closure with it.
     if project_tolerance > 0.0:
         runs_on = on_surface_runs(bm, points, project_tolerance)
         if not runs_on:
@@ -621,242 +888,66 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
             return collected, open_ends
 
     bm.faces.ensure_lookup_table()
+    bm.faces.index_update()
     bvh = BVHTree.FromBMesh(bm)
-    assigned = _assign_faces(bvh, bm, points)
+    hits = _classify(bm, bvh, points)
 
-    # A closed stroke lying wholly inside one face crosses no edge, so it has no
-    # entry or exit and face_split -- which joins two *boundary* vertices -- has
-    # nothing to work with. Left alone this returns silently having cut nothing,
-    # which is the worst outcome: the pattern looks applied and is not there.
-    #
-    # The mesh is simply too coarse for the piece being drawn, so the face is
-    # subdivided until the stroke crosses it. Refining where a line was drawn is
-    # what a modeller would do by hand, and it adds geometry only inside the
-    # face the stroke is already in.
+    # A closed stroke lying wholly inside one face reaches no boundary, and a
+    # net that does not reach the boundary is silently ignored -- measured in
+    # tests/test_edgenet_cut.py, and stated in the binding's own docs. The knife
+    # bridges the island with BM_face_split_edgenet_connect_islands, which is
+    # not exposed to Python, so the face is refined until the stroke crosses an
+    # edge instead. Refining where a line was drawn is what a modeller would do
+    # by hand, and it adds geometry only inside the face already involved.
+    def _all_inside():
+        return (not any(h["kind"] != FACE for h in hits)
+                and len({h["face"] for h in hits}) == 1)
+
     refined = 0
-    while refined < _MAX_REFINE and len({f for f, _ in assigned}) == 1:
-        face = assigned[0][0]
+    while refined < _MAX_REFINE and _all_inside():
+        face = hits[0]["face"]
         bmesh.ops.subdivide_edges(bm, edges=list(face.edges), cuts=3,
                                   use_grid_fill=True)
         bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
         bvh = BVHTree.FromBMesh(bm)
-        assigned = _assign_faces(bvh, bm, points)
+        hits = _classify(bm, bvh, points)
         refined += 1
-    if len({f for f, _ in assigned}) == 1:
+    if _all_inside():
         raise StrokeCutError(
             "the stroke stays inside a single face after %d subdivisions; it "
             "is far smaller than the mesh it is drawn on" % refined)
 
-    # --- Group the stroke into per-face runs, and note every crossing.
-    #
-    # A crossing is where the stroke leaves one face for the next. Each is
-    # recorded against the *shared edge* rather than resolved immediately,
-    # because the vertex made there belongs to both faces: it is the exit of one
-    # run and the entry of the next, and that shared vertex is the only thing
-    # keeping the finished seam continuous rather than a row of disconnected
-    # cuts.
-    runs = []           # [{face, interior:[Vector], entry_edge, exit_edge, ...}]
-    current = {"face": assigned[0][0], "interior": [assigned[0][1]],
-               "entry": None, "exit": None}
-    crossings = []      # (edge, fac, run_index_before, run_index_after)
+    hits, missed = _bridge(hits)
+    if missed:
+        _log.warning(foam_log.summary(
+            "stroke_gaps", segments=missed, points=len(points)))
 
-    order = list(range(1, len(assigned)))
-    if cyclic:
-        order.append(0)          # walk the closing segment back to the start
-    for i in order:
-        face, surf_pt = assigned[i]
-        if face is current["face"]:
-            if i != 0:
-                current["interior"].append(surf_pt)
-            continue
-        edge = _shared_edge(current["face"], face)
-        if edge is not None:
-            fac = _crossing_on_edge(edge, assigned[i - 1][1], surf_pt)
-            crossings.append(("edge", (edge, fac), len(runs)))
-        else:
-            corner = _shared_vert(current["face"], face)
-            if corner is not None:
-                crossings.append(("vert", corner, len(runs)))
-            else:
-                # The stroke crossed one or more faces between these two points.
-                # Walk them and take the real crossings rather than refusing, or
-                # inventing samples and hoping they land conveniently.
-                route = _walk_faces(current["face"], assigned[i - 1][1],
-                                    face, surf_pt)
-                if route is None:
-                    # Named, not just reported. "Could not follow the stroke"
-                    # gives nothing to act on -- which point, how far apart, and
-                    # how big the faces are is the difference between a stroke
-                    # that left the surface and one that outran the walk.
-                    gap = (surf_pt - assigned[i - 1][1]).length
-                    raise StrokeCutError(
-                        "could not follow the stroke from point %d to %d "
-                        "(gap %.4g, faces %d and %d)"
-                        % (i - 1, i, gap, current["face"].index, face.index))
-                if not route:
-                    raise StrokeCutError(
-                        "the stroke crosses faces that do not connect")
-                # Each boundary crossed closes the run before it and opens the
-                # next, exactly as a single-edge crossing does. The faces in
-                # between hold no drawn points -- the stroke passed straight
-                # over them -- so their runs are entry to exit and nothing else.
-                walking = current["face"]
-                for edge_hit, fac_hit in route[:-1]:
-                    crossings.append(("edge", (edge_hit, fac_hit), len(runs)))
-                    runs.append(current)
-                    walking = next((f for f in edge_hit.link_faces
-                                    if f is not walking), walking)
-                    current = {"face": walking, "interior": [],
-                               "entry": None, "exit": None}
-                last_edge, last_fac = route[-1]
-                crossings.append(("edge", (last_edge, last_fac), len(runs)))
-        runs.append(current)
-        if i == 0:
-            # The closing segment landed back on the run the walk began in, so
-            # that run gains this crossing as its entry rather than starting a
-            # new one. This is what makes a loop have no ends.
-            current = None
-            break
-        current = {"face": face, "interior": [surf_pt],
-                   "entry": None, "exit": None}
-    if current is not None:
-        if cyclic and runs and current["face"] is runs[0]["face"]:
-            # The stroke closed without crossing an edge on its final segment:
-            # first and last runs are the same face, so they are one run.
-            runs[0]["interior"] = current["interior"] + runs[0]["interior"]
-            runs[0]["entry"] = current["entry"]
-        else:
-            runs.append(current)
+    verts = _realise(bm, hits, snap_distance)
+    net, reused = _net_edges(bm, hits, verts, cyclic)
+    _split_faces(bm, net)
 
-    # --- Make every crossing vertex first, before any face is split.
-    #
-    # Order matters. edge_split on a shared edge changes both adjacent faces, so
-    # doing it up front means each run finds its entry vertex already present.
-    # Splitting faces first would invalidate the edges these crossings refer to.
-    for kind, payload, run_index in crossings:
-        if kind == "edge":
-            vert = _vert_at(payload[0], payload[1], snap_distance)
-        else:
-            # A corner the stroke passed through. It already exists, so there is
-            # nothing to split -- and splitting anything here would move a
-            # vertex the user never drew near.
-            vert = payload
-        runs[run_index]["exit"] = vert
-        # Wraps for a closed stroke, where the last run's exit is the first
-        # run's entry. On an open stroke this index is always in range.
-        runs[(run_index + 1) % len(runs)]["entry"] = vert
+    new_edges = [e for e, _f in net if e.is_valid] + \
+                [e for e in reused if e.is_valid]
 
-    # An open stroke's two loose ends. Resolved after the crossings, so an end
-    # landing on a line cut earlier in this same call finds it already there.
-    if not cyclic and runs:
-        if runs[0]["entry"] is None and runs[0]["interior"]:
-            runs[0]["entry"] = _endpoint_vert(
-                runs[0]["face"], runs[0]["interior"][0], snap_distance)
-            if runs[0]["entry"] is not None:
-                runs[0]["interior"] = runs[0]["interior"][1:]
-        last = runs[-1]
-        if last["exit"] is None and last["interior"]:
-            last["exit"] = _endpoint_vert(
-                last["face"], last["interior"][-1], snap_distance)
-            if last["exit"] is not None:
-                last["interior"] = last["interior"][:-1]
+    # Anything still wire went nowhere -- a loose end sitting inside a face,
+    # which cannot bound a piece. The knife removes these too: "Remove dangling
+    # edges, not essential - but nice for users." (editmesh_knife.cc:2166)
+    dangling = [e for e in new_edges if e.is_wire]
+    if dangling:
+        bmesh.ops.delete(bm, geom=dangling, context='EDGES')
+        new_edges = [e for e in new_edges if e.is_valid]
 
-    # --- Split each face along its run.
-    new_edges = []
-    skipped_open = 0
-    for run in runs:
-        entry, exit_v = run["entry"], run["exit"]
-        if entry is None or exit_v is None:
-            # The first and last runs of an open stroke have a loose end sitting
-            # inside a face. A face can only be split between two of its own
-            # boundary vertices, so a cut that stops halfway across one has
-            # nowhere to land. Counted and reported rather than fudged.
-            skipped_open += 1
-            continue
-        if entry is exit_v:
-            # Entered and left at the same vertex: the run is shorter than the
-            # snap distance, which is the tolerance saying to treat it as one
-            # point. Nothing to cut.
-            continue
-
-        # The stroke may be running along an edge that is already there. Drawing
-        # down an obvious feature line is a normal thing to do, and on a UV
-        # sphere an equatorial stroke lands exactly on a ring of the mesh.
-        #
-        # face_split cannot help here -- there is no face to divide, because the
-        # two vertices are already neighbours -- so the earlier code fell through
-        # and cut nothing, silently. The line the user drew simply did not
-        # appear. Marking the existing edge is the whole job: the topology it
-        # would have created is present already.
-        poly = [entry.co] + list(run["interior"]) + [exit_v.co]
-        along = _existing_path(entry, exit_v, poly, snap_distance)
-        if along is not None:
-            new_edges.extend(along)
-            continue
-        # Thin out points that sit on top of one another, or on top of the
-        # vertices the cut runs between. face_split places one vertex per coord
-        # regardless, so a duplicate becomes a zero-length edge and the faces
-        # around it collapse -- measured as 4 zero-length edges and 3 degenerate
-        # faces on a bar drawn along a sphere's equator, showing up as a pinched
-        # black wedge in the viewport.
-        #
-        # Same rule as everywhere else: two marks closer together than the width
-        # of the drawn line were one mark.
-        kept = []
-        face_verts = [v.co for v in run["face"].verts] \
-            if run["face"].is_valid else []
-        weld = _weld_eps(run["face"])
-        for point in run["interior"]:
-            if weld > 0.0:
-                if (point - entry.co).length <= weld:
-                    continue
-                if (point - exit_v.co).length <= weld:
-                    continue
-                if kept and (point - kept[-1]).length <= weld:
-                    continue
-                # ...and against the vertices already on this face. Blender's
-                # own knife classifies every cut point as snapped to a vertex,
-                # snapped to an edge, or loose in a face, with a tolerance for
-                # each. Only the run's two ends were checked here, so a drawn
-                # point passing close to any other corner had a second vertex
-                # laid on top of it -- a zero-length edge, and the faces around
-                # it collapse.
-                if any((point - co).length <= weld for co in face_verts):
-                    continue
-            kept.append(point)
-        interior = [tuple(p) for p in kept]
-        try:
-            new_face, _new_loop = bmesh.utils.face_split(
-                run["face"], entry, exit_v, coords=interior)
-        except ValueError as exc:
-            raise StrokeCutError(
-                "face_split refused a run: %s" % exc) from exc
-        if new_face is None:
-            raise StrokeCutError("face_split returned no face")
-        new_edges.extend(_cut_path_edges(new_face, entry, exit_v,
-                                         len(interior)))
-
-    # Marked here rather than left to the caller, and this is not tidiness.
-    #
-    # Cutting a later stroke can edge_split an edge that this one produced --
-    # which is exactly what happens wherever two strokes cross, since the second
-    # stroke's crossing lands on the first stroke's line. Splitting an edge
-    # leaves the returned list holding one half while the other half is a new
-    # edge nobody has a reference to, so marking the accumulated list at the end
-    # of the whole pattern leaves gaps in every stroke that a later one crossed.
-    #
-    # Marking now means the flag is already on the edge when it is split, and
-    # both halves inherit it. Measured on a theta -- a circle crossed by a bar
-    # -- the old order gave 1, 3 or 2 regions depending on how far the bar
-    # overhung, where the answer is always 3.
+    # Marked here rather than left to the caller. Cutting a later stroke can
+    # split an edge this one produced -- which is what happens wherever two
+    # strokes cross -- and marking now means both halves inherit the flag.
     for edge in new_edges:
         edge.seam = True
 
     _log.debug(foam_log.summary(
-        "cut_stroke", points=len(points), runs=len(runs),
-        crossings=len(crossings), open_ends=skipped_open,
-        snap=snap_distance))
-    return new_edges, skipped_open
+        "cut_stroke", points=len(points), net=len(net), reused=len(reused),
+        dangling=len(dangling), snap=snap_distance))
+    return new_edges, len(dangling)
 
 
 def chain_strokes(strokes, tolerance):
