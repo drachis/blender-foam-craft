@@ -830,9 +830,35 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         name="Island Margin", default=0.02, min=0.0, max=0.5)
 
     @classmethod
+    def blocked_because(cls, context):
+        """Why the bake cannot run, in words, or None when it can.
+
+        Kept apart from poll() so the panel can print the reason. A greyed
+        button that does not say why is a puzzle: this one used to disable
+        itself whenever the active object was not a mesh, which is the normal
+        state right after drawing, since the Grease Pencil is what you had
+        selected. Three unrelated causes all showed as the same silent grey.
+        """
+        settings = getattr(context.scene, "foam_craft", None)
+        if settings is None:
+            return "FoamCraft settings are unavailable"
+        if settings.pattern_source is None:
+            return "Pick the sculpt to cut from"
+        if settings.pattern_source.type != 'MESH':
+            return "The sculpt must be a mesh"
+        if settings.pattern_source.get("foam_pattern_source"):
+            return "That is a pattern copy, not the sculpt"
+        if settings.gp_object is None:
+            return "Pick the Grease Pencil object holding the strokes"
+        return None
+
+    @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        # Deliberately not keyed to the active object. Baking reads two objects
+        # named in the panel and writes a third, so what happens to be selected
+        # is irrelevant -- and requiring a mesh there disabled the button in the
+        # exact situation the feature exists for.
+        return cls.blocked_because(context) is None
 
     def invoke(self, context, event):
         settings = getattr(context.scene, "foam_craft", None)
@@ -841,17 +867,13 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         return self.execute(context)
 
     def execute(self, context):
-        settings = getattr(context.scene, "foam_craft", None)
-        source = context.active_object
-        gp_object = getattr(settings, "gp_object", None) if settings else None
-        if gp_object is None:
-            self.report({'ERROR'},
-                        "Pick a Grease Pencil object in the Pattern panel")
+        blocked = self.blocked_because(context)
+        if blocked:
+            self.report({'ERROR'}, blocked)
             return {'CANCELLED'}
-        if source.get("foam_pattern_source"):
-            self.report({'ERROR'},
-                        "That is already a pattern copy -- select the sculpt")
-            return {'CANCELLED'}
+        settings = context.scene.foam_craft
+        source = settings.pattern_source
+        gp_object = settings.gp_object
         if context.object and context.object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -949,8 +971,53 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class VIEW3D_PT_foam_pattern(bpy.types.Panel):
+    """Patterning lives in the 3D viewport, not the UV editor.
+
+    Baking reads a sculpt and a set of drawn strokes and writes a new object.
+    That is object-level work, and Blender users look for it where objects are
+    -- it was in the UV editor's sidebar, which is where the *result* is
+    inspected, not where the work is started.
+    """
+
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "FoamCraft"
+    bl_label = "Pattern"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = getattr(context.scene, "foam_craft", None)
+        if settings is None:
+            layout.label(text="FoamCraft settings unavailable", icon='ERROR')
+            return
+
+        layout.prop(settings, "pattern_source", text="Sculpt")
+        layout.prop(settings, "gp_object", text="Strokes")
+
+        blocked = OBJECT_OT_foam_bake_pattern.blocked_because(context)
+        if blocked:
+            # Say it rather than only greying the button out.
+            layout.label(text=blocked, icon='INFO')
+
+        existing = None
+        if settings.pattern_source is not None:
+            existing = bpy.data.objects.get(
+                "%s_Pattern" % settings.pattern_source.name)
+        row = layout.row()
+        row.scale_y = 1.4
+        row.enabled = blocked is None
+        row.operator("object.foam_bake_pattern",
+                     text="Re-bake Pattern" if existing else "Bake Pattern",
+                     icon='MOD_BOOLEAN')
+        if existing is not None:
+            layout.label(text="Replaces %s" % existing.name, icon='OBJECT_DATA')
+        layout.prop(settings, "snap_distance")
+
+
 _classes = (
     OBJECT_OT_foam_bake_pattern,
+    VIEW3D_PT_foam_pattern,
 )
 
 

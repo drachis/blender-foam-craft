@@ -13,6 +13,10 @@ is narrow and each part of it is a way the tool could quietly ruin a day's work:
     re-baking replaces, never accumulates otherwise draw-bake-look-adjust turns
                                           into a cleanup chore
     the copy carries its inputs           so a re-bake needs no restating
+    selection is irrelevant               the sculpt and strokes are named in
+                                          the panel, so having the Grease Pencil
+                                          active -- the normal state after
+                                          drawing -- must not disable the bake
 
 Every check states both bounds.
 """
@@ -72,6 +76,7 @@ def _shot(label, show_seams_on=None):
     screen = bpy.context.screen
     if screen is None:
         return None
+    hidden = []
     for area in screen.areas:
         if area.type != 'VIEW_3D':
             continue
@@ -102,6 +107,8 @@ def _shot(label, show_seams_on=None):
             bpy.ops.screen.screenshot_area(filepath=path)
         if entered:
             bpy.ops.object.mode_set(mode='OBJECT')
+        for other in hidden:
+            other.hide_set(False)
         return path
     return None
 
@@ -122,6 +129,7 @@ def _clear():
     settings = getattr(bpy.context.scene, "foam_craft", None)
     if settings is not None:
         settings.gp_object = None
+        settings.pattern_source = None
     for collection in (bpy.data.objects, bpy.data.meshes,
                        bpy.data.grease_pencils):
         for block in list(collection):
@@ -171,8 +179,24 @@ def _build_scene(ring_z=0.3137, n=160, offset=(0.0, 0.0, 0.0)):
 
     settings = bpy.context.scene.foam_craft
     settings.gp_object = gp_obj
-    bpy.context.view_layer.objects.active = sculpt
+    settings.pattern_source = sculpt
+    # Left active on purpose: right after drawing, the Grease Pencil is what is
+    # selected, and the bake must not care.
+    bpy.context.view_layer.objects.active = gp_obj
     return sculpt, gp_obj
+
+
+def _pattern_of(sculpt):
+    """The pattern copy made from `sculpt`, found by what it records.
+
+    Not by name. Blender renames on a clash, so a leftover object called Sculpt
+    makes the next one Sculpt.001 and its copy Sculpt.001_Pattern -- and a test
+    looking up a hardcoded name reports "no pattern was made" about a bake that
+    worked and said so. The copy stores foam_pattern_source for exactly this,
+    so using it also checks that the record is good for something.
+    """
+    return next((o for o in bpy.data.objects
+                 if o.get("foam_pattern_source") == sculpt.name), None)
 
 
 def _stroke_count(gp_obj):
@@ -235,7 +259,7 @@ def test_bake_makes_pieces_without_touching_inputs():
     strokes_before = _stroke_count(gp_obj)
 
     result = bpy.ops.object.foam_bake_pattern(snap_distance=0.002)
-    pattern = bpy.data.objects.get("Sculpt_Pattern")
+    pattern = _pattern_of(sculpt)
     islands, seams = _island_count(pattern) if pattern else (0, 0)
 
     return {
@@ -279,16 +303,15 @@ def test_rebake_replaces_the_copy():
     left another copy behind, the loop would come with a cleanup chore."""
     sculpt, gp_obj = _build_scene()
     for _ in range(3):
-        bpy.context.view_layer.objects.active = sculpt
         bpy.ops.object.foam_bake_pattern(snap_distance=0.002)
 
     patterns = [o for o in bpy.data.objects if o.get("foam_pattern_source")]
-    pattern = bpy.data.objects.get("Sculpt_Pattern")
+    pattern = _pattern_of(sculpt)
     islands, _seams = _island_count(pattern) if pattern else (0, 0)
 
-    # Baking with the pattern copy selected must be refused: it is an output,
+    # Naming the pattern copy as the sculpt must be refused: it is an output,
     # and cutting it again would compound the pattern into itself.
-    bpy.context.view_layer.objects.active = pattern
+    bpy.context.scene.foam_craft.pattern_source = pattern
     try:
         # Reports an error, which bpy.ops turns into an exception rather than a
         # CANCELLED return, so refusal has to be caught rather than inspected.
@@ -363,7 +386,7 @@ def _gp_from_strokes(strokes, name="PatternStrokes"):
     return gp_obj
 
 
-_LABEL = ["shape"]
+_LABEL = ["shape", ""]
 
 
 def _bake_strokes_on_sphere(strokes, segments=64, rings=32):
@@ -372,14 +395,18 @@ def _bake_strokes_on_sphere(strokes, segments=64, rings=32):
     bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=segments,
                                          ring_count=rings)
     sculpt = bpy.context.object
-    sculpt.name = "Sculpt"
+    # Whatever Blender called it. Renaming to a fixed "Sculpt" only invites the
+    # clash that _pattern_of already had to work around, and nothing here needs
+    # a particular name.
+    _LABEL[1] = sculpt.name
     gp_obj = _gp_from_strokes(strokes)
     bpy.context.scene.foam_craft.gp_object = gp_obj
-    bpy.context.view_layer.objects.active = sculpt
+    bpy.context.scene.foam_craft.pattern_source = sculpt
+    bpy.context.view_layer.objects.active = gp_obj
 
     shots = [_shot("%s_drawn" % _LABEL[0])]
     outcome = bpy.ops.object.foam_bake_pattern(snap_distance=0.004)
-    pattern = bpy.data.objects.get("Sculpt_Pattern")
+    pattern = _pattern_of(sculpt)
     if pattern is None:
         return {"failed": list(outcome), "shots": shots}, None
     shots.append(_shot("%s_cut" % _LABEL[0], show_seams_on=pattern))

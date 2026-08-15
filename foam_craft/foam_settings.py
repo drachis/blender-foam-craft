@@ -134,6 +134,14 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
         default=24, min=0, max=200)
 
     # --- Grease Pencil patterning
+    pattern_source: bpy.props.PointerProperty(
+        name="Sculpt", type=bpy.types.Object,
+        description="The mesh the pattern is cut from. Named explicitly rather "
+                    "than taken from the selection, because the object you have "
+                    "active while patterning is usually the Grease Pencil you "
+                    "were just drawing with",
+        poll=lambda self, obj: obj.type == 'MESH'
+        and not obj.get("foam_pattern_source"))
     gp_object: bpy.props.PointerProperty(
         name="Pattern Strokes", type=bpy.types.Object,
         description="Grease Pencil object holding the drawn piece boundaries. "
