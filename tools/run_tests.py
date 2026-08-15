@@ -57,6 +57,8 @@ import blender_bridge  # noqa: E402
 TEST_FILES = (
     # First, because it is the one that says whether the rest can be believed.
     "tests/test_determinism.py",
+    # Second, because everything else is built on this primitive.
+    "tests/test_edgenet_cut.py",
     "tests/test_gp_pattern.py",
     "tests/test_curvature_darts.py",
     "tests/test_bake_pattern.py",
