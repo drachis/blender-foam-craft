@@ -70,6 +70,36 @@ stroke-resampling pass invented to work around a walk that could not cross
 non-adjacent faces -- where walking the faces, which is what a knife does, was
 both exact and cheaper.
 
+**A "not available in Python" conclusion needs a test, not a reading.**
+The single most expensive error in this project was concluding that
+`BM_face_split_edgenet` -- the function the knife splits faces with -- was C-only
+and would need a patched Blender. It is exposed as
+**`bmesh.utils.face_split_edgenet(face, edgenet)`**, and it had been there all
+along. The whole cutter was then built on `face_split(face, va, vb, coords=[])`,
+which splits one face between two of its *own boundary vertices* along one
+polyline -- a signature that forces the caller to group the stroke into per-face
+runs, pair entry and exit vertices, walk the faces between non-adjacent points,
+and afterwards work out by counting which edges the split produced. Two sessions
+of defects all lived in that bookkeeping, and none of it was necessary.
+
+The earlier grep was not wrong about what it saw: `BM_face_split_edgenet` is
+absent from the bmesh *operator table*, which is where `bmesh.ops` comes from.
+It is bound in `bmesh_py_utils.cc` instead. So the failure was searching one
+layer and concluding about the whole API -- the same mistake this file already
+warns about, made again. The cheap check is a one-line probe in a live session,
+and any claim of the form "Blender cannot do X from Python" is worth that
+minute before any design is built on it.
+
+**Verify the fixture before chasing the code.** A defect that keeps coming back,
+where each fix works once and the next run disagrees, is a signal to doubt the
+measurement rather than the code. `bpy.ops.mesh.primitive_uv_sphere_add` returns
+identical vertices and a **different face table** on every call -- it finishes
+with a `remove_doubles` weld (`bmo_create_uvsphere_exec`) and welds do not order
+their output. Anything resolving a tie by face index therefore moved run to run.
+Renumbering is normal Blender behaviour, so the lasting fix was for the cutter to
+stop depending on numbering at all; `tests/test_determinism.py` now guards both
+halves -- same input twice, and the same mesh renumbered.
+
 The tell is inventing a *rule* -- a tolerance, a spacing, a fallback -- for a
 problem Blender solves daily. Go and read how it solves it.
 
@@ -255,8 +285,20 @@ Measured directly in a running session, not inferred from docs.
   (1536 faces) dissolves to 204 at 10° and 55 at 20°. **Note:** when driving it
   from Python you must call `depsgraph.update()` after changing `angle_limit`,
   or `evaluated_get()` returns the previous result and it looks like a no-op.
+- **`bmesh.utils.face_split_edgenet(face, edgenet)` exists** and is the knife's
+  own splitter (`BM_face_split_edgenet`, bound in `bmesh_py_utils.cc:646`). It
+  takes an **unordered sequence of edges** and returns the faces it made.
+  Measured in `tests/test_edgenet_cut.py`: four edges meeting at a hub split a
+  quad into 4 faces in one call; a bent net keeps every interior point exactly.
+  Constraints, from `bmesh_polygon_edgenet.cc:519-528`: no duplicate edges, and
+  **no edge that is already a loop of the face** -- the second is a `BLI_assert`
+  that compiles out of a release build and the binding does not check it.
+  A net that does not reach the face's boundary is **silently ignored**, not an
+  error. `BM_face_split_edgenet_connect_islands`, which the knife uses to bridge
+  those, is genuinely *not* exposed (checked across `python/` and the op table).
 - `mathutils.bvhtree.BVHTree.FromObject(obj, depsgraph).find_nearest(pt)` works
-  for closest-point reprojection.
+  for closest-point reprojection. Note it must break ties arbitrarily for a point
+  landing on an edge, where two faces are exactly as near.
 - `mesh.attributes.new(name, type='INT', domain='FACE')` works for per-face
   integer piece IDs.
 - Blender Labs MCP add-on socket protocol (port 9876): newline is not the
