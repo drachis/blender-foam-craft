@@ -286,10 +286,16 @@ def test_points_on_an_edge_land_on_the_same_face_every_time():
         bm = _sphere_bmesh()
         try:
             bvh = gp.BVHTree.FromBMesh(bm)
-            # The cutter's own assignment, not the raw tree. find_nearest is
+            # The cutter's own classification, not the raw tree. find_nearest is
             # entitled to break a tie however it likes -- what has to be stable
             # is the answer the cutter builds on top of it.
-            indices = [f.index for f, _ in gp._assign_faces(bvh, bm, bar)]
+            #
+            # Described geometrically, as a kind plus a rounded position, rather
+            # than by element index. Indices are exactly what must not matter
+            # here: welds and cuts renumber a mesh, so a check written against
+            # numbering would pass while the real property failed.
+            indices = [(h["kind"], tuple(round(c, 7) for c in h["loc"]))
+                       for h in gp._classify(bm, bvh, bar)]
             ties = 0
             for point in bar:
                 loc, _n, index, dist = bvh.find_nearest(point)

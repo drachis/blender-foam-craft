@@ -4,17 +4,35 @@ The pattern for a foam piece is drawn on the sculpt and has to become UV island
 boundaries. That means the drawn line must exist in the mesh as actual vertices
 and edges, because Blender's Unwrap reads seams from real mesh data.
 
-Blender has no single operator for this. What it does have, and what this module
-uses, are the two primitives its own Knife tool is built from:
+Blender has no single operator for this, but it does expose the two primitives
+its own Knife tool is built from, and this module uses both:
 
-    bmesh.utils.edge_split(edge, vert, fac)          -> a vertex on an edge
-    bmesh.utils.face_split(face, va, vb, coords=[])  -> a face split along a path
+    bmesh.utils.edge_split(edge, vert, fac)      -> a vertex on an edge
+    bmesh.utils.face_split_edgenet(face, edges)  -> a face split by an edge net
 
-``face_split``'s ``coords`` is the important one: it splits a face from one
-boundary vertex to another *through an arbitrary polyline*, so curvature inside
-a single face is reproduced exactly. Measured on 5.2 against an S-curve with
-seven inflections across one quad: two faces out, seven interior vertices, and
-zero deviation from the requested points.
+``face_split_edgenet`` is the one that matters. It takes an **unordered set of
+edges** and works out for itself which regions they enclose, which is exactly
+what the knife hands it (``BM_face_split_edgenet``, editmesh_knife.cc:2163).
+Measured in tests/test_edgenet_cut.py: four edges meeting at a hub split one
+quad into four faces in a single call, and a bent net keeps every interior point
+at the coordinate given.
+
+A correction worth keeping, because it cost more than any bug here. An earlier
+version of this file recorded that ``BM_face_split_edgenet`` was C-only and
+would need a patched Blender, and the cutter was built around that belief on
+``bmesh.utils.face_split(face, va, vb, coords=[])`` -- which splits one face
+between two of its own boundary vertices along one polyline. That signature
+forces the caller to group the stroke into per-face runs, pair up entry and exit
+vertices, walk the faces between non-adjacent points, and afterwards work out by
+counting which edges the split had produced. Every defect this module suffered
+lived in that bookkeeping rather than in the cutting, and none of it was ever
+necessary. The binding was there the whole time.
+
+The one genuine gap: a net that does not reach the face's boundary is silently
+ignored ("Regions defined by edges need to connect to the face, otherwise
+they're ignored as loose edges"). The knife bridges such islands with
+``BM_face_split_edgenet_connect_islands``, which really is not exposed, so a
+stroke drawn wholly inside one face is handled by refining that face instead.
 
 Routes that were tried and do not work, recorded so they are not retried:
 
@@ -30,9 +48,9 @@ Routes that were tried and do not work, recorded so they are not retried:
 - ``bpy.ops.mesh.knife_project`` cuts along the *view* direction, so no single
   viewpoint can reach a surface that wraps.
 
-What this module writes is only the bookkeeping: which face each stroke point
-falls in, and where the stroke crosses from one face to the next. Every change to
-the topology is made by Blender.
+What this module writes is only the bookkeeping: what each stroke point landed
+on, and where the stroke crosses from one face to the next. Every change to the
+topology is made by Blender.
 """
 
 import bmesh
@@ -188,115 +206,6 @@ def _weld_eps(face):
     return max(_ON_ELEMENT_EPS, shortest * _WELD_FRACTION)
 
 
-def _candidate_faces(face, loc):
-    """Every face that is equally entitled to claim this landed point.
-
-    One face when the point is loose in its interior; two when it sits on an
-    edge; all of them round a corner when it sits on a vertex. Returned in index
-    order so a caller with no better reason has a stable one to fall back on.
-
-    This is Blender's own knife classification -- snapped to a vertex, snapped
-    to an edge, or loose in a face -- rather than resolving everything to a
-    single face and hoping the choice does not matter.
-    """
-    for vert in face.verts:
-        if (loc - vert.co).length <= _ON_ELEMENT_EPS:
-            return sorted(vert.link_faces, key=lambda f: f.index)
-    for edge in face.edges:
-        a, b = edge.verts[0].co, edge.verts[1].co
-        span = b - a
-        denom = span.length_squared
-        if denom < 1e-18:
-            continue
-        t = max(0.0, min(1.0, (loc - a).dot(span) / denom))
-        if (loc - (a + span * t)).length <= _ON_ELEMENT_EPS:
-            if len(edge.link_faces) < 2:
-                return [face]
-            return sorted(edge.link_faces, key=lambda f: f.index)
-    return [face]
-
-
-def _assign_faces(bvh, bm, points):
-    """Which face does each stroke point sit on, and where exactly.
-
-    Returns [(face, surface_point)]. The stroke is drawn on the surface but its
-    points are only approximately on it, so each is pulled to the real nearest
-    point -- otherwise a point hovering microscopically above a face would land
-    the cut on the wrong side of an edge.
-
-    Where the landed point sits on a shared edge or corner it has no single
-    owning face, and the walk is carried forward instead: if the face the stroke
-    is already in is one of the candidates, it stays in it. This is the physical
-    reading -- a knife travelling along a crease does not hop from one side to
-    the other and back at every millimetre, it stays where it is until the line
-    actually leaves.
-
-    It matters more than tidiness. Choosing by a fixed rule instead -- lowest
-    index, say -- is stable but geometrically arbitrary, so it can name the face
-    on the *wrong side* of the direction of travel; the face walk then has to
-    cross back over the line it is following and gives up, and a whole stroke is
-    dropped. Measured: a circle of angular radius 0.9 on a sphere cut nothing at
-    all, reporting "could not follow the stroke between two points".
-
-    Index order remains the tie-break for the first point, and for any point
-    whose candidates do not include where the stroke already was.
-    """
-    bm.faces.ensure_lookup_table()
-    # The fallback tie-break is by face index, so the indices have to mean
-    # something. They go stale as soon as the cutter splits anything.
-    bm.faces.index_update()
-    out = []
-    previous = None
-    for position, p in enumerate(points):
-        loc, _nrm, index, _dist = bvh.find_nearest(p)
-        if index is None:
-            raise StrokeCutError(
-                "a stroke point found no surface; is the stroke near the mesh?")
-        loc = loc.copy()
-        candidates = _candidate_faces(bm.faces[index], loc)
-        if previous in candidates:
-            face = previous
-        elif len(candidates) == 1:
-            face = candidates[0]
-        else:
-            # Nothing to carry forward -- the first point of a stroke, or one
-            # that jumped. Pick the face the stroke is heading *into*, by which
-            # candidate centre the next drawn point is nearest.
-            #
-            # Geometric on purpose. Choosing the lowest-indexed candidate is
-            # stable for a given mesh but says nothing about direction, and the
-            # numbering it relies on is not something a mesh keeps: Blender's
-            # own sphere primitive finishes with a remove_doubles weld
-            # (bmo_create_uvsphere_exec), and welds and cuts both renumber. A
-            # cutter that reads differently after a renumber is reading the
-            # wrong thing.
-            # Measured to the face's nearest corner, not its centre. A cut made
-            # earlier in the same pattern leaves long thin faces behind, and a
-            # sliver's centre can sit far from every part of it that the stroke
-            # actually passes near -- which picked a face the stroke was leaving
-            # rather than entering, and stranded the walk two points later.
-            # The first key is geometric and does nearly all the work. The
-            # second is the face index, and it is a compromise worth naming:
-            # numbering is not something a mesh keeps, so relying on it means
-            # the same shape can cut differently after an edit that only welded
-            # or renumbered. Settling the remaining tie geometrically instead --
-            # by centre distance -- was tried and reintroduced a real defect,
-            # dropping the bar of a theta at radius 0.45 entirely, because two
-            # candidates round a corner can be genuinely indistinguishable by
-            # any local measure.
-            #
-            # tests/test_determinism.py::test_face_numbering_does_not_change_
-            # the_cut fails on exactly this, deliberately, rather than the gap
-            # going unrecorded.
-            ahead = points[position + 1] if position + 1 < len(points) else p
-            face = min(candidates,
-                       key=lambda f: (min((v.co - ahead).length
-                                          for v in f.verts), f.index))
-        previous = face
-        out.append((face, loc))
-    return out
-
-
 def _shared_edge(face_a, face_b):
     for edge in face_a.edges:
         if face_b in edge.link_faces:
@@ -344,213 +253,6 @@ def _crossing_on_edge(edge, p_from, p_to):
     if denom < 1e-18:
         return 0.0
     return max(0.0, min(1.0, (target - a).dot(span) / denom))
-
-
-def _vert_at(edge, fac, snap_distance):
-    """Put a vertex on `edge` at `fac`, or reuse an endpoint if it is already there.
-
-    The crossing cuts where it lands. An endpoint is reused only when splitting
-    would leave an edge with no length -- that is, when the crossing *is* the
-    corner to within rounding -- because a zero-length edge collapses the faces
-    around it into a spike no saw can follow.
-
-    Reuse used to be governed by the marker width instead, which is a much
-    larger number: on a unit sphere it pulled any crossing within 4mm of a
-    corner onto that corner, moving the cut off the drawn line to tidy up a
-    problem that only arises in the last few decimal places. Marker width is the
-    right tolerance for deciding that two separate lines were meant as one; it
-    is the wrong one for deciding where a single line crosses an edge.
-
-    `snap_distance` is still accepted so callers read the same, and is used only
-    as a ceiling -- a caller asking for no snapping at all still gets none.
-    """
-    a, b = edge.verts[0], edge.verts[1]
-    length = (b.co - a.co).length
-    if length > 1e-12 and snap_distance > 0.0:
-        weld = min(snap_distance, max(_ON_ELEMENT_EPS, length * _WELD_FRACTION))
-        if fac * length <= weld:
-            return a
-        if (1.0 - fac) * length <= weld:
-            return b
-    _new_edge, new_vert = bmesh.utils.edge_split(edge, a, fac)
-    return new_vert
-
-
-def _endpoint_vert(face, point, snap_distance):
-    """Resolve a stroke's loose end onto the boundary of the face it sits in.
-
-    A pattern maker crosses strokes deliberately, so that the pieces they bound
-    close up -- an end is normally drawn *onto* another line rather than left
-    hanging. Strokes are cut one after another, so by the time this one is being
-    cut, the line it ends on is already real mesh topology and the end is lying
-    on an ordinary edge. Splitting that edge turns the end into a boundary
-    vertex, which is exactly what ``face_split`` needs.
-
-    Returns None when the end really is hanging in open space, further than the
-    tolerance from anything. Nothing is invented to rescue it: a seam that
-    dead-ends mid-face separates no regions anyway, so extending it to the
-    nearest boundary would add a cut nobody drew and still achieve nothing.
-    """
-    if snap_distance <= 0.0:
-        return None
-    best_edge, best_fac, best_dist = None, 0.0, None
-    for edge in face.edges:
-        a, b = edge.verts[0].co, edge.verts[1].co
-        span = b - a
-        denom = span.length_squared
-        fac = 0.0 if denom < 1e-18 else \
-            max(0.0, min(1.0, (point - a).dot(span) / denom))
-        dist = (point - (a + span * fac)).length
-        if best_dist is None or dist < best_dist:
-            best_edge, best_fac, best_dist = edge, fac, dist
-    if best_edge is None or best_dist > snap_distance:
-        return None
-    return _vert_at(best_edge, best_fac, snap_distance)
-
-
-def _near_polyline(point, poly):
-    """Closest approach from a point to a polyline."""
-    best = None
-    for i in range(len(poly) - 1):
-        a, b = poly[i], poly[i + 1]
-        span = b - a
-        denom = span.length_squared
-        fac = 0.0 if denom < 1e-18 else             max(0.0, min(1.0, (point - a).dot(span) / denom))
-        gap = (point - (a + span * fac)).length
-        if best is None or gap < best:
-            best = gap
-    return best if best is not None else float("inf")
-
-
-def _existing_path(entry, exit_v, poly, snap_distance, limit=32):
-    """Edges already in the mesh that this run lies along, entry to exit.
-
-    A cut is a mixture: it reuses the geometry that is already where the line
-    goes, and cuts new geometry where none is. Drawing down a feature line, or
-    along an edge loop, is ordinary -- and cutting a parallel line a fraction
-    away from an existing edge leaves a hairline quad trapped between the two,
-    which is the collinear sliver this had been leaving behind. Worse, past a
-    certain length the run stopped cutting at all: a theta whose bar lay on a
-    sphere's equator gave 2 regions instead of 3 at radius 0.45.
-
-    Checked in **both** directions, which is what an earlier attempt missed.
-    Requiring only that the path stay near the stroke let a greedy walk wander
-    off down any chain of edges that happened to pass nearby and claim runs that
-    needed real cutting, which broke every shape test and was reverted. The
-    stroke must also stay near the path, or the drawn line is not what is being
-    reused.
-    """
-    if snap_distance <= 0.0 or len(poly) < 2:
-        return None
-
-    path, current, seen = [], entry, {entry}
-    for _ in range(limit):
-        if current is exit_v:
-            break
-        best_edge, best_gap = None, None
-        for edge in current.link_edges:
-            other = edge.other_vert(current)
-            if other in seen and other is not exit_v:
-                continue
-            gap = _near_polyline(other.co, poly)
-            if gap > snap_distance:
-                continue
-            if best_gap is None or gap < best_gap:
-                best_edge, best_gap = edge, gap
-        if best_edge is None:
-            return None
-        path.append(best_edge)
-        current = best_edge.other_vert(current)
-        seen.add(current)
-    if current is not exit_v or not path:
-        return None
-
-    # ...and now the other direction: every point the user drew has to be close
-    # to the edges being reused, or this is a detour rather than the same line.
-    walked = [entry.co]
-    node = entry
-    for edge in path:
-        node = edge.other_vert(node)
-        walked.append(node.co)
-    for point in poly:
-        if _near_polyline(point, walked) > snap_distance:
-            return None
-    return path
-
-
-def _run_follows_edge(interior, entry, exit_v, snap_distance):
-    """Is this run actually lying along the edge joining its two ends?
-
-    Two ends being neighbours is not enough on its own. A stroke can enter and
-    leave a face through vertices that happen to be adjacent while bowing well
-    away from the edge between them, and taking that edge instead would move the
-    cut by up to half an edge length -- measured at 0.061 on a grid whose edges
-    are 0.125, against 0.005 when the path is cut properly.
-
-    So the run only counts as following the edge when every point of it stays
-    within the snap tolerance of that edge. Same tolerance as everywhere else:
-    the width of the drawn line.
-    """
-    if not interior:
-        return True
-    if snap_distance <= 0.0:
-        return False
-    a, b = entry.co, exit_v.co
-    span = b - a
-    denom = span.length_squared
-    if denom < 1e-18:
-        return True
-    for point in interior:
-        fac = max(0.0, min(1.0, (point - a).dot(span) / denom))
-        if (point - (a + span * fac)).length > snap_distance:
-            return False
-    return True
-
-
-def _cut_path_edges(face, entry, exit_v, n_interior):
-    """The edges face_split just created, walked off the new face's boundary.
-
-    The new face is bounded by the cut on one side and by part of the original
-    outline on the other, and both run between the same two vertices. They are
-    told apart by length: the cut carries exactly the interior points that were
-    asked for, so it is ``n_interior + 1`` edges long.
-
-    Reading the path off the face beats diffing edge sets before and after. An
-    earlier version took ``entry.link_faces[0].edges``, which picks an arbitrary
-    neighbouring face and silently missed parts of the cut -- the seam came out
-    with loose ends and the sphere stayed a single island.
-    """
-    start = next((l for l in face.loops if l.vert is entry), None)
-    if start is None:
-        raise StrokeCutError("split face does not contain the entry vertex")
-
-    want = n_interior + 1
-    limit = len(face.loops)
-
-    # loop.edge joins loop.vert to link_loop_next.vert, so walking forward the
-    # edge is read before stepping, and walking back it is read after.
-    forward, backward = [], []
-    loop = start
-    for _ in range(limit):
-        forward.append(loop.edge)
-        loop = loop.link_loop_next
-        if loop.vert is exit_v:
-            break
-    if len(forward) == want:
-        return forward
-
-    loop = start
-    for _ in range(limit):
-        loop = loop.link_loop_prev
-        backward.append(loop.edge)
-        if loop.vert is exit_v:
-            break
-    if len(backward) == want:
-        return backward
-
-    raise StrokeCutError(
-        "could not trace the cut across the split face; wanted %d edges, "
-        "found %d forward and %d back" % (want, len(forward), len(backward)))
 
 
 def on_surface_runs(bm, points, tolerance):
