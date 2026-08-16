@@ -3,6 +3,15 @@
 A design note. The cutter described under "What is built" now exists; the rest
 is still design.
 
+## Known defect: seam gaps at crossings and junctions
+
+Root-caused and reproduced with isolated `bmesh` experiments, but not yet
+fixed. Full writeup, including the `face_split_edgenet` failure mode and the
+two code paths that trigger it, lives in
+[RESEARCH_gp_pattern_seam_gaps.md](RESEARCH_gp_pattern_seam_gaps.md) rather
+than here, to keep this document to design decisions and move dated
+investigation detail into its own research notes.
+
 ## What is built (2026-08-11)
 
 `foam_craft/foam_gp_pattern.py` cuts a stroke into a mesh as real topology and

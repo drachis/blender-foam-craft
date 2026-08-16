@@ -35,6 +35,18 @@ the understanding changed, which is usually the more valuable half.
     python tools/blender_bridge.py --port 9885 < tests/test_gp_pattern.py
     python tools/blender_bridge.py --port 9885 < tests/test_curvature_darts.py
 
+**Investigation findings go in `RESEARCH_<slug>.md`, never only in chat.**
+The same reasoning as the rule above, applied to prose instead of code: a
+root-cause hunt that read source and ran live experiments against a running
+Blender to confirm or rule out a hypothesis is expensive, and a chat
+transcript is not a place a future session will think to look. Use the
+`research-doc` skill (`.claude/skills/research-doc/`) whenever a session does
+that kind of non-trivial context-gathering — it should trigger on its own,
+not only when asked. One file per investigated question (not one per
+feature), diagnosis only (symptom, root cause, evidence, open questions) —
+never a decision or a plan, which belongs in a `DESIGN_` doc instead. See
+"Research notes" below for the index of what already exists.
+
 Two rules the suite already enforces, both learned the hard way:
 
 - **State both bounds.** A check that can only fail in one direction is not a
@@ -296,6 +308,13 @@ Measured directly in a running session, not inferred from docs.
   A net that does not reach the face's boundary is **silently ignored**, not an
   error. `BM_face_split_edgenet_connect_islands`, which the knife uses to bridge
   those, is genuinely *not* exposed (checked across `python/` and the op table).
+  **Refinement (2026-08-16):** "silently ignored" is per-face, not per-edge — a
+  single malformed edge anywhere in one face's net (a spur that reaches the
+  boundary at only one end, or two net edges crossing without a shared vertex)
+  makes the call return nothing **for the whole face**, discarding otherwise-
+  valid cuts that happened to share it. Root cause of the grease-pencil
+  cutter's seam gaps at crossings/junctions; see
+  [RESEARCH_gp_pattern_seam_gaps.md](RESEARCH_gp_pattern_seam_gaps.md).
 - `mathutils.bvhtree.BVHTree.FromObject(obj, depsgraph).find_nearest(pt)` works
   for closest-point reprojection. Note it must break ties arbitrarily for a point
   landing on an edge, where two faces are exactly as near.
@@ -314,6 +333,20 @@ Measured directly in a running session, not inferred from docs.
   "Material Color") *and* the Principled BSDF node's `Base Color` input (used by
   Material Preview and Rendered). `diffuse_color` alone is not enough, and
   turning nodes off to force it is not an option.
+
+## Research notes
+
+Diagnostic write-ups live in their own `RESEARCH_<slug>.md` files at the repo
+root rather than inline here or in a `DESIGN_` doc — see the `research-doc`
+skill and the "Investigation findings" rule above for the convention. Index of
+what exists so far:
+
+- [RESEARCH_gp_pattern_seam_gaps.md](RESEARCH_gp_pattern_seam_gaps.md) — why
+  the grease-pencil cutter's seams show gaps at crossings and junctions:
+  `bmesh.utils.face_split_edgenet` discards a whole face's split when any one
+  edge in its net is malformed, and two code paths in `foam_gp_pattern.py`
+  (order-dependent T-junction snapping, undetected self-crossing strokes)
+  produce exactly that shape. Root cause confirmed; no fix applied yet.
 
 ## Good test shapes
 - **Torus, 12 major x 5 minor** — the craftability reference case: it needs
