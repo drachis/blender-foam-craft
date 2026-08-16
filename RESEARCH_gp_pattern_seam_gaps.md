@@ -268,7 +268,7 @@ not density"), so the graph can be built at the same granularity the drawn
 stroke was sampled at, same as the knife builds it at mouse-move
 granularity.
 
-## Implementation plan (agreed with the user, not yet built)
+## Implementation plan (agreed with the user; items 1-3 and 5 built and verified below, item 4 still open)
 
 1. **A shared cut-graph, not a per-stroke one.** Give this module its own
    `KnifeVert`/`KnifeEdge`-equivalent: plain Python objects (or parallel
@@ -329,6 +329,97 @@ This is a substantial rewrite of `cut_stroke`/`cut_strokes`/`_bridge`/
 user has explicitly authorized this ("feel free to tear it apart to better
 serve the end goal... commit regularly in case something goes wrong, but
 risks can be taken to make it work").
+
+## Implemented and verified (2026-08-16)
+
+Items 1-3 and 5 above are built: `_CutGraph` (`foam_gp_pattern.py`, near
+`_segment_crossing`), `_add_stroke_to_graph` (feeds one stroke's points into
+a graph shared across the whole bake), `_realise_graph` (the single
+batched-per-face conversion to real `BMesh`, mirroring `knife_make_cuts`),
+and a warning logged whenever `face_split_edgenet` returns empty on a
+non-empty net. `cut_stroke` (singular) still exists as a
+single-stroke convenience wrapper (its own fresh graph, realised
+immediately) for backward compatibility with existing single-stroke
+callers/tests -- it fixes self-crossing but, since it does not share a graph
+with any other call, cannot fix a cross-stroke junction on its own. Only
+`cut_strokes` (plural) gets the full fix, by building one graph across every
+stroke before realising anything.
+
+Verified: [tests/test_gp_junctions.py](tests/test_gp_junctions.py) (the
+self-crossing and order-independent-T-junction cases from earlier in this
+document) now pass, as does the full pre-existing suite
+(`test_gp_pattern.py`, `test_edgenet_cut.py`, `test_determinism.py`).
+
+**Three further defects surfaced only once real multi-stroke data was run
+through the new graph**, each caught by an existing test rather than
+inferred, and each worth recording because the failure mode is easy to
+reintroduce:
+
+1. **Crossing search scoped to the wrong face.** The first version of
+   `_CutGraph.connect` searched for a crossing only within the *home face*
+   chosen for the current segment (`min(shared, key=index)`). Two strokes
+   whose hits both touch several shared faces at once (e.g. both landing on
+   an existing vertex) can each independently pick a *different* valid home
+   face, and if the genuine crossing lives under the face the *other*
+   stroke picked, it is never found. Fixed by scanning the *union* of both
+   endpoints' faces (`scan_faces`) while still using the single `min`-index
+   face as the new edge's own home. Caught by
+   `test_theta_cuts_identically_every_time`
+   (tests/test_determinism.py): a circle and a bar that visibly cross in
+   the drawing came out with the bar never actually meeting the circle.
+2. **Same-original-edge segments treated as a crossing candidate.** A
+   stroke drawn along an existing edge loop (the theta test's bar, sitting
+   exactly on a UV sphere's equator) produces almost entirely collinear
+   segments -- and testing a collinear segment for a "crossing" against
+   another stroke that happens to touch the same two faces produced a
+   spurious near-parallel intersection, moving or losing the real crossing.
+   Fixed by `_locally_trivial`: skip the crossing search outright when both
+   hits already name the same real edge or vertex, or when one hit is a
+   real vertex and the other stays inside that vertex's own face fan.
+3. **The same-edge shortcut skipping over a third point.** Fixing #2 by
+   connecting two same-edge hits *directly* introduced a new defect: if a
+   *different* stroke's point sits between them on that same original
+   edge, the direct edge skips straight over it, slicing a sliver triangle
+   off the corner and orphaning whatever was attached to the skipped point
+   (traced by hand to a single missing vertex in this session --
+   `test_face_split_follows_a_polyline`-style isolated `bmesh` replay of one
+   face's `face_split_edgenet` call showed the "north" side of a junction
+   simply absent from either resulting face). Fixed by *not* connecting
+   same-edge hits directly at all: `_realise_graph`'s per-edge realisation
+   already builds one connected chain through every hit on an edge, from
+   any stroke, correctly ordered by `fac` (`same_edge_chain`), so the
+   graph-building step just needs to add nothing and let that handle it.
+4. **Set-iteration order in `_CutGraph.add`/`connect`.** Both scan a set of
+   `BMFace` objects (`_hit_faces` returns a `set`), and BMesh elements hash
+   by identity -- the project's own recurring lesson (`CLAUDE.md`, "Rebuild
+   scene state for every measurement"). When more than one candidate is
+   within reach, *which one is found first* must not depend on a hash
+   order that changes between runs or between differently-numbered
+   meshes. Fixed by sorting both iterations by `face.index`. This resolved
+   `test_theta_cuts_identically_every_time`'s "every_run_agrees" check
+   completely (five identical runs now agree exactly).
+
+**Known remaining residual, not yet fixed:** in
+`test_face_numbering_does_not_change_the_cut`, the exact same geometry
+presented with three different face orderings (as-built, sorted, reversed)
+now agrees on regions, region sizes, vertex count and face count -- but the
+raw `seam_edges` count differs by 2 between "as-built" and the other two
+(174 vs. 176), with no topological difference. Fixing #4 above made every
+*repeated* run of one numbering agree exactly, but a genuinely *different*
+numbering still changes `bvh.find_nearest`'s tie-break on points sitting
+exactly on an edge (the same tie this project has hit before, see
+`test_points_on_an_edge_land_on_the_same_face_every_time`'s own docstring),
+which can shift a handful of `_realise_on_edge` weld decisions by a hair.
+Given this is an extreme, adversarial construction (a stroke drawn exactly
+along an existing edge loop, crossed by another stroke at a point also
+exactly on that edge) and has zero effect on the actual seam/region
+structure, it was left as a known residual rather than chased further in
+this session -- worth a fresh look if it recurs somewhere less contrived.
+
+**Not yet built:** item 4, the near-miss junction extension heuristic (both
+head and tail of an open stroke). This is genuinely new logic with no knife
+equivalent to check against, greenlit by the user but not yet designed in
+enough detail to implement -- see the open items in the plan above.
 
 ## Diagnostic script (the "17 dangling" trace above)
 

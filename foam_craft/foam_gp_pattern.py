@@ -51,6 +51,26 @@ Routes that were tried and do not work, recorded so they are not retried:
 What this module writes is only the bookkeeping: what each stroke point landed
 on, and where the stroke crosses from one face to the next. Every change to the
 topology is made by Blender.
+
+A second correction, recorded in full in RESEARCH_gp_pattern_seam_gaps.md.
+``face_split_edgenet`` requires the edges handed to it for one face to form a
+*valid* planar net -- every edge reaching the boundary at both ends, no two
+edges crossing without a shared vertex -- and silently returns nothing **for
+the whole face** if that is violated anywhere in it, not just for the
+offending edge. Cutting one stroke's whole batch of hits at once, or a whole
+face's accumulated hits at once, could hand it exactly that shape: a stroke
+crossing its own earlier path, or a stroke's end snapped onto a point another
+stroke had not been cut through yet. Checked against
+``editmesh_knife.cc`` rather than invented a fix: the real knife never
+constructs a malformed net in the first place. During interaction it only
+ever extends its own lightweight ``KnifeVert``/``KnifeEdge`` graph -- no
+``BMesh`` mutation at all -- testing each new segment against *everything the
+graph already has*, from this stroke or a different one, so a later segment
+landing back on an earlier point reuses it instead of creating a disconnected
+one. Only once, at confirm, is the finished graph converted to real topology,
+batched per face (``knife_make_cuts``). ``_CutGraph`` below is this module's
+version of that graph: built up across every stroke in one bake, resolved
+before anything touches ``bmesh``, realised once.
 """
 
 import bmesh
@@ -359,6 +379,55 @@ def _hit_faces(hit):
     return set(hit["elem"].link_faces)
 
 
+def _locally_trivial(hit_a, hit_b):
+    """"same_edge", "vert_fan", or None: whether the segment between these
+    two hits cannot need a crossing test, and why.
+
+    Two shapes, handled differently by the caller because only one of them
+    is safe to connect directly:
+
+    "same_edge" -- both hits name the *same* existing edge, most commonly a
+    stroke walking along an edge loop (drawn along an existing seam or
+    crease). This does **not** mean "connect them directly": a *different*
+    stroke can independently touch the very same edge at a point that lies
+    *between* these two along it, and a direct edge here would skip straight
+    over that point rather than through it, cutting a sliver off the corner.
+    `_realise_graph`'s per-edge chain (`same_edge_chain`) already connects
+    every hit on one edge in the correct order regardless of which stroke
+    contributed which point, so the caller should add nothing here and let
+    that handle it. Measured need for the "don't connect directly" half:
+    `test_theta_cuts_identically_every_time` (tests/test_determinism.py) --
+    a circle's own crossing point sat between two of a second stroke's
+    points on that same edge, and connecting those two directly (skipping
+    over the crossing point) sliced a sliver triangle off the corner and
+    orphaned the circle's own approach into it.
+
+    "vert_fan" -- one hit is an existing vertex, and the other stays inside
+    that vertex's own edge/face fan: a curve passing close enough to an
+    existing corner to snap onto it, with a drawn point on either side, not
+    a crossing with anything else. This one *is* safe to connect directly --
+    there is no shared "same original edge" for a different stroke to also
+    be occupying a position along.
+
+    Either way, the point is to skip the crossing search: two points that
+    already sit on the same original edge have no well-defined "crossing" for
+    `_segment_crossing` to find (collinear segments overlap, they do not
+    cross), and testing every such trivial step against unrelated nearby
+    strokes was found to produce spurious near-parallel "intersections" --
+    moving a real crossing, or losing it, rather than finding nothing.
+    """
+    if hit_a["kind"] != FACE and hit_b["kind"] != FACE \
+            and hit_a["kind"] == hit_b["kind"] and hit_a["elem"] is hit_b["elem"]:
+        return "same_edge"
+    vert_hit = hit_a if hit_a["kind"] == VERT else \
+        hit_b if hit_b["kind"] == VERT else None
+    if vert_hit is not None:
+        other = hit_b if vert_hit is hit_a else hit_a
+        if _hit_faces(other) <= set(vert_hit["elem"].link_faces):
+            return "vert_fan"
+    return None
+
+
 def _bridge(hits):
     """Insert the crossings between points that share no face.
 
@@ -459,86 +528,353 @@ def _realise_on_edge(edge, targets, weld):
     return found
 
 
-def _realise(bm, hits, snap_distance):
-    """Turn every hit into a real BMVert. Returns a list aligned to `hits`."""
+def _segment_crossing(p1, p2, q1, q2, tol):
+    """Where segment p1-p2 crosses segment q1-q2, strictly in the interior of
+    both -- an endpoint-to-endpoint touch is handled separately, by graph
+    vertex reuse, so this only has to find a genuine crossing in the middle.
+
+    The segments live on a curved surface, so ``intersect_line_line`` gives
+    each its own closest-approach point rather than one shared point; they
+    count as crossing when those two points land within `tol` of each other.
+    Returns a location, or None.
+    """
+    hit = intersect_line_line(p1, p2, q1, q2)
+    if hit is None:
+        return None
+    on_p, on_q = hit
+    if (on_p - on_q).length > tol:
+        return None
+    span_p = p2 - p1
+    denom_p = span_p.length_squared
+    if denom_p < 1e-18:
+        return None
+    t_p = (on_p - p1).dot(span_p) / denom_p
+    span_q = q2 - q1
+    denom_q = span_q.length_squared
+    if denom_q < 1e-18:
+        return None
+    t_q = (on_q - q1).dot(span_q) / denom_q
+    margin = 1e-4
+    if not (margin < t_p < 1.0 - margin):
+        return None
+    if not (margin < t_q < 1.0 - margin):
+        return None
+    return (on_p + on_q) * 0.5
+
+
+class _CutGraph:
+    """This module's own version of the knife's ``KnifeVert``/``KnifeEdge``
+    graph (see the module docstring and RESEARCH_gp_pattern_seam_gaps.md).
+
+    Accumulates cut points and the edges joining them across as many strokes
+    as are fed into it via :func:`_add_stroke_to_graph`, resolving reuse (a
+    later point landing on one already placed, whether from this stroke or a
+    different one) and genuine crossings (two segments meeting without
+    sharing a drawn point) at this abstract level, entirely in Python.
+    Nothing here touches ``bmesh`` -- that happens once, in
+    :func:`_realise_graph`, after every stroke has had its say.
+    """
+
+    def __init__(self):
+        self.hits = []          # index -> hit dict (kind, elem, fac, loc, face)
+        self.edges = []         # index -> [i, j] into self.hits (mutable pair)
+        self.edge_face = []     # index -> the one face this edge belongs to
+        self._by_key = {}       # (kind, id(elem), fac?) -> hit index, for reuse
+        self.face_hits = {}     # BMFace -> [hit indices] landing in/on it
+        self.face_edges = {}    # BMFace -> [edge indices] whose home is it
+
+    @staticmethod
+    def _key(hit):
+        # VERT/EDGE hits are already anchored to a specific, identifiable
+        # piece of the original mesh, so two hits naming the same one are the
+        # same graph vertex by construction -- no distance test needed, and
+        # this is the common case (most of a drawn line's points land on
+        # ordinary edge crossings). FACE hits have no such anchor and fall
+        # through to the distance-based scan in `add`.
+        if hit["kind"] == VERT:
+            return (VERT, id(hit["elem"]))
+        if hit["kind"] == EDGE:
+            return (EDGE, id(hit["elem"]), round(hit["fac"], 7))
+        return None
+
+    def add(self, hit, weld):
+        """Return the graph index for `hit`, reusing an existing vertex that
+        already names the same mesh element, or sits within `weld` of one
+        placed earlier in a face `hit` also touches."""
+        key = self._key(hit)
+        if key is not None and key in self._by_key:
+            return self._by_key[key]
+        # Sorted, not iterated as the set `_hit_faces` returns: BMesh
+        # elements hash by identity, so a set of them comes out in a
+        # different order on every run, and when more than one existing
+        # point is within `weld` the *first found* is the one reused --
+        # letting that vary by run number renumbers the same mesh
+        # differently each time (this project's own recurring lesson, see
+        # CLAUDE.md's "Rebuild scene state for every measurement").
+        for face in sorted(_hit_faces(hit), key=lambda f: f.index):
+            for index in self.face_hits.get(face, ()):
+                if (self.hits[index]["loc"] - hit["loc"]).length <= weld:
+                    if key is not None:
+                        self._by_key[key] = index
+                    return index
+        index = len(self.hits)
+        self.hits.append(hit)
+        if key is not None:
+            self._by_key[key] = index
+        for face in _hit_faces(hit):
+            self.face_hits.setdefault(face, []).append(index)
+        return index
+
+    def connect(self, i, j, home_face, scan_faces, weld):
+        """Join graph vertices `i` and `j`, splicing in a real crossing
+        against anything already placed nearby first.
+
+        `home_face` is where the plain edge `i`-`j` belongs if nothing
+        crosses it. `scan_faces` is the *full* set of faces either endpoint
+        touches, not just `home_face` -- searched for a crossing, because two
+        strokes can each pick a different (but each individually valid) home
+        face for hits that touch several faces at once, e.g. two hits that
+        are both existing mesh vertices. Scanning only `home_face` missed a
+        crossing whenever the two strokes disagreed on which shared face was
+        "the" one, which is what `test_theta_cuts_identically_every_time`
+        caught: a circle and a bar that visibly cross in the drawing came out
+        with the bar's cut never actually meeting the circle's.
+
+        This is the step that makes a stroke crossing itself, or a different
+        stroke, resolve the same way regardless of which one reached this
+        area first: the new segment is tested against the accumulated graph,
+        not just against the raw mesh, exactly as the knife tests a new
+        mouse segment against its own ``kfvs``/``kfes`` (editmesh_knife.cc,
+        around line 2900) rather than only against real geometry.
+        """
+        current = i
+        for _ in range(8):        # bounded: a real stroke crosses itself a
+            if current == j:      # handful of times per face, not endlessly
+                return
+            found = None
+            # Sorted for the same reason as in `add`: `scan_faces` is a set
+            # of BMesh elements, and which candidate crossing is found
+            # *first* among several must not depend on identity-hash order.
+            for f in sorted(scan_faces, key=lambda face: face.index):
+                for edge_index in self.face_edges.get(f, ()):
+                    a, b = self.edges[edge_index]
+                    if current in (a, b) or j in (a, b):
+                        continue
+                    loc = _segment_crossing(
+                        self.hits[current]["loc"], self.hits[j]["loc"],
+                        self.hits[a]["loc"], self.hits[b]["loc"], weld)
+                    if loc is not None:
+                        found = (edge_index, a, b, loc, self.edge_face[edge_index])
+                        break
+                if found is not None:
+                    break
+            if found is None:
+                self._add_edge(current, j, home_face)
+                return
+            edge_index, a, b, loc, cross_face = found
+            k = self.add({"kind": FACE, "elem": cross_face, "fac": 0.0,
+                         "loc": loc, "face": cross_face}, weld)
+            if k in (current, j, a, b):
+                # Numerically landed on a point already there -- connect
+                # straight through it rather than loop on the same crossing.
+                self._add_edge(current, k, home_face)
+                current = k
+                continue
+            self.edges[edge_index] = [a, k]           # splice the old edge...
+            self._add_edge(k, b, cross_face)           # ...into two.
+            self._add_edge(current, k, cross_face)
+            current = k
+        self._add_edge(current, j, home_face)
+
+    def _add_edge(self, i, j, face):
+        if i == j:
+            return
+        index = len(self.edges)
+        self.edges.append([i, j])
+        self.edge_face.append(face)
+        self.face_edges.setdefault(face, []).append(index)
+
+
+def _add_stroke_to_graph(bm, bvh, graph, points, cyclic, snap_distance):
+    """Classify and bridge one stroke's points, then fold every hit and
+    segment into `graph` -- reusing or crossing whatever earlier strokes (or
+    this stroke's own earlier points) already placed there. `bm` is read but
+    never written; nothing here creates real topology.
+    """
+    hits = _classify(bm, bvh, points)
+    hits, missed = _bridge(hits)
+    if missed:
+        _log.warning(foam_log.summary(
+            "stroke_gaps", segments=missed, points=len(points)))
+
+    def weld_for(hit):
+        face = hit["face"] if hit["kind"] != FACE else hit["elem"]
+        natural = _weld_eps(face)
+        return min(snap_distance, natural) if snap_distance > 0.0 else natural
+
+    indices = [graph.add(hit, weld_for(hit)) for hit in hits]
+
+    pairs = list(zip(range(len(hits)), range(1, len(hits))))
+    if cyclic and len(hits) > 2:
+        pairs.append((len(hits) - 1, 0))
+    for p, q in pairs:
+        a, b = indices[p], indices[q]
+        if a == b:
+            continue
+        shared = _hit_faces(hits[p]) & _hit_faces(hits[q])
+        if not shared:
+            continue
+        home_face = min(shared, key=lambda f: f.index)
+
+        # See `_locally_trivial`: both ends already anchored to real
+        # topology, and neither reaches beyond what the other already owns,
+        # so there is nothing a crossing search could find that is not
+        # already accounted for -- and running it anyway is how this went
+        # wrong (`test_theta_...` in tests/test_determinism.py).
+        trivial = _locally_trivial(hits[p], hits[q])
+        if trivial == "vert_fan":
+            graph._add_edge(a, b, home_face)
+            continue
+        if trivial == "same_edge":
+            # Deliberately no edge added here -- see `_locally_trivial`.
+            # `_realise_graph`'s per-edge chain connects every hit on this
+            # edge, from every stroke, in the correct order; adding a direct
+            # edge here too would risk skipping over a point a different
+            # stroke placed between these two along the very same edge.
+            continue
+
+        scan_faces = _hit_faces(hits[p]) | _hit_faces(hits[q])
+        graph.connect(a, b, home_face, scan_faces, weld_for(hits[p]))
+    return indices
+
+
+def _refine_if_wholly_inside(bm, bvh, points):
+    """If `points` never leaves a single face, subdivide until it does (or
+    give up after `_MAX_REFINE` passes). Returns the current `bvh` -- rebuilt
+    if a subdivision happened, unchanged otherwise.
+
+    A closed stroke lying wholly inside one face reaches no boundary, and a
+    net that does not reach the boundary is silently ignored -- measured in
+    tests/test_edgenet_cut.py, and stated in the binding's own docs. The
+    knife bridges the island with `BM_face_split_edgenet_connect_islands`,
+    which is not exposed to Python, so the face is refined until the stroke
+    crosses an edge instead. Refining where a line was drawn is what a
+    modeller would do by hand, and it adds geometry only inside the face
+    already involved.
+    """
+    hits = _classify(bm, bvh, points)
+
+    def _all_inside():
+        return (not any(h["kind"] != FACE for h in hits)
+                and len({h["face"] for h in hits}) == 1)
+
+    refined = 0
+    while refined < _MAX_REFINE and _all_inside():
+        face = hits[0]["face"]
+        bmesh.ops.subdivide_edges(bm, edges=list(face.edges), cuts=3,
+                                  use_grid_fill=True)
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+        bvh = BVHTree.FromBMesh(bm)
+        hits = _classify(bm, bvh, points)
+        refined += 1
+    if _all_inside():
+        raise StrokeCutError(
+            "the stroke stays inside a single face after %d subdivisions; it "
+            "is far smaller than the mesh it is drawn on" % refined)
+    return bvh
+
+
+def _realise_graph(bm, graph, snap_distance):
+    """Convert the finished graph into real `BMesh` topology, once, batched
+    per face -- mirroring `knife_make_cuts`. Returns (new_edges, open_ends).
+    """
+    # Realise every hit into a BMVert. Hits on the same original edge are
+    # grouped and split in order along it in one pass, via `_realise_on_edge`
+    # -- unchanged from before this rewrite, just now working over every
+    # stroke's edge hits at once instead of one stroke's.
     by_edge = {}
-    for index, hit in enumerate(hits):
+    for index, hit in enumerate(graph.hits):
         if hit["kind"] == EDGE:
             by_edge.setdefault(hit["elem"], []).append((index, hit["fac"]))
 
-    verts = [None] * len(hits)
+    verts = [None] * len(graph.hits)
+    # Consecutive real edges between two touches on the *same* original edge
+    # -- see below.
+    same_edge_chain = []
     for edge, targets in by_edge.items():
         if not edge.is_valid:
             continue
         natural = edge.calc_length() * _WELD_FRACTION
         weld = min(snap_distance, max(_ON_ELEMENT_EPS, natural)) \
             if snap_distance > 0.0 else natural
-        for index, vert in _realise_on_edge(
-                edge, sorted(targets, key=lambda t: t[1]), weld).items():
+        ordered = sorted(targets, key=lambda t: t[1])
+        realised = _realise_on_edge(edge, ordered, weld)
+        for index, vert in realised.items():
             verts[index] = vert
 
-    for index, hit in enumerate(hits):
+        # Whatever stroke each of these came from, they all sit on the same
+        # original edge, and `_realise_on_edge` splits it into one connected
+        # chain to hold them, in order -- regardless of which stroke
+        # contributed which point. The stretch between two touches belongs
+        # to the seam the same way an ordinary crossing does; it just could
+        # not be *found* as one, because two points on the very same
+        # straight edge have no well-defined crossing for
+        # `_segment_crossing` to locate (collinear segments do not cross,
+        # they overlap). Two different strokes independently landing on the
+        # same original edge -- a stroke crossing another almost exactly
+        # along an existing edge loop, e.g. a pattern drawn near a UV
+        # sphere's equator -- hits exactly this. Measured in
+        # `test_theta_cuts_identically_every_time`
+        # (tests/test_determinism.py): the span between a circle's own
+        # crossing point and a second stroke's nearest point on that same
+        # edge was never marked seam by either stroke's own connectivity on
+        # its own, leaving one unsealed edge exactly where the two were
+        # supposed to meet -- which is all it takes to leak an otherwise
+        # fully enclosed region into its neighbour.
+        chain_verts = [realised[index] for index, _fac in ordered]
+        for va, vb in zip(chain_verts, chain_verts[1:]):
+            if va is vb or not (va.is_valid and vb.is_valid):
+                continue
+            chain_edge = bm.edges.get((va, vb))
+            if chain_edge is not None:
+                same_edge_chain.append(chain_edge)
+
+    for index, hit in enumerate(graph.hits):
         if verts[index] is not None:
             continue
         if hit["kind"] == VERT:
             verts[index] = hit["elem"]
         else:
             verts[index] = bm.verts.new(hit["loc"])
-    return verts
 
+    # Join every graph edge, reusing existing bmesh topology where it
+    # already connects two of these verts -- the knife does the same
+    # (BM_edge_exists, editmesh_knife.cc:2098). Grouped by the face each
+    # edge was registered under while the graph was built, which is the
+    # `fhash` pass the knife itself does (editmesh_knife.cc:2219): one call
+    # per face with all of that face's edges at once.
+    by_face, reused, seen_pairs = {}, [], set()
+    for face, edge_indices in graph.face_edges.items():
+        made = []
+        for edge_index in edge_indices:
+            i, j = graph.edges[edge_index]
+            va, vb = verts[i], verts[j]
+            if va is vb or not (va.is_valid and vb.is_valid):
+                continue
+            pair = (id(va), id(vb)) if id(va) < id(vb) else (id(vb), id(va))
+            if pair in seen_pairs:
+                continue
+            existing = bm.edges.get((va, vb))
+            if existing is not None:
+                seen_pairs.add(pair)
+                reused.append(existing)
+                continue
+            seen_pairs.add(pair)
+            made.append(bm.edges.new((va, vb)))
+        if made:
+            by_face[face] = made
 
-def _net_edges(bm, hits, verts, cyclic):
-    """Join consecutive points into edges. Returns ([(edge, face)], reused).
-
-    An existing edge between two consecutive points is reused rather than
-    duplicated -- the knife does the same (BM_edge_exists,
-    editmesh_knife.cc:2098) -- which is the whole of what `_existing_path` was
-    written to do, for free, and without a greedy search that can go wrong.
-
-    An edge already belonging to the face being split must not go into that
-    face's net. bmesh_polygon_edgenet.cc:519-528 asserts against it, and the
-    assert compiles out of a release build, so nothing would report a mistake.
-    """
-    pairs = list(zip(range(len(verts)), range(1, len(verts))))
-    if cyclic and len(verts) > 2:
-        pairs.append((len(verts) - 1, 0))
-
-    net, reused, seen = [], [], set()
-    for i, j in pairs:
-        va, vb = verts[i], verts[j]
-        if va is vb or not (va.is_valid and vb.is_valid):
-            continue
-        existing = bm.edges.get((va, vb))
-        if existing is not None:
-            # Already topology. It is part of the cut, but handing it to
-            # face_split_edgenet as part of that face's net is forbidden.
-            reused.append(existing)
-            continue
-        shared = _hit_faces(hits[i]) & _hit_faces(hits[j])
-        if not shared:
-            continue
-        face = min(shared, key=lambda f: f.index)
-        edge = bm.edges.new((va, vb))
-        if edge in seen:
-            continue
-        seen.add(edge)
-        net.append((edge, face))
-    return net, reused
-
-
-def _split_faces(bm, net):
-    """Hand each face its share of the net and let Blender split it.
-
-    One call per face with all of that face's edges at once, exactly as the
-    knife groups them before splitting (the `fhash` pass,
-    editmesh_knife.cc:2219). Splitting one face does not invalidate another, so
-    no ordering between faces is needed.
-    """
-    by_face = {}
-    for edge, face in net:
-        by_face.setdefault(face, []).append(edge)
-
-    made_total = 0
     for face, edges in by_face.items():
         if not face.is_valid:
             continue
@@ -553,8 +889,46 @@ def _split_faces(bm, net):
                 "face_split_edgenet_refused", edges=len(live),
                 reason=str(exc)[:100]))
             continue
-        made_total += len(made)
-    return made_total
+        if not made:
+            # The empty-and-silent case, not the ValueError above: the net
+            # handed to this face did not form a valid planar graph (a spur
+            # reaching the boundary at only one end, or two edges crossing
+            # without a shared vertex), and the call dropped the *whole*
+            # face's split rather than the offending edge alone. Should be
+            # rare once `_CutGraph` has resolved crossings ahead of time --
+            # if this fires, that resolution missed something.
+            _log.warning(foam_log.summary(
+                "face_split_edgenet_empty", edges=len(live),
+                face=face.index if face.is_valid else -1))
+
+    # Deduplicated, and this is not tidiness. A stroke that doubles back over
+    # its own path resolves several segments onto the same existing edge, so
+    # `reused` can hold it more than once. bmesh.ops.delete refuses a
+    # sequence containing any element twice.
+    new_edges, seen_edges = [], set()
+    for edge in ([e for edges in by_face.values() for e in edges]
+                + reused + same_edge_chain):
+        if not edge.is_valid or edge in seen_edges:
+            continue
+        seen_edges.add(edge)
+        new_edges.append(edge)
+
+    # Anything still wire went nowhere -- a loose end sitting inside a face,
+    # which cannot bound a piece. The knife removes these too: "Remove
+    # dangling edges, not essential - but nice for users."
+    # (editmesh_knife.cc:2166)
+    dangling = [e for e in new_edges if e.is_wire]
+    if dangling:
+        bmesh.ops.delete(bm, geom=dangling, context='EDGES')
+        new_edges = [e for e in new_edges if e.is_valid]
+
+    # Marked here, once, now that every stroke that might split one of these
+    # edges further has already had its say -- unlike the old per-stroke
+    # design, nothing downstream can still cut through an edge marked here.
+    for edge in new_edges:
+        edge.seam = True
+
+    return new_edges, len(dangling)
 
 
 def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
@@ -566,6 +940,13 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
     along the drawn line and the faces it crosses are split by it.
 
     `cyclic` closes the stroke, joining its last point back to its first.
+
+    A single-stroke convenience wrapper around `_CutGraph`: builds a graph
+    from just this stroke and realises it immediately. That is enough to
+    resolve this stroke crossing *itself*, but -- unlike `cut_strokes`, which
+    shares one graph across every stroke in a bake -- it cannot resolve a
+    junction against a *different* stroke cut in a separate call, since that
+    stroke's points were never added to this graph.
     """
     if len(points) < 2:
         raise StrokeCutError("a stroke needs at least two points")
@@ -592,74 +973,16 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
     bm.faces.ensure_lookup_table()
     bm.faces.index_update()
     bvh = BVHTree.FromBMesh(bm)
-    hits = _classify(bm, bvh, points)
+    bvh = _refine_if_wholly_inside(bm, bvh, points)
 
-    # A closed stroke lying wholly inside one face reaches no boundary, and a
-    # net that does not reach the boundary is silently ignored -- measured in
-    # tests/test_edgenet_cut.py, and stated in the binding's own docs. The knife
-    # bridges the island with BM_face_split_edgenet_connect_islands, which is
-    # not exposed to Python, so the face is refined until the stroke crosses an
-    # edge instead. Refining where a line was drawn is what a modeller would do
-    # by hand, and it adds geometry only inside the face already involved.
-    def _all_inside():
-        return (not any(h["kind"] != FACE for h in hits)
-                and len({h["face"] for h in hits}) == 1)
-
-    refined = 0
-    while refined < _MAX_REFINE and _all_inside():
-        face = hits[0]["face"]
-        bmesh.ops.subdivide_edges(bm, edges=list(face.edges), cuts=3,
-                                  use_grid_fill=True)
-        bm.faces.ensure_lookup_table()
-        bm.faces.index_update()
-        bvh = BVHTree.FromBMesh(bm)
-        hits = _classify(bm, bvh, points)
-        refined += 1
-    if _all_inside():
-        raise StrokeCutError(
-            "the stroke stays inside a single face after %d subdivisions; it "
-            "is far smaller than the mesh it is drawn on" % refined)
-
-    hits, missed = _bridge(hits)
-    if missed:
-        _log.warning(foam_log.summary(
-            "stroke_gaps", segments=missed, points=len(points)))
-
-    verts = _realise(bm, hits, snap_distance)
-    net, reused = _net_edges(bm, hits, verts, cyclic)
-    _split_faces(bm, net)
-
-    # Deduplicated, and this is not tidiness. A stroke that doubles back over
-    # its own path -- which a hand does constantly and a generated test stroke
-    # never does -- resolves several consecutive pairs onto the *same* existing
-    # edge, so `reused` holds it more than once. bmesh.ops.delete refuses a
-    # sequence containing any element twice ("found the same (BMVert/BMEdge/
-    # BMFace) used multiple times") and the whole bake dies on a real drawing.
-    new_edges, seen_edges = [], set()
-    for edge in [e for e, _f in net] + reused:
-        if not edge.is_valid or edge in seen_edges:
-            continue
-        seen_edges.add(edge)
-        new_edges.append(edge)
-
-    # Anything still wire went nowhere -- a loose end sitting inside a face,
-    # which cannot bound a piece. The knife removes these too: "Remove dangling
-    # edges, not essential - but nice for users." (editmesh_knife.cc:2166)
-    dangling = [e for e in new_edges if e.is_wire]
-    if dangling:
-        bmesh.ops.delete(bm, geom=dangling, context='EDGES')
-        new_edges = [e for e in new_edges if e.is_valid]
-
-    # Marked here rather than left to the caller. Cutting a later stroke can
-    # split an edge this one produced -- which is what happens wherever two
-    # strokes cross -- and marking now means both halves inherit the flag.
-    for edge in new_edges:
-        edge.seam = True
+    graph = _CutGraph()
+    _add_stroke_to_graph(bm, bvh, graph, points, cyclic, snap_distance)
+    new_edges, dangling = _realise_graph(bm, graph, snap_distance)
 
     _log.debug(foam_log.summary(
-        "cut_stroke", points=len(points), net=len(net), reused=len(reused),
-        dangling=len(dangling), snap=snap_distance))
-    return new_edges, len(dangling)
+        "cut_stroke", points=len(points), edges=len(new_edges),
+        dangling=dangling, snap=snap_distance))
+    return new_edges, dangling
 
 
 def chain_strokes(strokes, tolerance):
@@ -825,23 +1148,34 @@ def snap_stroke_ends(strokes, tolerance):
 
 def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
                 chain_tolerance=0.0):
-    """Cut several strokes, one after another. Returns (edges, open_ends).
+    """Cut every stroke into `bm` through one shared cut-graph, then realise
+    the whole thing at once. Returns (edges, open_ends).
 
-    Order is what makes intersections work. A pattern maker crosses strokes on
-    purpose, because that is what closes a region into a piece -- and once the
-    first stroke has been cut, its line *is* mesh topology, so the second one
-    crossing it is an ordinary edge crossing with nothing special about it. The
-    junction needs no special case at all, as long as the strokes are not cut
-    simultaneously.
+    A pattern maker crosses strokes on purpose, because that is what closes a
+    region into a piece -- and a stroke's end is routinely snapped onto a
+    point *another* stroke passes through, at a T-junction. Both are
+    junctions in exactly the same sense: two lines meeting at a point neither
+    would place alone. Cutting strokes one at a time into an evolving mesh,
+    the way this function used to, made the first case work for free (the
+    first stroke cut is already real topology by the time the second crosses
+    it) but not the second: whichever stroke's snapped end happened to be cut
+    *before* its target left a spur with nothing there yet to attach to, and
+    `face_split_edgenet` silently drops the whole face's split around a spur
+    like that -- see the module docstring and RESEARCH_gp_pattern_seam_gaps.md.
+
+    Feeding every stroke into one `_CutGraph` before any of it becomes real
+    `BMesh` topology removes the ordering question rather than scheduling
+    around it: whichever stroke's segment reaches a shared point *second*
+    simply reuses the graph vertex the first one already placed there,
+    exactly as the interactive knife's own graph does for a mouse segment
+    tested against its accumulated `KnifeVert`/`KnifeEdge` pool.
 
     `strokes` is a sequence of (points, cyclic) pairs, or (points, cyclic,
     width) triples as `strokes_from_grease_pencil` returns them -- `width` is
     the drawn line's half-width and feeds the crossing tolerance.
     """
     # Ends first, while each stroke still knows its own drawn width -- chaining
-    # merges strokes and the widths would not survive it. Mid-line crossings
-    # need no pass of their own: a stroke crossing one already cut meets real
-    # topology, and the crossing is an ordinary edge crossing.
+    # merges strokes and the widths would not survive it.
     pen = max((s[2] for s in strokes if len(s) > 2), default=0.0)
     strokes = snap_stroke_ends(strokes, snap_distance)
     strokes = [(s[0], s[1]) for s in strokes]
@@ -851,22 +1185,43 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
     if chain_tolerance > 0.0:
         strokes = chain_strokes(strokes, chain_tolerance)
 
-    all_edges = []
-    open_ends = 0
+    bm.faces.ensure_lookup_table()
+    bm.faces.index_update()
+    bvh = BVHTree.FromBMesh(bm)
+
+    graph = _CutGraph()
     for index, (points, cyclic) in enumerate(strokes):
-        try:
-            edges, ends = cut_stroke(bm, points, snap_distance=snap_distance,
-                                     cyclic=cyclic,
-                                     project_tolerance=project_tolerance)
-        except StrokeCutError as exc:
-            # One bad stroke should not discard the rest of the pattern. Which
-            # one failed is worth knowing, so it is named rather than counted.
-            _log.warning(foam_log.summary(
-                "stroke_failed", index=index, points=len(points),
-                cyclic=cyclic, reason=str(exc)[:120]))
+        if len(points) < 2:
             continue
-        all_edges.extend(edges)
-        open_ends += ends
+        pieces = [(points, cyclic)]
+        if project_tolerance > 0.0:
+            # Drop anything that missed the surface, and cut what is left. A
+            # stroke broken into pieces is no longer closed, whatever it was
+            # drawn as: the part that ran off took the closure with it.
+            runs_on = on_surface_runs(bm, points, project_tolerance)
+            if not runs_on:
+                _log.warning(foam_log.summary(
+                    "stroke_off_surface", index=index, points=len(points)))
+                continue
+            pieces = [(points, cyclic)] if (
+                len(runs_on) == 1 and len(runs_on[0]) == len(points)) \
+                else [(piece, False) for piece in runs_on]
+
+        for piece_points, piece_cyclic in pieces:
+            try:
+                bvh = _refine_if_wholly_inside(bm, bvh, piece_points)
+                _add_stroke_to_graph(bm, bvh, graph, piece_points,
+                                     piece_cyclic, snap_distance)
+            except StrokeCutError as exc:
+                # One bad stroke should not discard the rest of the pattern.
+                # Which one failed is worth knowing, so it is named rather
+                # than counted.
+                _log.warning(foam_log.summary(
+                    "stroke_failed", index=index, points=len(piece_points),
+                    cyclic=piece_cyclic, reason=str(exc)[:120]))
+
+    all_edges, open_ends = _realise_graph(bm, graph, snap_distance)
+
     # Weld the leftovers. Splitting an edge at a point that already has a vertex
     # a fraction away leaves a zero-length edge, and the faces around it
     # collapse -- a pinched wedge in the viewport, a spike no saw can follow in

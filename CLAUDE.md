@@ -342,11 +342,15 @@ skill and the "Investigation findings" rule above for the convention. Index of
 what exists so far:
 
 - [RESEARCH_gp_pattern_seam_gaps.md](RESEARCH_gp_pattern_seam_gaps.md) — why
-  the grease-pencil cutter's seams show gaps at crossings and junctions:
+  the grease-pencil cutter's seams showed gaps at crossings and junctions:
   `bmesh.utils.face_split_edgenet` discards a whole face's split when any one
-  edge in its net is malformed, and two code paths in `foam_gp_pattern.py`
-  (order-dependent T-junction snapping, undetected self-crossing strokes)
-  produce exactly that shape. Root cause confirmed; no fix applied yet.
+  edge in its net is malformed. Fixed by giving `foam_gp_pattern.py` its own
+  `KnifeVert`/`KnifeEdge`-style cut-graph (`_CutGraph`), shared across every
+  stroke in a bake and resolved before anything touches `bmesh`, mirroring
+  `editmesh_knife.cc`'s real two-phase design. Self-crossing and
+  order-dependent T-junction spurs are both fixed and covered by
+  `tests/test_gp_junctions.py`; the near-miss (non-touching) junction case is
+  still open.
 
 ## Good test shapes
 - **Torus, 12 major x 5 minor** — the craftability reference case: it needs

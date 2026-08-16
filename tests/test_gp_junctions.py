@@ -124,28 +124,30 @@ def _max_gap_to_seam(points, seam_edges):
 
 # --- 1. A stroke that crosses its own earlier path ----------------------
 def test_self_crossing_stroke_keeps_both_arms():
-    """One open stroke, four points, drawn like an X: A->B is one diagonal of
-    a square, B->C is an edge, C->D is the other diagonal -- which crosses
-    A->B's diagonal at the centre, well after B was already visited. This is
-    the "doubling back" shape named directly by the user and reproduced from
-    the live file in RESEARCH_gp_pattern_seam_gaps.md (chain 1's 8-edge
-    dangling run).
+    """One open stroke, four points, drawn like an X: A->B is one diagonal,
+    B->C is an edge, C->D is the other diagonal -- which crosses A->B's
+    diagonal at the centre, well after B was already visited. This is the
+    "doubling back" shape named directly by the user and reproduced from the
+    live file in RESEARCH_gp_pattern_seam_gaps.md (chain 1's 8-edge dangling
+    run). A and D sit exactly on the plane's own boundary edge, so -- unlike
+    an arbitrary interior tip -- there is no legitimate reason for either end
+    to be left unconnected; every point on the drawn curve, tip to tip,
+    should have real seam nearby.
 
-    Known answer: the sub-path X->B->C->X (X the crossing point) is a closed
-    triangle, so it must separate the sheet into exactly two regions --
-    inside that triangle and everything else. The two open tails (A->X and
-    X->D) hang off the crossing without closing anything further, so they add
-    no additional region on their own, but they must still reach the
-    crossing: if the face containing the crossing point gets its whole net
-    dropped (the bug), the triangle would not close and this drops to one
-    region.
+    The real test, over the topological region-counting this file used
+    before: for every point sampled along the drawn curve, is there a
+    seam-tagged edge within a small, fixed distance of it? That is the
+    module's actual job -- the curve drawn should be the seam cut, however
+    the stroke happened to be shaped -- and it does not depend on correctly
+    predicting the crossing's topology by hand. Regions/wire counts are kept
+    as a secondary sanity check, not the primary criterion.
     """
     _clear()
     me, edge = _grid_plane(cuts=15)
-    a = Vector((-0.8, -0.8, 0.0))
+    a = Vector((-1.0, -0.8, 0.0))    # on the plane's left boundary
     b = Vector((0.8, 0.8, 0.0))
     c = Vector((0.8, -0.8, 0.0))
-    d = Vector((-0.8, 0.8, 0.0))
+    d = Vector((-1.0, 0.8, 0.0))     # on the plane's left boundary
     points = _densify([a, b, c, d], per_segment=14)
 
     bm = bmesh.new()
@@ -160,6 +162,11 @@ def test_self_crossing_stroke_keeps_both_arms():
     n_wire = sum(1 for e in edges if e.is_valid and e.is_wire)
     bm.free()
 
+    # A small, fixed tolerance -- not scaled to the mesh's own edge length --
+    # because the claim being tested is "the cutter followed the curve
+    # closely," and a bound that grows with the mesh would let a coarser mesh
+    # hide the same defect a finer one would catch.
+    tolerance = 0.01
     return {
         "regions": regions,
         "seam_edges": len(seam_edges),
@@ -167,18 +174,19 @@ def test_self_crossing_stroke_keeps_both_arms():
         "max_gap_to_seam": round(gap, 5),
         "wire_edges_remaining": n_wire,
         "edge_length": round(edge, 5),
+        "tolerance": tolerance,
         "checks": {
-            # The closed triangle at the crossing must be there.
-            "crossing_closes_a_second_region": regions == 2,
-            # Only the two genuine tails (A and D) may legitimately fail to
-            # extend further -- nothing else should be dropped as dangling.
-            "at_most_the_two_true_tails_open": open_ends <= 2,
-            # The bug drops a WHOLE face's net, which would put points well
-            # away from the crossing (mid-arm, nowhere near the poisoned
-            # face) outside any reasonable bound too -- so this has to be
-            # tight, not just "close to the crossing".
-            "cut_within_half_an_edge": gap <= edge * 0.5,
+            "every_drawn_point_has_nearby_seam": gap <= tolerance,
+            "no_open_ends": open_ends == 0,
             "no_wire_left_behind": n_wire == 0,
+            # Secondary: three regions -- the closed triangle B-C-X at the
+            # crossing, and the two halves the boundary-to-boundary path
+            # A-X-D splits the rest of the sheet into. (A and D anchor to
+            # the boundary specifically so there is no ambiguous "legitimate
+            # open tip" case, which also means this number is no longer the
+            # 2 it would be with A/D floating -- the path itself now also
+            # bisects the outer region.)
+            "three_regions": regions == 3,
         },
     }
 
@@ -230,8 +238,9 @@ def test_t_junction_is_order_independent():
             "wire_edges_remaining": n_wire,
         }
 
-    edge = edge_ref[0]
+    tolerance = 0.01
     out = dict(results)
+    out["tolerance"] = tolerance
     out["checks"] = {
         "three_regions_through_then_t": results["through_then_t"]["regions"] == 3,
         "three_regions_t_then_through": results["t_then_through"]["regions"] == 3,
@@ -241,9 +250,11 @@ def test_t_junction_is_order_independent():
         "no_open_ends_either_order":
             results["through_then_t"]["open_ends"] == 0 and
             results["t_then_through"]["open_ends"] == 0,
-        "cut_within_half_an_edge_either_order":
-            results["through_then_t"]["max_gap_to_seam"] <= edge * 0.5 and
-            results["t_then_through"]["max_gap_to_seam"] <= edge * 0.5,
+        # The real test: every point on both drawn curves has a seam edge
+        # within a small, fixed tolerance nearby -- regardless of cut order.
+        "every_drawn_point_has_nearby_seam_either_order":
+            results["through_then_t"]["max_gap_to_seam"] <= tolerance and
+            results["t_then_through"]["max_gap_to_seam"] <= tolerance,
         "no_wire_left_behind_either_order":
             results["through_then_t"]["wire_edges_remaining"] == 0 and
             results["t_then_through"]["wire_edges_remaining"] == 0,
