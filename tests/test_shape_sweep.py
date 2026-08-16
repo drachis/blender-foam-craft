@@ -330,11 +330,95 @@ def test_t_junctions_join_by_pen_width():
         },
     }
 
+
+# --- 5. A stroke that doubles back over itself ---------------------------
+def _cut_raw(points):
+    """Cut one stroke and report the edge list as it comes back."""
+    _clear()
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=SEGMENTS,
+                                         ring_count=RINGS)
+    bm = bmesh.new()
+    bm.from_mesh(bpy.context.object.data)
+    _canonical_faces(bm)
+    try:
+        edges, open_ends = gp.cut_strokes(bm, [(points, False)],
+                                          snap_distance=SNAP)
+        return {"edges": len(edges), "unique_edges": len(set(edges)),
+                "regions": len(_regions(bm)), "open_ends": open_ends,
+                "degenerate": sum(1 for f in bm.faces
+                                  if f.calc_area() < 1e-8)}
+    finally:
+        bm.free()
+
+
+def test_a_stroke_that_retraces_itself_survives():
+    """Drawing back over a line already drawn must not report an edge twice.
+
+    From a real drawing pass, where the bake died with
+
+        ValueError: geom: found the same (BMVert/BMEdge/BMFace) used
+        multiple times
+
+    A hand wavers, pauses and goes back over a line; every other stroke in this
+    suite advances cleanly and never does, which is why the class went unseen.
+    When a stroke retraces ground that already has mesh edges under it,
+    consecutive point pairs resolve onto the *same* edge, and it was collected
+    once per pair. Measured on the strokes below before the fix: 36 duplicate
+    entries out of 72 for the out-and-back, 50 of 60 for the zigzag.
+
+    The duplicate list is the defect; the exception is one consequence of it,
+    and not the only one -- bmesh.ops.delete refuses a repeated element, so the
+    operator only died when a duplicate happened to also be dangling. Asserting
+    on the exception alone would therefore have gone on passing. The invariant
+    is what is checked: an edge appears in the cut once.
+
+    Both strokes run along the equator, which on a sphere with an even ring
+    count is an existing edge loop -- shared vertices are what make a pair
+    repeat at all, so a retrace in open space would not exercise this.
+
+    Two-sided: a cutter that returned nothing would trivially have no
+    duplicates, so each case must also cut, and a retraced line encloses no
+    area and must not invent a region.
+    """
+    out_and_back = [_point(1.5708, -0.25 + 0.5 * i / 29.0) for i in range(30)]
+    out_and_back += list(reversed(out_and_back))
+
+    zigzag = []
+    for k in range(6):
+        leg = [_point(1.5708, -0.05 + 0.1 * i / 9.0) for i in range(10)]
+        zigzag += leg if k % 2 == 0 else list(reversed(leg))
+
+    cases = {}
+    for label, points in (("out_and_back", out_and_back),
+                          ("zigzag", zigzag)):
+        try:
+            cases[label] = _cut_raw(points)
+        except Exception as exc:          # noqa: BLE001
+            cases[label] = {"raised": "%s: %s" % (type(exc).__name__,
+                                                  str(exc)[:120]),
+                            "edges": 0, "unique_edges": 0, "regions": 0,
+                            "open_ends": 0, "degenerate": 0}
+
+    out = dict(cases)
+    out["checks"] = {
+        "nothing_raised": all("raised" not in c for c in cases.values()),
+        "no_edge_reported_twice":
+            all(c["edges"] == c["unique_edges"] for c in cases.values()),
+        "both_cut_something": all(c["edges"] > 0 for c in cases.values()),
+        # A line retraced encloses nothing, so the sphere stays whole.
+        "no_region_invented": all(c["regions"] == 1 for c in cases.values()),
+        "no_degenerate_geometry":
+            all(c["degenerate"] == 0 for c in cases.values()),
+    }
+    return out
+
+
 TESTS = (
     test_theta_at_several_radii,
     test_two_circles_through_tangency,
     test_circle_scaled_about_its_centre,
     test_t_junctions_join_by_pen_width,
+    test_a_stroke_that_retraces_itself_survives,
 )
 
 result = {}

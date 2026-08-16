@@ -629,8 +629,18 @@ def cut_stroke(bm, points, snap_distance=0.0, cyclic=False,
     net, reused = _net_edges(bm, hits, verts, cyclic)
     _split_faces(bm, net)
 
-    new_edges = [e for e, _f in net if e.is_valid] + \
-                [e for e in reused if e.is_valid]
+    # Deduplicated, and this is not tidiness. A stroke that doubles back over
+    # its own path -- which a hand does constantly and a generated test stroke
+    # never does -- resolves several consecutive pairs onto the *same* existing
+    # edge, so `reused` holds it more than once. bmesh.ops.delete refuses a
+    # sequence containing any element twice ("found the same (BMVert/BMEdge/
+    # BMFace) used multiple times") and the whole bake dies on a real drawing.
+    new_edges, seen_edges = [], set()
+    for edge in [e for e, _f in net] + reused:
+        if not edge.is_valid or edge in seen_edges:
+            continue
+        seen_edges.add(edge)
+        new_edges.append(edge)
 
     # Anything still wire went nowhere -- a loose end sitting inside a face,
     # which cannot bound a piece. The knife removes these too: "Remove dangling
