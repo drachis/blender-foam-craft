@@ -429,9 +429,214 @@ def test_near_miss_only_extends_along_direction_of_travel():
     return out
 
 
+# --- 5. Two strokes crossing exactly at an existing face corner ---------
+def test_crossing_at_a_face_corner_still_joins():
+    """Reported from the live file: two strokes that visibly cross leave a
+    gap in the seam when the crossing lands on a face *corner* -- an
+    existing mesh vertex -- rather than in open face.
+
+    A corner is the awkward case because a point landing there is snapped
+    onto real geometry that already exists, so it is no longer a free point
+    in a face the way an ordinary crossing is, and any shortcut taken for
+    "this point is already on real topology" risks skipping the very test
+    that would notice the other stroke.
+
+    Two diagonals of the sheet, corner to corner, which cross at the middle
+    -- and on this grid the middle is exactly a vertex. Known answer: an X
+    across a square divides it into 4 regions. A crossing that fails to
+    join gives 2 (each diagonal cutting the sheet but not each other).
+
+    Deliberately diagonal, so neither stroke runs along an existing edge:
+    that isolates "crossing at a corner" from "running down an edge loop",
+    which is a different case with its own handling.
+    """
+    _clear()
+    me, edge = _grid_plane(cuts=15)
+    # cuts=15 on a 2x2 plane puts grid lines every 0.125, so (0, 0) is a
+    # vertex and both diagonals pass exactly through it.
+    diag_a = _densify(
+        [Vector((-1.0, -1.0, 0.0)), Vector((1.0, 1.0, 0.0))], per_segment=40)
+    diag_b = _densify(
+        [Vector((-1.0, 1.0, 0.0)), Vector((1.0, -1.0, 0.0))], per_segment=40)
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    edges, open_ends = gp.cut_strokes(bm, [(diag_a, False), (diag_b, False)],
+                                      snap_distance=0.01)
+    for e in edges:
+        e.seam = True
+    seam_edges = [e for e in bm.edges if e.seam]
+    regions = _seam_regions(bm)
+    gap = _max_gap_to_seam(diag_a + diag_b, seam_edges)
+    n_wire = sum(1 for e in edges if e.is_valid and e.is_wire)
+
+    # The crossing itself: is there a seam vertex at the sheet's centre, and
+    # does it carry all four arms? A junction that "joined" by laying two
+    # separate vertices a hair apart would still leave the piece open.
+    centre = Vector((0.0, 0.0, 0.0))
+    near_centre = [v for v in bm.verts if (v.co - centre).length < 1e-4]
+    arms = 0
+    if near_centre:
+        arms = sum(1 for e in near_centre[0].link_edges if e.seam)
+    bm.free()
+
+    tolerance = 0.01
+    return {
+        "regions": regions,
+        "open_ends": open_ends,
+        "max_gap_to_seam": round(gap, 5),
+        "wire_edges_remaining": n_wire,
+        "verts_at_centre": len(near_centre),
+        "seam_arms_at_centre": arms,
+        "checks": {
+            "four_regions": regions == 4,
+            "every_drawn_point_has_nearby_seam": gap <= tolerance,
+            # One vertex at the crossing, not two laid a hair apart.
+            "single_vertex_at_the_crossing": len(near_centre) == 1,
+            # All four arms of the X meet there.
+            "all_four_arms_meet": arms == 4,
+            "no_open_ends": open_ends == 0,
+            "no_wire_left_behind": n_wire == 0,
+        },
+    }
+
+
+# --- 6. One stroke through a corner, another crossing just beside it ----
+def test_crossing_beside_a_face_corner_still_joins():
+    """The harder half of the corner case, and the one the live file hit.
+
+    When both strokes pass exactly through the same mesh vertex they join
+    for free -- both snap to it, so they are the same point by construction
+    (that is `test_crossing_at_a_face_corner_still_joins`). The failure is
+    when only *one* of them lands on the corner and the other crosses a
+    whisker beside it: the first is now anchored to real geometry while the
+    second is still a free point in a face, so nothing makes them the same
+    point, and any shortcut that treats "already on real topology" as
+    "nothing more to check here" skips the test that would notice the
+    crossing at all.
+
+    `diag_a` runs corner to corner through the vertex at the origin.
+    `diag_b` spans the sheet too but crosses `diag_a` at about
+    (0.0067, 0.0067) -- roughly 0.0095 off the vertex, far enough not to
+    snap to it and close enough to share its faces.
+
+    Known answer: two lines that each span the sheet and cross once divide
+    it into 4. A crossing that is missed leaves the seam open where they
+    meet and the count drops.
+    """
+    _clear()
+    me, edge = _grid_plane(cuts=15)
+    diag_a = _densify(
+        [Vector((-1.0, -1.0, 0.0)), Vector((1.0, 1.0, 0.0))], per_segment=40)
+    diag_b = _densify(
+        [Vector((-1.0, 0.5, 0.0)), Vector((1.0, -0.48, 0.0))], per_segment=40)
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    edges, open_ends = gp.cut_strokes(bm, [(diag_a, False), (diag_b, False)],
+                                      snap_distance=0.01)
+    for e in edges:
+        e.seam = True
+    seam_edges = [e for e in bm.edges if e.seam]
+    regions = _seam_regions(bm)
+    gap = _max_gap_to_seam(diag_a + diag_b, seam_edges)
+    n_wire = sum(1 for e in edges if e.is_valid and e.is_wire)
+
+    # Where the two lines actually meet, solved by hand above.
+    crossing = Vector((0.0067, 0.0067, 0.0))
+    junction_arms = 0
+    for v in bm.verts:
+        if (v.co - crossing).length > 0.03:
+            continue
+        junction_arms = max(junction_arms,
+                            sum(1 for e in v.link_edges if e.seam))
+    bm.free()
+
+    tolerance = 0.01
+    return {
+        "regions": regions,
+        "open_ends": open_ends,
+        "max_gap_to_seam": round(gap, 5),
+        "wire_edges_remaining": n_wire,
+        "best_seam_degree_near_crossing": junction_arms,
+        "checks": {
+            "four_regions": regions == 4,
+            "every_drawn_point_has_nearby_seam": gap <= tolerance,
+            # A real crossing leaves a vertex with four seam arms. Two lines
+            # that merely pass by each other leave only degree-2 vertices.
+            "four_arms_meet_at_the_crossing": junction_arms >= 4,
+            "no_open_ends": open_ends == 0,
+            "no_wire_left_behind": n_wire == 0,
+        },
+    }
+
+
+# --- 7. A line passing near a corner must not be dragged onto it --------
+def test_line_passing_near_a_corner_is_not_snapped_to_it():
+    """Reported from the live file as a notch in the seam, and traced to
+    `_bridge` routing the cut *through* a shared face corner whenever two
+    consecutive points landed on faces that touch only at that corner --
+    with no tolerance, however far the drawn line actually passed from it.
+
+    That is an assumption inherited from the old `face_split` cutter, where
+    a cut had to run between vertices the face already owned. A knife does
+    not do it: a vertex is hit only when the line passes within a hair of
+    one, and otherwise the ordinary edge crossings either side are taken
+    (editmesh_knife.cc:2883-2935). Measured on the workshop file before the
+    fix: 5 segments routed through a corner, dragging the seam as much as
+    0.075 off the line drawn.
+
+    A diagonal stroke offset just enough to pass *beside* the grid vertices
+    rather than through them. Every point of it must have seam within a
+    tight tolerance -- a seam detoured to a corner and back cannot.
+
+    Two-sided: the offset is 0.02, comfortably larger than the tolerance
+    asserted, so a cutter that did snap to corners fails this rather than
+    scraping through.
+    """
+    _clear()
+    me, edge = _grid_plane(cuts=15)
+    # Grid lines every 0.125. A 45-degree line through (0.02, 0) passes
+    # 0.014 from each vertex it goes by -- beside them, not through.
+    stroke = _densify(
+        [Vector((-0.98, -1.0, 0.0)), Vector((1.0, 0.98, 0.0))],
+        per_segment=40)
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    edges, open_ends = gp.cut_strokes(bm, [(stroke, False)],
+                                      snap_distance=0.002)
+    for e in edges:
+        e.seam = True
+    seam_edges = [e for e in bm.edges if e.seam]
+    gap = _max_gap_to_seam(stroke, seam_edges)
+    regions = _seam_regions(bm)
+    bm.free()
+
+    tolerance = 0.004
+    return {
+        "regions": regions,
+        "open_ends": open_ends,
+        "max_gap_to_seam": round(gap, 5),
+        "tolerance": tolerance,
+        "checks": {
+            # The cut follows the drawn line rather than detouring via the
+            # corners it passes.
+            "cut_follows_the_drawn_line": gap <= tolerance,
+            # And it still actually cut: a line corner to corner divides
+            # the sheet in two.
+            "two_regions": regions == 2,
+            "no_open_ends": open_ends == 0,
+        },
+    }
+
+
 TESTS = (
     test_self_crossing_stroke_keeps_both_arms,
     test_t_junction_is_order_independent,
+    test_crossing_at_a_face_corner_still_joins,
+    test_crossing_beside_a_face_corner_still_joins,
+    test_line_passing_near_a_corner_is_not_snapped_to_it,
     test_near_miss_t_junction_extends_to_meet,
     test_near_miss_only_extends_along_direction_of_travel,
 )

@@ -35,6 +35,20 @@ the understanding changed, which is usually the more valuable half.
     python tools/blender_bridge.py --port 9885 < tests/test_gp_pattern.py
     python tools/blender_bridge.py --port 9885 < tests/test_curvature_darts.py
 
+**No code is one-off.** The same rule, stated the way it kept being broken:
+a "quick probe" written to answer one question during a debugging session is
+the same measurement the next session will need, so it goes in `tests/` at
+the moment it is written, not after it proves interesting. A session chasing
+the grease-pencil seam gaps wrote six throwaway scripts — hover height vs.
+cut error, `_bridge` route counts, a snap-distance sweep — every one of
+which turned out to be a check worth keeping, and all of which are now
+`tests/test_cut_accuracy.py`.
+
+**And what a probe measures, a log line should usually report.** If a
+question needs a script to answer it against a live bake, the operator was
+not saying enough. `cut_routes` and `cut_accuracy` exist because that
+session kept re-deriving, from scratch, numbers the cutter already knew.
+
 **Investigation findings go in `RESEARCH_<slug>.md`, never only in chat.**
 The same reasoning as the rule above, applied to prose instead of code: a
 root-cause hunt that read source and ran live experiments against a running

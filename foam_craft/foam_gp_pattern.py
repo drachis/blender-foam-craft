@@ -77,7 +77,7 @@ import math
 
 import bmesh
 import bpy
-from mathutils import Vector
+from mathutils import Vector, kdtree
 from mathutils.bvhtree import BVHTree
 from mathutils.geometry import intersect_line_line
 
@@ -430,8 +430,14 @@ def _locally_trivial(hit_a, hit_b):
     return None
 
 
-def _bridge(hits):
+def _bridge(hits, stats=None):
     """Insert the crossings between points that share no face.
+
+    `stats` is an optional counter dict, tallying which route each pair of
+    consecutive points took. It is logged once per bake, because how a cut
+    got from one drawn point to the next is the first thing worth knowing
+    when a seam comes out somewhere the user did not draw -- and reading it
+    out of the log beats writing a probe to rediscover it.
 
     Two consecutive drawn points can land on faces that do not touch, because
     the stroke passed straight over the faces between them. Those crossings are
@@ -444,9 +450,16 @@ def _bridge(hits):
     cuts. Losing a whole drawn line because one segment was awkward was the
     worst behaviour of the previous design.
     """
+    if stats is None:
+        stats = {}
+
+    def tally(name, value=1):
+        stats[name] = stats.get(name, 0) + value
+
     out, missed = [hits[0]], 0
     for previous, hit in zip(hits, hits[1:]):
         if _hit_faces(previous) & _hit_faces(hit):
+            tally("same_face")
             out.append(hit)
             continue
 
@@ -458,6 +471,7 @@ def _bridge(hits):
         # it where the answer is already known just adds ways to be wrong.
         edge = _shared_edge(previous["face"], hit["face"])
         if edge is not None:
+            tally("shared_edge")
             fac = _crossing_on_edge(edge, previous["loc"], hit["loc"])
             a, b = edge.verts[0].co, edge.verts[1].co
             out.append({"kind": EDGE, "elem": edge, "fac": fac,
@@ -466,22 +480,60 @@ def _bridge(hits):
             out.append(hit)
             continue
 
-        # Diagonal neighbours, touching at one corner only. The crossing is the
-        # corner itself and nothing needs splitting -- the stroke went through a
-        # vertex that is already there.
+        # Diagonal neighbours, touching at one corner only -- but only route
+        # the cut *through* that corner when the drawn line really does pass
+        # within a hair of it.
+        #
+        # Routing through it unconditionally is an old assumption from the
+        # `face_split` design, where a cut had to run between vertices the
+        # face already owned, and it is not what a knife does: the knife
+        # registers a vertex hit only when the line passes within
+        # KNIFE_FLT_EPS_PX_VERT of one (editmesh_knife.cc:2883-2935), and
+        # otherwise takes the ordinary edge crossings either side of it.
+        # Snapping regardless drags the seam sideways onto the corner and
+        # back -- measured on the workshop file: 5 segments routed this way,
+        # pulling the cut as much as 0.075 off the line the user drew, which
+        # is the visible notch it leaves in the seam.
         corner = _shared_vert(previous["face"], hit["face"])
         if corner is not None:
-            out.append({"kind": VERT, "elem": corner, "fac": 0.0,
-                        "loc": corner.co.copy(), "face": previous["face"]})
-            out.append(hit)
-            continue
+            span = hit["loc"] - previous["loc"]
+            denom = span.length_squared
+            t = 0.0 if denom < 1e-18 else max(0.0, min(
+                1.0, (corner.co - previous["loc"]).dot(span) / denom))
+            off_line = (corner.co - (previous["loc"] + span * t)).length
+            if off_line <= _weld_eps(previous["face"]):
+                tally("through_corner")
+                out.append({"kind": VERT, "elem": corner, "fac": 0.0,
+                            "loc": corner.co.copy(), "face": previous["face"]})
+                out.append(hit)
+                continue
 
         route = _walk_faces(previous["face"], previous["loc"],
                             hit["face"], hit["loc"])
         if not route:
+            # The walk could not find the way across. Falling back on the
+            # shared corner keeps the line connected -- a seam bent to the
+            # corner is worse than one that follows the drawing, but both
+            # beat a hole in the piece boundary.
+            if corner is not None:
+                # Counted *and* measured: this is the one route that
+                # knowingly puts the seam somewhere other than where the
+                # line was drawn, so how far it bent it is worth having in
+                # the log rather than needing a probe to find out.
+                tally("corner_fallback")
+                stats["corner_fallback_worst"] = max(
+                    stats.get("corner_fallback_worst", 0.0), off_line)
+                out.append({"kind": VERT, "elem": corner, "fac": 0.0,
+                            "loc": corner.co.copy(),
+                            "face": previous["face"]})
+                out.append(hit)
+                continue
+            tally("no_route")
             missed += 1
             out.append(hit)
             continue
+        tally("walked")
+        tally("walk_crossings", len(route))
         for edge, fac in route:
             a, b = edge.verts[0].co, edge.verts[1].co
             out.append({"kind": EDGE, "elem": edge, "fac": fac,
@@ -697,14 +749,15 @@ class _CutGraph:
         self.face_edges.setdefault(face, []).append(index)
 
 
-def _add_stroke_to_graph(bm, bvh, graph, points, cyclic, snap_distance):
+def _add_stroke_to_graph(bm, bvh, graph, points, cyclic, snap_distance,
+                         stats=None):
     """Classify and bridge one stroke's points, then fold every hit and
     segment into `graph` -- reusing or crossing whatever earlier strokes (or
     this stroke's own earlier points) already placed there. `bm` is read but
     never written; nothing here creates real topology.
     """
     hits = _classify(bm, bvh, points)
-    hits, missed = _bridge(hits)
+    hits, missed = _bridge(hits, stats)
     if missed:
         _log.warning(foam_log.summary(
             "stroke_gaps", segments=missed, points=len(points)))
@@ -1384,6 +1437,8 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
     bvh = BVHTree.FromBMesh(bm)
 
     graph = _CutGraph()
+    route_stats = {}
+    drawn = []
     for index, (points, cyclic) in enumerate(strokes):
         if len(points) < 2:
             continue
@@ -1405,7 +1460,8 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
             try:
                 bvh = _refine_if_wholly_inside(bm, bvh, piece_points)
                 _add_stroke_to_graph(bm, bvh, graph, piece_points,
-                                     piece_cyclic, snap_distance)
+                                     piece_cyclic, snap_distance, route_stats)
+                drawn.extend(piece_points)
             except StrokeCutError as exc:
                 # One bad stroke should not discard the rest of the pattern.
                 # Which one failed is worth knowing, so it is named rather
@@ -1426,6 +1482,7 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
     # Restricted to the vertices the cut produced. Run over the whole mesh it
     # would weld the sculpt's own detail, which is far worse than the slivers
     # it came to remove.
+    welded = 0
     if snap_distance > 0.0 and all_edges:
         # The cut's own vertices only. Widening this to their neighbours was
         # tried and made things worse -- theta went from 3 collapsed faces to 5
@@ -1447,8 +1504,50 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
             # time it was processed.
             bm.verts.index_update()
             ordered = sorted(touched, key=lambda v: v.index)
+            before = len(bm.verts)
             bmesh.ops.remove_doubles(bm, verts=ordered, dist=snap_distance)
+            welded = before - len(bm.verts)
             all_edges = [e for e in all_edges if e.is_valid]
+
+    # How much of the cut went which way. Read this first when a seam comes
+    # out somewhere the drawing does not go: `corner_fallback` above zero is
+    # the cut knowingly bending to a face corner, and `no_route` is a segment
+    # that could not be crossed at all.
+    _log.info(foam_log.summary("cut_routes", **route_stats))
+
+    # And how faithfully the finished cut followed the line, which is the
+    # question this module exists to answer -- so it belongs in the log
+    # rather than in a probe written afresh each time somebody doubts it.
+    #
+    # Measured against the drawn points *projected onto the surface*, not the
+    # raw ones: strokes drawn with a Shrinkwrap sit a fixed hover above the
+    # mesh, and comparing against that hover reports a constant error that is
+    # nothing to do with the cut. Nearest cut *vertex* rather than nearest
+    # seam edge, via a KD-tree, because every drawn point should have become
+    # one and the tree keeps this cheap on a dense sculpt.
+    if drawn and all_edges:
+        cut_verts = [v for e in all_edges if e.is_valid for v in e.verts]
+        if cut_verts:
+            unique = {v.index: v for v in cut_verts}
+            tree = kdtree.KDTree(len(unique))
+            for i, v in enumerate(unique.values()):
+                tree.insert(v.co, i)
+            tree.balance()
+            surface = BVHTree.FromBMesh(bm)
+            offs = []
+            for point in drawn:
+                landed = surface.find_nearest(point)[0]
+                if landed is None:
+                    continue
+                offs.append(tree.find(landed)[2])
+            if offs:
+                offs.sort()
+                _log.info(foam_log.summary(
+                    "cut_accuracy", points=len(offs),
+                    median=offs[len(offs) // 2],
+                    p90=offs[min(len(offs) - 1, int(len(offs) * 0.9))],
+                    worst=offs[-1], snap=snap_distance,
+                    welded=welded))
 
     _log.info(foam_log.summary(
         "cut_strokes", strokes=len(strokes), edges=len(all_edges),

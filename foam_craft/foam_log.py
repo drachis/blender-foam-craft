@@ -36,8 +36,6 @@ _FILENAME = "foam_craft.log"
 _MAX_BYTES = 1 << 20
 _BACKUPS = 3
 
-_configured = False
-
 
 def log_dir():
     """Directory holding the log file, created if missing."""
@@ -54,11 +52,24 @@ def get_logger():
     Handlers are attached once and reused. Re-running register() during
     development would otherwise stack a second copy of every handler onto the
     same logger and duplicate every line.
+
+    The guard has to live on the *logger*, not in a module global. Reloading
+    the add-on -- which is the normal iterate-and-retry loop, and what
+    `bpy.ops.preferences.addon_disable`/`_enable` does -- rebinds this module
+    and resets any module-level flag, but `logging.getLogger` hands back the
+    same logger object with the handlers already on it. A module global
+    therefore reads False while the handlers are still attached, and each
+    reload adds another pair. Measured: six reloads, every line six times,
+    which makes the log actively harder to read than no log at all.
     """
-    global _configured
     logger = logging.getLogger(_LOGGER_NAME)
-    if _configured:
+    if getattr(logger, "_foam_craft_configured", False):
         return logger
+    # Belt and braces: an older build of this module may have attached
+    # handlers without the marker below, and those would duplicate too.
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
 
     logger.setLevel(logging.DEBUG)
     # Blender's own logging is not ours to configure, and propagating would
@@ -86,7 +97,7 @@ def get_logger():
     console.setLevel(logging.INFO)
     logger.addHandler(console)
 
-    _configured = True
+    logger._foam_craft_configured = True
     return logger
 
 
