@@ -430,13 +430,24 @@ def _locally_trivial(hit_a, hit_b):
     return None
 
 
-def _faces_around(face_from, face_to, limit=4):
+def _faces_around(face_from, face_to, limit=64):
     """The patch of mesh the segment could plausibly cross, grown out from
     `face_from` by vertex adjacency until `face_to` is inside it.
 
     Vertex adjacency rather than edge adjacency on purpose: the whole point
     is to include faces that touch only at a corner, which is where the walk
     this replaces used to get stuck.
+
+    `limit` is a safety stop, not a working bound, and it has to be well
+    clear of what any real segment needs: the loop already stops the moment
+    `face_to` is reached, so a generous cap costs nothing in the ordinary
+    case of two points a face or two apart. It was 4, which quietly failed
+    on long segments -- a sawtooth's near-vertical reset spans as many faces
+    as its amplitude divided by the face size, and at 300 mm on an 83 mm
+    grid that is seven, so the far end was never in the patch, its crossings
+    were never collected, and the seam came out with a hole in it. Nothing
+    reported: the cut simply did not close, and the whole sheet stayed one
+    region.
     """
     seen = {face_from}
     frontier = [face_from]
@@ -1395,28 +1406,47 @@ def join_touching_strokes(strokes, tolerance):
         for j in range(i + 1, len(strokes)):
             points_b, _cyclic_b, width_b = strokes[j]
             reach = max(tolerance, width_a + width_b)
-            found = []
+
+            # How near the other mark runs, all along this one. Walking one
+            # stroke and asking "how far is the other from here" turns the
+            # question into a single profile, and the meetings are simply
+            # the places that profile dips inside the ink.
+            profile = []
             for x in range(len(points_a) - 1):
+                best = None
                 for y in range(len(points_b) - 1):
-                    distance, fac_a, on_a, fac_b, on_b = _segment_closest(
+                    found = _segment_closest(
                         points_a[x], points_a[x + 1],
                         points_b[y], points_b[y + 1])
-                    if distance <= reach:
-                        found.append((distance, x, fac_a, on_a, y, fac_b, on_b))
-            if not found:
-                continue
-            # One junction per overlapping stretch: take them closest-first
-            # and drop any that sits within reach of one already taken.
-            found.sort(key=lambda item: item[0])
-            taken = []
-            for distance, x, fac_a, on_a, y, fac_b, on_b in found:
-                middle = (on_a + on_b) * 0.5
-                if any((middle - other).length <= reach for other in taken):
+                    if best is None or found[0] < best[0]:
+                        best = (found[0], found[1], found[2],
+                                y, found[3], found[4])
+                if best is not None:
+                    profile.append((x,) + best)
+
+            # One junction per *stretch* of overlap, taken at its closest
+            # point. Not one per sample, and not one per fixed distance
+            # along the run either -- which is what this used to do, and it
+            # scattered a join every reach-width down two marks that ran
+            # close for a long way, walling off a sliver between each pair.
+            # Measured on a sine and a sawtooth 7.5 mm apart over 1.7 m: 78
+            # junctions and 78 slivers, where the drawing has three
+            # meetings. A stretch is where the ink genuinely overlaps, so
+            # its ends are where the profile crosses out of reach, and the
+            # meeting is its lowest point.
+            run = []
+            for entry in profile + [None]:
+                if entry is not None and entry[1] <= reach:
+                    run.append(entry)
                     continue
-                taken.append(middle)
-                inserts[i].setdefault(x, []).append((fac_a, middle))
-                inserts[j].setdefault(y, []).append((fac_b, middle))
-                joins += 1
+                if run:
+                    x, distance, fac_a, on_a, y, fac_b, on_b = min(
+                        run, key=lambda item: item[1])
+                    middle = (on_a + on_b) * 0.5
+                    inserts[i].setdefault(x, []).append((fac_a, middle))
+                    inserts[j].setdefault(y, []).append((fac_b, middle))
+                    joins += 1
+                    run = []
 
     out = []
     for index, (points, cyclic, width) in enumerate(strokes):

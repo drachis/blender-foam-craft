@@ -64,7 +64,12 @@ PEN_RADIUS_M = 0.005
 
 _SPAN = 1.7          # how far across the sheet the waves run
 _CYCLES = 3.0
-_SAMPLES = 240
+# 241 samples, not a round 240, so that (N-1) divides by 12 and the sine's
+# peaks land *exactly* on sampled points for 3 cycles. Off-sample peaks cost
+# a fraction of a step in x, which on a steep sawtooth ramp is several
+# millimetres in y -- enough to push the meeting outside the nib at large
+# amplitudes and make the cutter look like it had missed when the test had.
+_SAMPLES = 241
 
 
 def _clear():
@@ -96,7 +101,7 @@ def _sine(amplitude):
     return out
 
 
-def _sawtooth(amplitude):
+def _sawtooth(amplitude, gap=None):
     """A sawtooth riding above the sine, dipping to meet each of its peaks.
 
     Lifted so its *troughs* sit exactly ``1.5 * PEN_RADIUS_M`` above the
@@ -118,7 +123,9 @@ def _sawtooth(amplitude):
     peaks by the top. That is the harder question, and the one the
     local-minimum clustering in `join_touching_strokes` exists to answer.
     """
-    offset = 2.0 * amplitude + 1.5 * PEN_RADIUS_M
+    if gap is None:
+        gap = 1.5 * PEN_RADIUS_M
+    offset = 2.0 * amplitude + gap
     out = []
     for i in range(_SAMPLES):
         f = i / (_SAMPLES - 1.0)
@@ -172,6 +179,41 @@ def _junctions(bm):
                if sum(1 for e in v.link_edges if e.seam) >= 3)
 
 
+def _enclosed_regions(bm):
+    """Regions the cut walled off completely -- pieces, rather than the rest
+    of the sheet.
+
+    This is the number that says whether the pattern actually made anything.
+    Two waves pinched together at each peak should enclose the stretch
+    between one pinch and the next: a piece per raised iteration of the
+    wave. A region touching the sheet's outer boundary is not that -- it is
+    the leftover surround, and it is there whether the cut worked or not,
+    which is why a plain region count can look healthy while nothing was
+    actually enclosed.
+    """
+    outer = {f for e in bm.edges if len(e.link_faces) == 1
+             for f in e.link_faces}
+    seen, enclosed = set(), 0
+    for face in bm.faces:
+        if face in seen:
+            continue
+        stack, group = [face], []
+        seen.add(face)
+        while stack:
+            current = stack.pop()
+            group.append(current)
+            for loop in current.loops:
+                if loop.edge.seam:
+                    continue
+                for other in loop.edge.link_faces:
+                    if other not in seen:
+                        seen.add(other)
+                        stack.append(other)
+        if not any(f in outer for f in group):
+            enclosed += 1
+    return enclosed
+
+
 def _strays(edges, drawn, tolerance):
     """Cut edges whose middles lie off every drawn stroke."""
     count = 0
@@ -220,6 +262,7 @@ def test_sine_against_sawtooth_across_amplitudes():
         networks = _seam_networks(bm)
         junctions = _junctions(bm)
         regions = _seam_regions_count(bm)
+        enclosed = _enclosed_regions(bm)
         # Judged against the ink, not the centrelines. Where two marks
         # overlap the cut deliberately runs down the *midline between
         # them* -- that is the whole point of `join_touching_strokes`, and
@@ -241,6 +284,7 @@ def test_sine_against_sawtooth_across_amplitudes():
             "seam_networks": networks,
             "junctions": junctions,
             "regions": regions,
+            "enclosed_pieces": enclosed,
             "cut_edges": len(edges),
             "strays_beyond_the_ink": strays,
             "open_ends": open_ends,
@@ -290,6 +334,13 @@ def test_sine_against_sawtooth_across_amplitudes():
         # not a pattern anyone drew -- see the note in this file's summary.
         "merging_marks_do_not_make_a_ladder_of_slivers":
             ordered[0]["regions"] <= 6,
+        # The invariant that says the pattern actually made something: the
+        # two waves pinch together at each of the 3 peaks, so the stretch
+        # between one pinch and the next is walled off -- a piece per raised
+        # iteration of the wave. Zero enclosed pieces means the pinches did
+        # not close, however healthy the plain region count looks.
+        "every_wave_iteration_encloses_a_piece": all(
+            r["enclosed_pieces"] >= int(_CYCLES) - 1 for r in ordered),
     }
     return out
 
@@ -314,8 +365,145 @@ def _seam_regions_count(bm):
     return regions
 
 
+def test_joining_follows_the_ink_not_the_distance():
+    """Whether two marks join must depend on the *ink*, not on any absolute
+    distance -- so it is the ratio of separation to nib that decides, and
+    the same ratio must give the same answer at any scale.
+
+    Four cases at one amplitude: a fine nib and a broad one, each with the
+    marks drawn inside their combined ink and clearly outside it. A rule
+    keyed to a fixed distance would join the broad-nib pair at 15 mm and
+    refuse the fine-nib pair at 6 mm, which is backwards -- 6 mm is three
+    nib-widths for a fine pen and well clear, while 15 mm is inside a broad
+    one and plainly one mark.
+    """
+    rows = {}
+    amplitude = 0.03
+    for label, radius, gap in (
+            ("fine_nib_ink_overlaps", 0.002, 0.003),
+            ("fine_nib_clearly_apart", 0.002, 0.006),
+            ("broad_nib_ink_overlaps", 0.010, 0.015),
+            ("broad_nib_clearly_apart", 0.010, 0.030)):
+        _clear()
+        obj = _plane()
+        sine = _sine(amplitude)
+        saw = _sawtooth(amplitude, gap=gap)
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        edges, _ends = gp.cut_strokes(
+            bm, [(sine, False, radius), (saw, False, radius)],
+            snap_distance=0.0002)
+        for e in edges:
+            e.seam = True
+        rows[label] = {
+            "nib_radius_mm": round(radius * 1000, 2),
+            "separation_mm": round(gap * 1000, 2),
+            "ink_reach_mm": round(2 * radius * 1000, 2),
+            "ink_overlaps": gap < 2 * radius,
+            "seam_networks": _seam_networks(bm),
+            "junctions": _junctions(bm),
+            "enclosed_pieces": _enclosed_regions(bm),
+        }
+        bm.free()
+
+    out = dict(rows)
+    out["checks"] = {
+        "fine_nib_joins_when_its_own_ink_overlaps":
+            rows["fine_nib_ink_overlaps"]["enclosed_pieces"] >= 2,
+        "fine_nib_leaves_a_wider_gap_alone":
+            rows["fine_nib_clearly_apart"]["junctions"] == 0
+            and rows["fine_nib_clearly_apart"]["seam_networks"] == 2,
+        "broad_nib_joins_across_a_gap_the_fine_one_would_not":
+            rows["broad_nib_ink_overlaps"]["enclosed_pieces"] >= 2,
+        "broad_nib_still_refuses_when_its_ink_does_not_reach":
+            rows["broad_nib_clearly_apart"]["junctions"] == 0
+            and rows["broad_nib_clearly_apart"]["seam_networks"] == 2,
+        # The point, stated directly: 6 mm apart is two marks for a fine
+        # nib, and 15 mm apart is one mark for a broad one. Distance alone
+        # cannot tell them apart; ink can.
+        "the_wider_gap_joins_and_the_narrower_one_does_not":
+            rows["broad_nib_ink_overlaps"]["junctions"] > 0
+            and rows["fine_nib_clearly_apart"]["junctions"] == 0
+            and rows["broad_nib_ink_overlaps"]["separation_mm"]
+            > rows["fine_nib_clearly_apart"]["separation_mm"],
+    }
+    return out
+
+
+def test_two_parallel_sines():
+    """Two identical sines, one offset above the other -- the degenerate
+    case, and the one the sawtooth was chosen to avoid.
+
+    Everywhere else in this file the two marks pinch together and pull
+    apart, so there are distinct meetings to find. Two copies of the same
+    curve never pinch: the gap between them is the *same all the way
+    along*, so there is no closest point, no meeting, and nothing that
+    picks out one place over another. If the ink overlaps at all it
+    overlaps for the entire length, and a maker looking at that sees one
+    thick line rather than two lines that touch somewhere.
+
+    Reported here rather than asserted into a shape, because what a
+    single continuous overlap *should* cut to is a design decision and not
+    mine to make: one line down the middle is the honest reading of the
+    mark, and it is not what a pair-of-lines-plus-a-join produces.
+    """
+    rows = {}
+    amplitude = 0.03
+    for label, radius, gap in (
+            ("fine_nib_overlapping", 0.002, 0.003),
+            ("fine_nib_apart", 0.002, 0.006),
+            ("broad_nib_overlapping", 0.010, 0.015),
+            ("broad_nib_apart", 0.010, 0.030)):
+        _clear()
+        obj = _plane()
+        lower = _sine(amplitude)
+        upper = [Vector((p.x, p.y + gap, p.z)) for p in lower]
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        edges, _ends = gp.cut_strokes(
+            bm, [(lower, False, radius), (upper, False, radius)],
+            snap_distance=0.0002)
+        for e in edges:
+            e.seam = True
+        rows[label] = {
+            "nib_radius_mm": round(radius * 1000, 2),
+            "separation_mm": round(gap * 1000, 2),
+            "ink_reach_mm": round(2 * radius * 1000, 2),
+            "ink_overlaps": gap < 2 * radius,
+            "seam_networks": _seam_networks(bm),
+            "junctions": _junctions(bm),
+            "enclosed_pieces": _enclosed_regions(bm),
+            "cut_edges": len(edges),
+        }
+        bm.free()
+
+    out = dict(rows)
+    out["checks"] = {
+        # Drawn clearly apart, at either nib, they stay two lines. This is
+        # the half that must hold whatever is decided about the other.
+        "separate_marks_stay_separate":
+            rows["fine_nib_apart"]["seam_networks"] == 2
+            and rows["broad_nib_apart"]["seam_networks"] == 2,
+        "separate_marks_invent_no_junctions":
+            rows["fine_nib_apart"]["junctions"] == 0
+            and rows["broad_nib_apart"]["junctions"] == 0,
+        # Overlapping ink is noticed at all, at either nib.
+        "overlapping_marks_are_noticed":
+            rows["fine_nib_overlapping"]["seam_networks"] == 1
+            and rows["broad_nib_overlapping"]["seam_networks"] == 1,
+        # And it must not wall off slivers down the length, which is what
+        # the old per-distance clustering did to a long parallel overlap.
+        "no_ladder_of_slivers":
+            rows["fine_nib_overlapping"]["enclosed_pieces"] <= 2
+            and rows["broad_nib_overlapping"]["enclosed_pieces"] <= 2,
+    }
+    return out
+
+
 TESTS = (
     test_sine_against_sawtooth_across_amplitudes,
+    test_joining_follows_the_ink_not_the_distance,
+    test_two_parallel_sines,
 )
 
 result = {}
