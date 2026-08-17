@@ -49,6 +49,40 @@ question needs a script to answer it against a live bake, the operator was
 not saying enough. `cut_routes` and `cut_accuracy` exist because that
 session kept re-deriving, from scratch, numbers the cutter already knew.
 
+**A tolerance that stands for a physical limit is not a tuning knob.**
+This add-on exists to produce something a person then cuts out of foam with
+a real tool, and several of its numbers are measurements of that tool rather
+than parameters of an algorithm. `snap_distance` is the clearest: it is the
+smallest feature the saw or hot wire can actually follow. You cannot cut a
+notch finer than the blade, so the pattern must not contain one.
+
+That fixes the direction the reasoning has to run. The tolerance is set from
+the workshop, and whatever accuracy falls out of it is the answer. It is
+never lowered to make a measurement look better — doing that produces a
+pattern the shop cannot cut, which is worse than an honest coarse one,
+and it does it silently.
+
+Worked example (2026-08-16), and the mistake is mine: a session measured
+that the cut sat further from the drawn line at `snap_distance=0.022` than
+at `0.004`, and recommended lowering it. Wrong advice. The number came from
+what the user can physically cut. The correct reading of the same
+measurement is that *the drawn pattern has detail finer than the process can
+make* — a craftability finding to report to the maker, alongside the ones
+the advisor already produces, not a defect in the cutter and not a number to
+turn down.
+
+Two consequences worth stating separately:
+
+- **Model at real-world scale.** A physical tolerance in metres only means
+  anything if the sculpt is the size of the thing being built. On a 2 m test
+  sphere a 0.022 m snap is a 22 mm blade, which is coarse; on a real horn it
+  might be right. When a tolerance and a model disagree, suspect the model's
+  scale before the tolerance.
+- **Say when the drawing is finer than the process.** The `welded=` count in
+  `cut_accuracy` is exactly this signal — it is how many of the maker's own
+  drawn points were merged away because they were closer together than the
+  blade is wide. It is worth surfacing rather than leaving in the log.
+
 **Investigation findings go in `RESEARCH_<slug>.md`, never only in chat.**
 The same reasoning as the rule above, applied to prose instead of code: a
 root-cause hunt that read source and ran live experiments against a running

@@ -165,16 +165,24 @@ def test_snap_distance_trades_fidelity_for_welding():
 
     It feeds `bmesh.ops.remove_doubles` at the end of the cut, which exists
     to stop the cut leaving zero-length edges and the collapsed faces around
-    them. But it welds by distance, so a generous setting also drags the cut
-    off the line it was following. Measured on the workshop file, whose
-    setting was 0.022 on a 1m sphere: the drawn points' p90 offset fell from
-    0.0045 to 0.0 as the setting was tightened to 0.001.
+    them. But it welds by distance, so a generous setting also pulls the cut
+    off the line it was following.
 
-    That is worth a check rather than a comment, because the direction is
-    not obvious from the code and the setting is exposed in the UI: a future
-    change that made a large snap harmless would mean the weld had stopped
-    doing its job, and one that made a small snap inaccurate would mean the
-    cut had stopped following the line.
+    Read the direction of this check carefully, because the obvious reading
+    is the wrong one. `snap_distance` is the smallest feature the saw can
+    actually cut (see CLAUDE.md, "A tolerance that stands for a physical
+    limit is not a tuning knob") -- it is a measurement of the workshop, not
+    a knob to turn until the numbers look good. So this does **not** say
+    "prefer a small snap". It says the setting has a real and bounded cost,
+    which is what lets a coarse result be read correctly when it happens: a
+    cut that cannot follow the drawing at the blade's own width means the
+    pattern has detail finer than the process can make, and that belongs in
+    front of the maker rather than being tuned away.
+
+    Worth a check rather than a comment because both directions are
+    failures. A large snap that stopped costing anything would mean the weld
+    had quietly stopped welding; a small snap that was inaccurate would mean
+    the cut had stopped following the line.
     """
     stroke = _spiral()
     rows = {}

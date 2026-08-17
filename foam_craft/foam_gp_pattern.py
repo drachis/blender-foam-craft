@@ -1644,12 +1644,14 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
 
     snap_distance: bpy.props.FloatProperty(
         name="Snap Distance",
-        description="Crossings and stroke ends landing closer than this to an "
-                    "existing vertex reuse it rather than splitting again. A "
-                    "drawn line has the width of a marker tip while the curve "
-                    "taken from it is idealised to zero width, so marks a "
-                    "fraction of a millimetre apart were one line as drawn. "
-                    "Measured on the sculpt, so it means the same at any scale",
+        description="The smallest feature the saw or hot wire can actually "
+                    "follow. Set it from the tool, not to taste: detail "
+                    "drawn finer than this is welded away, because a notch "
+                    "narrower than the blade cannot be cut. Crossings and "
+                    "stroke ends landing closer than this to an existing "
+                    "vertex reuse it rather than splitting again. Measured "
+                    "on the sculpt, so the sculpt must be at real-world "
+                    "scale for it to mean anything",
         default=0.002, min=0.0, max=0.05,
         subtype='DISTANCE', unit='LENGTH', precision=4)
     unwrap_method: bpy.props.EnumProperty(
