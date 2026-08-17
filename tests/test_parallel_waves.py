@@ -500,7 +500,77 @@ def test_two_parallel_sines():
     return out
 
 
+def test_a_stack_of_parallel_lines_inside_one_another_s_ink():
+    """Two parallel marks inside each other's ink read as one thick line.
+    So what does a stack of them read as?
+
+    A hatch drawn tight enough that every line touches its neighbours is a
+    real thing to draw -- it is how anyone shades -- and it is the case
+    where "join what overlaps" has the most opportunity to make a mess:
+    with 12 lines each within reach of several others, there are dozens of
+    pairs that all overlap, and joining every one of them independently
+    would web the whole band together.
+
+    Reported rather than pinned to an expected count, because the right
+    answer is a judgement about what the mark means, and 12 tight lines
+    plausibly mean one broad band rather than 12 boundaries. What can be
+    asserted is that it does not degenerate: the work must not explode with
+    the number of lines, and it must not wall off a sliver for every pair.
+    """
+    rows = {}
+    amplitude = 0.03
+    radius = 0.005
+    spacing = 0.006          # inside 2*radius, so every neighbour overlaps
+    for count in (2, 3, 4, 12):
+        _clear()
+        obj = _plane()
+        base = _sine(amplitude)
+        strokes = []
+        for n in range(count):
+            offset = (n - (count - 1) * 0.5) * spacing
+            strokes.append(([Vector((p.x, p.y + offset, p.z)) for p in base],
+                            False, radius))
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        edges, _ends = gp.cut_strokes(bm, strokes, snap_distance=0.0002)
+        for e in edges:
+            e.seam = True
+        rows["lines_%d" % count] = {
+            "lines": count,
+            "spacing_mm": round(spacing * 1000, 2),
+            "ink_reach_mm": round(2 * radius * 1000, 2),
+            "band_width_mm": round((count - 1) * spacing * 1000, 2),
+            "seam_networks": _seam_networks(bm),
+            "junctions": _junctions(bm),
+            "enclosed_pieces": _enclosed_regions(bm),
+            "cut_edges": len(edges),
+        }
+        bm.free()
+
+    ordered = [rows["lines_%d" % n] for n in (2, 3, 4, 12)]
+    out = dict(rows)
+    out["checks"] = {
+        # Every line overlaps its neighbours, so the band is one connected
+        # cut however many lines are in it.
+        "the_whole_band_is_one_cut": all(
+            r["seam_networks"] == 1 for r in ordered),
+        # No sliver per pair. Joining n lines pairwise where every pair
+        # overlaps would enclose a piece between each neighbouring pair and
+        # then some; a band should not manufacture pieces out of its own
+        # hatching.
+        "no_sliver_per_pair": all(
+            r["enclosed_pieces"] <= r["lines"] for r in ordered),
+        # And the cost stays sane: 12 lines is 6x the strokes of 2, so
+        # anything worse than a few times the edges means the pairwise
+        # joining is compounding.
+        "work_does_not_explode":
+            rows["lines_12"]["cut_edges"] < rows["lines_2"]["cut_edges"] * 12,
+    }
+    return out
+
+
 TESTS = (
+    test_a_stack_of_parallel_lines_inside_one_another_s_ink,
     test_sine_against_sawtooth_across_amplitudes,
     test_joining_follows_the_ink_not_the_distance,
     test_two_parallel_sines,

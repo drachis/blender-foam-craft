@@ -430,6 +430,41 @@ def _locally_trivial(hit_a, hit_b):
     return None
 
 
+def _faces_along(bm, bvh, p_from, p_to, face_from, face_to):
+    """The faces the segment actually passes over, gathered spatially.
+
+    The knife gathers its candidates from a spatial query and never walks
+    face adjacency (`knife_find_line_hits`), and that is the difference
+    between a search that is bounded by the *segment* and one bounded by a
+    ring count picked in advance. Growing outward from one end until the
+    other is reached had to guess how far to go: too small and the far end
+    of a long segment was never searched, so its crossings were never
+    collected and the seam came out with a hole in it and said nothing; too
+    large and a dense sculpt pays for thousands of faces on every ordinary
+    step. Walking the segment and asking the surface what is under each
+    step is bounded by how long the segment is and how big the faces are,
+    which is the honest answer to "what could this cross".
+
+    One ring of vertex neighbours is added around whatever the walk found,
+    to catch a face the segment only clips the corner of.
+    """
+    faces = {face_from, face_to}
+    span = p_to - p_from
+    length = span.length
+    if length > 1e-12:
+        lengths = [e.calc_length() for e in face_from.edges]
+        step = max(min(lengths) * 0.5 if lengths else length, 1e-9)
+        steps = min(4096, max(2, int(length / step) + 2))
+        for i in range(steps + 1):
+            _loc, _nrm, index, _d = bvh.find_nearest(p_from + span * (i / steps))
+            if index is not None:
+                faces.add(bm.faces[index])
+    for face in list(faces):
+        for vert in face.verts:
+            faces.update(vert.link_faces)
+    return faces
+
+
 def _faces_around(face_from, face_to, limit=64):
     """The patch of mesh the segment could plausibly cross, grown out from
     `face_from` by vertex adjacency until `face_to` is inside it.
@@ -467,7 +502,8 @@ def _faces_around(face_from, face_to, limit=64):
     return seen
 
 
-def _crossings_along(face_from, face_to, p_from, p_to, weld):
+def _crossings_along(face_from, face_to, p_from, p_to, weld,
+                     bm=None, bvh=None):
     """Every existing edge or vertex the segment crosses, in order along it.
 
     This is the knife's own method, and it replaces a face-to-face walk that
@@ -493,8 +529,14 @@ def _crossings_along(face_from, face_to, p_from, p_to, weld):
     if span < 1e-18:
         return None
 
+    # Spatially where we can -- see `_faces_along`. The adjacency walk is
+    # kept only for callers that have no surface tree to ask.
+    if bm is not None and bvh is not None:
+        candidates = _faces_along(bm, bvh, p_from, p_to, face_from, face_to)
+    else:
+        candidates = _faces_around(face_from, face_to)
     found = {}
-    for face in _faces_around(face_from, face_to):
+    for face in candidates:
         for edge in face.edges:
             if edge in found:
                 continue
@@ -564,7 +606,7 @@ def _crossings_along(face_from, face_to, p_from, p_to, weld):
     return kept or None
 
 
-def _bridge(hits, stats=None):
+def _bridge(hits, stats=None, bm=None, bvh=None):
     """Insert the crossings between points that share no face.
 
     `stats` is an optional counter dict, tallying which route each pair of
@@ -645,7 +687,7 @@ def _bridge(hits, stats=None):
         # Collect and sort, the way the knife does -- see `_crossings_along`.
         crossed = _crossings_along(previous["face"], hit["face"],
                                    previous["loc"], hit["loc"],
-                                   _weld_eps(previous["face"]))
+                                   _weld_eps(previous["face"]), bm, bvh)
         if crossed:
             tally("crossed")
             tally("crossings", len(crossed))
@@ -927,7 +969,7 @@ def _add_stroke_to_graph(bm, bvh, graph, points, cyclic, snap_distance,
     never written; nothing here creates real topology.
     """
     hits = _classify(bm, bvh, points)
-    hits, missed = _bridge(hits, stats)
+    hits, missed = _bridge(hits, stats, bm, bvh)
     if missed:
         _log.warning(foam_log.summary(
             "stroke_gaps", segments=missed, points=len(points)))
