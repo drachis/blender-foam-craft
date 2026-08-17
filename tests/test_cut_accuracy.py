@@ -248,39 +248,32 @@ def test_bridge_routes_are_sane_on_an_ordinary_curve():
     bm.free()
 
     segments = len(stroke) - 1
+    # Every route a segment can take. `crossings` is deliberately absent --
+    # it counts hits, not segments, and adding it here would break the tally.
     routed = sum(stats.get(k, 0) for k in
-                 ("same_face", "shared_edge", "through_corner", "walked",
-                  "corner_fallback", "no_route"))
-    fallbacks = stats.get("corner_fallback", 0)
-    worst_detour = stats.get("corner_fallback_worst", 0.0)
-    # The sphere's own edge length, the natural yardstick for "how far off
-    # the line is too far": 48 segments around the equator.
-    edge_len = 2.0 * math.pi / 48.0
+                 ("same_face", "shared_edge", "through_corner", "crossed",
+                  "walked", "corner_fallback", "no_route"))
     return {
         "routes": stats,
         "segments": segments,
         "points_after_bridging": len(bridged),
         "missed": missed,
-        "sphere_edge_length": round(edge_len, 5),
         "checks": {
             # Every segment took exactly one route, so the tally is complete
             # -- otherwise the numbers below describe only part of the cut.
             "every_segment_accounted_for": routed == segments,
             # No segment left uncrossed.
             "no_segment_without_a_route": stats.get("no_route", 0) == 0,
-            # Corner fallbacks are a known, deliberate compromise: when the
-            # face walk cannot find the way across, bending the cut to the
-            # shared corner keeps the seam connected, which beats a hole in
-            # the piece boundary. So this is not asserted at zero -- it is
-            # asserted *rare*, because the failure that matters is the route
-            # becoming common again (it was the default before, and put a
-            # visible notch in the workshop file's seam).
-            "corner_fallbacks_are_rare": fallbacks <= max(2, segments * 0.02),
-            # ...and bounded. A fallback moves the cut to a corner of the
-            # face it was crossing, so it can never be off by more than the
-            # face is wide; well inside that is the check worth having.
-            "corner_fallback_detour_is_small":
-                worst_detour <= edge_len * 0.25,
+            # And none bent to a corner. This was once asserted merely
+            # "rare", because the face walk it fell back from could not
+            # always find its way across -- collecting the crossings and
+            # sorting them, the way the knife does, removed the need for the
+            # fallback rather than making it rarer, so zero is the honest
+            # bar now. A seam bent to a corner is a pattern that does not
+            # match what the maker drew.
+            "no_corner_fallbacks": stats.get("corner_fallback", 0) == 0,
+            # The old face walk should likewise never be needed.
+            "no_face_walks_needed": stats.get("walked", 0) == 0,
             # Bridging inserts crossings, so it can only add points.
             "bridging_added_crossings": len(bridged) > len(stroke),
         },

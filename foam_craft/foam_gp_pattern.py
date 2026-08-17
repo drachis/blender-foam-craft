@@ -430,6 +430,129 @@ def _locally_trivial(hit_a, hit_b):
     return None
 
 
+def _faces_around(face_from, face_to, limit=4):
+    """The patch of mesh the segment could plausibly cross, grown out from
+    `face_from` by vertex adjacency until `face_to` is inside it.
+
+    Vertex adjacency rather than edge adjacency on purpose: the whole point
+    is to include faces that touch only at a corner, which is where the walk
+    this replaces used to get stuck.
+    """
+    seen = {face_from}
+    frontier = [face_from]
+    for _ in range(limit):
+        if face_to in seen:
+            break
+        nxt = []
+        for face in frontier:
+            for vert in face.verts:
+                for other in vert.link_faces:
+                    if other not in seen:
+                        seen.add(other)
+                        nxt.append(other)
+        if not nxt:
+            break
+        frontier = nxt
+    return seen
+
+
+def _crossings_along(face_from, face_to, p_from, p_to, weld):
+    """Every existing edge or vertex the segment crosses, in order along it.
+
+    This is the knife's own method, and it replaces a face-to-face walk that
+    could not always find its way. `knife_find_line_hits` gathers every
+    candidate element near the cut segment and tests each one, then
+    `prepare_linehits_for_cut` sorts them by distance along the segment and
+    discards edge hits that sit next to a near-coincident vertex hit
+    (editmesh_knife.cc:1860-1933). Nothing steps from face to face, so there
+    is no state to get stuck in.
+
+    The walk it replaces failed exactly where a segment passed close to a
+    corner: its next crossing was then at almost the same distance along as
+    the last one, its "must make progress" epsilon rejected it, and the walk
+    gave up with nowhere to go. Collecting and sorting has no such problem --
+    two crossings at the same distance are simply two hits at the same
+    distance, and if they share a vertex that is precisely the signal the
+    line went through the corner.
+
+    Returns a list of hit dicts, or None when nothing was found.
+    """
+    direction = p_to - p_from
+    span = direction.length_squared
+    if span < 1e-18:
+        return None
+
+    found = {}
+    for face in _faces_around(face_from, face_to):
+        for edge in face.edges:
+            if edge in found:
+                continue
+            a, b = edge.verts[0].co, edge.verts[1].co
+            meeting = intersect_line_line(p_from, p_to, a, b)
+            if meeting is None:
+                continue
+            on_segment, on_edge = meeting
+            # Skew lines: the stroke lies on a curved surface and the edge is
+            # straight, so they rarely meet exactly. Same test the walk used.
+            if (on_segment - on_edge).length > direction.length * 0.5:
+                continue
+            along = (on_segment - p_from).dot(direction) / span
+            if not (1e-9 < along < 1.0 - 1e-9):
+                continue
+            edge_span = b - a
+            denom = edge_span.length_squared
+            if denom < 1e-18:
+                continue
+            fac = (on_edge - a).dot(edge_span) / denom
+            if not (-1e-6 <= fac <= 1.0 + 1e-6):
+                continue
+            found[edge] = (along, max(0.0, min(1.0, fac)))
+
+    if not found:
+        return None
+
+    ordered = sorted((along, fac, edge) for edge, (along, fac) in found.items())
+
+    # A crossing that lands on an edge's own end is really a vertex hit, and
+    # saying so keeps the cut off a zero-length sliver beside the corner.
+    out, used_verts = [], set()
+    for along, fac, edge in ordered:
+        a, b = edge.verts[0], edge.verts[1]
+        length = (b.co - a.co).length
+        vert = None
+        if fac * length <= weld:
+            vert = a
+        elif (1.0 - fac) * length <= weld:
+            vert = b
+        if vert is not None:
+            # All but one of a series of hits on the same vertex is dropped,
+            # as the knife does (editmesh_knife.cc:1899).
+            if vert in used_verts:
+                continue
+            used_verts.add(vert)
+            out.append((along, {"kind": VERT, "elem": vert, "fac": 0.0,
+                                "loc": vert.co.copy(), "face": face_from}))
+        else:
+            out.append((along, {"kind": EDGE, "elem": edge, "fac": fac,
+                                "loc": a.co + (b.co - a.co) * fac,
+                                "face": edge.link_faces[0]
+                                if edge.link_faces else face_from}))
+
+    # Where the line passed through a corner, the two edges meeting there
+    # were both crossed at the same distance; the vertex hit already stands
+    # for that, so drop the edge hits it swallowed.
+    kept = []
+    for along, hit in out:
+        if hit["kind"] == EDGE and any(
+                other["kind"] == VERT
+                and abs(other_along - along) <= 1e-6
+                and other["elem"] in hit["elem"].verts
+                for other_along, other in out):
+            continue
+        kept.append(hit)
+    return kept or None
+
+
 def _bridge(hits, stats=None):
     """Insert the crossings between points that share no face.
 
@@ -507,6 +630,17 @@ def _bridge(hits, stats=None):
                             "loc": corner.co.copy(), "face": previous["face"]})
                 out.append(hit)
                 continue
+
+        # Collect and sort, the way the knife does -- see `_crossings_along`.
+        crossed = _crossings_along(previous["face"], hit["face"],
+                                   previous["loc"], hit["loc"],
+                                   _weld_eps(previous["face"]))
+        if crossed:
+            tally("crossed")
+            tally("crossings", len(crossed))
+            out.extend(crossed)
+            out.append(hit)
+            continue
 
         route = _walk_faces(previous["face"], previous["loc"],
                             hit["face"], hit["loc"])
