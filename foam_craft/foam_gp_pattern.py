@@ -1336,6 +1336,108 @@ def _nearest_on_polyline(point, points, cyclic):
     return best
 
 
+def _segment_closest(a0, a1, b0, b1):
+    """Closest approach between two segments.
+
+    Returns ``(distance, fac_a, point_a, fac_b, point_b)``.
+    """
+    u, v, w = a1 - a0, b1 - b0, a0 - b0
+    uu, uv, vv = u.dot(u), u.dot(v), v.dot(v)
+    uw, vw = u.dot(w), v.dot(w)
+    denom = uu * vv - uv * uv
+    if denom < 1e-18:                      # parallel, or a degenerate segment
+        s = 0.0
+        t = (vw / vv) if vv > 1e-18 else 0.0
+    else:
+        s = (uv * vw - vv * uw) / denom
+        t = (uu * vw - uv * uw) / denom
+    s = max(0.0, min(1.0, s))
+    t = max(0.0, min(1.0, t))
+    qa, qb = a0 + u * s, b0 + v * t
+    return (qa - qb).length, s, qa, t, qb
+
+
+def join_touching_strokes(strokes, tolerance):
+    """Join strokes whose ink overlaps but whose centrelines never meet.
+
+    A hand draws with a nib that has width; the curve taken from it is
+    idealised to none. So two marks can plainly touch on the page -- their
+    ink shares the same patch of paper -- while the polylines through their
+    middles pass by each other with a gap. Read as curves they do not
+    cross, and nothing joins them; read as marks they are obviously one
+    junction, and a maker looking at the drawing would cut it as one.
+
+    The case that named this: a C drawn just under the corner of a V, close
+    enough that the two marks merge into a single blot at the elbow. Neither
+    is an end meeting anything -- `snap_stroke_ends` handles ends and this
+    is mid-stroke on both -- and they do not intersect, so the ordinary
+    crossing machinery never sees them. The corner simply did not cut.
+
+    Where the two run within a nib's width of each other, this puts a point
+    on the **midline between them** and inserts it into both strokes, so
+    both pass through the same place and the graph joins them there like any
+    other crossing. The midline rather than one line or the other because
+    neither mark is the junction on its own: the blot is, and its middle is
+    the honest reading of where the maker would put the knife.
+
+    Only the closest point of each overlapping stretch is taken, not every
+    pair within reach. Two strokes running alongside each other for a while
+    overlap at hundreds of sampled points and mean one meeting, not
+    hundreds; taking the local minimum of each stretch is what tells "these
+    two touch here" from "these two run together".
+    """
+    strokes = [(list(s[0]), s[1], s[2] if len(s) > 2 else 0.0)
+               for s in strokes]
+    inserts = [{} for _ in strokes]
+    joins = 0
+    for i in range(len(strokes)):
+        points_a, _cyclic_a, width_a = strokes[i]
+        for j in range(i + 1, len(strokes)):
+            points_b, _cyclic_b, width_b = strokes[j]
+            reach = max(tolerance, width_a + width_b)
+            found = []
+            for x in range(len(points_a) - 1):
+                for y in range(len(points_b) - 1):
+                    distance, fac_a, on_a, fac_b, on_b = _segment_closest(
+                        points_a[x], points_a[x + 1],
+                        points_b[y], points_b[y + 1])
+                    if distance <= reach:
+                        found.append((distance, x, fac_a, on_a, y, fac_b, on_b))
+            if not found:
+                continue
+            # One junction per overlapping stretch: take them closest-first
+            # and drop any that sits within reach of one already taken.
+            found.sort(key=lambda item: item[0])
+            taken = []
+            for distance, x, fac_a, on_a, y, fac_b, on_b in found:
+                middle = (on_a + on_b) * 0.5
+                if any((middle - other).length <= reach for other in taken):
+                    continue
+                taken.append(middle)
+                inserts[i].setdefault(x, []).append((fac_a, middle))
+                inserts[j].setdefault(y, []).append((fac_b, middle))
+                joins += 1
+
+    out = []
+    for index, (points, cyclic, width) in enumerate(strokes):
+        if not inserts[index]:
+            out.append((points, cyclic, width))
+            continue
+        grown = []
+        for position, point in enumerate(points):
+            grown.append(point)
+            for _fac, middle in sorted(inserts[index].get(position, []),
+                                       key=lambda item: item[0]):
+                if (middle - grown[-1]).length > 1e-9:
+                    grown.append(middle.copy())
+        out.append((grown, cyclic, width))
+
+    if joins:
+        _log.info(foam_log.summary(
+            "strokes_joined_by_ink", junctions=joins, tolerance=tolerance))
+    return out
+
+
 def _end_direction(points, end_index):
     """Unit vector pointing outward along the stroke at one of its ends.
 
@@ -1641,6 +1743,11 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
     # merges strokes and the widths would not survive it.
     pen = max((s[2] for s in strokes if len(s) > 2), default=0.0)
     strokes = snap_stroke_ends(strokes, snap_distance)
+    # Then the marks that overlap without their centrelines meeting -- see
+    # `join_touching_strokes`. After the ends, because an end that reaches
+    # its target properly should do so on its own terms rather than being
+    # read as a blot.
+    strokes = join_touching_strokes(strokes, snap_distance)
     strokes = [(s[0], s[1]) for s in strokes]
     # Ends meeting *ends* is the same judgement at a corner: two marks within a
     # pen width of each other were one mark.

@@ -20,6 +20,7 @@ Run against a live Blender with the add-on installed::
 Same rule as tests/test_gp_pattern.py: every check states both bounds.
 """
 
+import math
 import sys
 import importlib
 import traceback
@@ -728,8 +729,111 @@ def test_junction_with_an_open_arm_still_cuts():
     return out
 
 
+def _seam_networks(bm):
+    """Connected groups of seam edges -- how many separate cut lines the
+    mesh ends up with. Two strokes that joined leave one; two that passed
+    each other without joining leave two."""
+    seam = [e for e in bm.edges if e.seam]
+    seen, groups = set(), 0
+    for edge in seam:
+        if edge in seen:
+            continue
+        groups += 1
+        stack = [edge]
+        seen.add(edge)
+        while stack:
+            current = stack.pop()
+            for vert in current.verts:
+                for other in vert.link_edges:
+                    if other.seam and other not in seen:
+                        seen.add(other)
+                        stack.append(other)
+    return groups
+
+
+# --- 9. Marks that touch but whose centrelines do not ------------------
+def test_overlapping_ink_joins_even_when_curves_miss():
+    """A C drawn just under the corner of a V, close enough that the two
+    marks merge into one blot at the elbow -- and reported from the workshop
+    file as a corner that simply does not cut.
+
+    Nothing else in this module sees it. `snap_stroke_ends` looks at ends,
+    and this is mid-stroke on both. The crossing machinery wants the
+    centrelines to actually meet, and they miss. So read as curves there is
+    no junction here at all, while read as marks on paper there is obviously
+    one, and the maker would cut it as one.
+
+    The gap is 0.006 against pen half-widths of 0.005 each: the curves are
+    a clear 6 mm apart, so nothing may join them by proximity of the lines
+    themselves, while the ink overlaps by 4 mm and a person would see one
+    mark.
+
+    Known answer: the V and the C become a single connected cut. Before,
+    they are two separate seam networks that never touch; the elbow region
+    is closed off by the join, which also raises the region count.
+
+    Two-sided: the same shapes drawn *far* apart -- 30 mm, well beyond any
+    nib -- must stay two networks, or this is not reading the ink, it is
+    just joining whatever is nearest.
+    """
+    results = {}
+    for label, gap in (("ink_overlaps", 0.006), ("clearly_apart", 0.03)):
+        _clear()
+        me, edge = _grid_plane(cuts=15)
+        # A V with its elbow at y = 0. Points, not endpoints, are what meet.
+        elbow = Vector((0.0, 0.0, 0.0))
+        v_stroke = (_densify([Vector((-0.62, 0.66, 0.0)), elbow], 26)
+                    + _densify([elbow, Vector((0.62, 0.66, 0.0))], 26)[1:])
+        # A C passing below the elbow, its top `gap` beneath it.
+        c_stroke = [Vector((0.52 * math.cos(a),
+                            -0.52 - gap + 0.52 * math.sin(a), 0.0))
+                    for a in [math.pi * (0.12 + 0.76 * i / 59.0)
+                              for i in range(60)]]
+        strokes = [(v_stroke, False, 0.005), (c_stroke, False, 0.005)]
+
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        edges, open_ends = gp.cut_strokes(bm, strokes, snap_distance=0.001)
+        for e in edges:
+            e.seam = True
+        networks = _seam_networks(bm)
+        regions = _seam_regions(bm)
+        # The join, if it happened, sits on the midline between the two.
+        midline = Vector((0.0, -gap * 0.5, 0.0))
+        arms = 0
+        for v in bm.verts:
+            if (v.co - midline).length > gap:
+                continue
+            arms = max(arms, sum(1 for e in v.link_edges if e.seam))
+        bm.free()
+
+        results[label] = {
+            "gap_mm": round(gap * 1000, 1),
+            "seam_networks": networks,
+            "regions": regions,
+            "seam_arms_on_the_midline": arms,
+            "open_ends": open_ends,
+        }
+
+    out = dict(results)
+    out["checks"] = {
+        # Ink overlapping: one cut, and the elbow is a real junction.
+        "overlapping_ink_becomes_one_cut":
+            results["ink_overlaps"]["seam_networks"] == 1,
+        "the_elbow_is_a_junction":
+            results["ink_overlaps"]["seam_arms_on_the_midline"] >= 3,
+        # Clearly apart: left alone. Without this the rule is not "read the
+        # ink", it is "join whatever is nearest", which would wreck any
+        # pattern with two lines deliberately drawn close.
+        "strokes_drawn_apart_stay_apart":
+            results["clearly_apart"]["seam_networks"] == 2,
+    }
+    return out
+
+
 TESTS = (
     test_self_crossing_stroke_keeps_both_arms,
+    test_overlapping_ink_joins_even_when_curves_miss,
     test_junction_with_an_open_arm_still_cuts,
     test_t_junction_is_order_independent,
     test_crossing_at_a_face_corner_still_joins,
