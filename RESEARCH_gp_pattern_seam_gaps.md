@@ -481,6 +481,14 @@ deliberately renumbered mesh, and `test_theta_cuts_identically_every_time`'s
 `every_run_agrees` check fails on the `seam_edges` field for the same
 reason.
 
+**It is intermittent, which is the thing to know before chasing it.**
+Measured 2026-08-16, three consecutive runs of the whole file against the
+same Blender instance: FAIL (both tests), FAIL (numbering only), PASS. So a
+single green run is not evidence of a fix -- this was briefly believed
+fixed by the corner-routing change on exactly that basis, and it was not.
+Anything claiming to resolve this needs several consecutive runs before it
+is believed.
+
 What is already ruled out: classification is stable
 (`test_points_on_an_edge_land_on_the_same_face_every_time` passes, so
 `_classify` returns the same kind and location for every point every run),
