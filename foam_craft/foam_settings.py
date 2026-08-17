@@ -155,11 +155,10 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
                     "blade cannot be cut. Set it from the tool, and model "
                     "the sculpt at real-world scale so it means something",
         default=0.002, min=0.0, max=0.05,
-        # Six decimals of a metre -- a thousandth of a millimetre. Four was
-        # not enough: a maker working to a 0.2 mm material resolution could
-        # only step the setting in 0.1 mm jumps, which is half their working
-        # tolerance per click.
-        subtype='DISTANCE', unit='LENGTH', precision=6)
+        # Four decimals of a metre, so the setting steps in 0.1 mm. That is
+        # the right grain for a thing cut by hand at metre scale -- finer
+        # steps would be tuning below what the cutting can hold anyway.
+        subtype='DISTANCE', unit='LENGTH', precision=4)
 
     # --- Stock, for craftability checks
     sheet_width: bpy.props.FloatProperty(
