@@ -149,12 +149,17 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
         poll=lambda self, obj: obj.type == 'GREASEPENCIL')
     snap_distance: bpy.props.FloatProperty(
         name="Snap Distance",
-        description="Default for the bake. A drawn line has the width of a "
-                    "marker tip while the curve taken from it is idealised to "
-                    "zero width, so cuts landing this close to an existing "
-                    "vertex reuse it rather than splitting again",
+        description="Default for the bake. The smallest feature the saw or "
+                    "hot wire can actually follow: detail drawn finer than "
+                    "this is welded away, because a notch narrower than the "
+                    "blade cannot be cut. Set it from the tool, and model "
+                    "the sculpt at real-world scale so it means something",
         default=0.002, min=0.0, max=0.05,
-        subtype='DISTANCE', unit='LENGTH', precision=4)
+        # Six decimals of a metre -- a thousandth of a millimetre. Four was
+        # not enough: a maker working to a 0.2 mm material resolution could
+        # only step the setting in 0.1 mm jumps, which is half their working
+        # tolerance per click.
+        subtype='DISTANCE', unit='LENGTH', precision=6)
 
     # --- Stock, for craftability checks
     sheet_width: bpy.props.FloatProperty(

@@ -1653,7 +1653,8 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
                     "on the sculpt, so the sculpt must be at real-world "
                     "scale for it to mean anything",
         default=0.002, min=0.0, max=0.05,
-        subtype='DISTANCE', unit='LENGTH', precision=4)
+        # See foam_settings.snap_distance for why six and not four.
+        subtype='DISTANCE', unit='LENGTH', precision=6)
     unwrap_method: bpy.props.EnumProperty(
         name="Unwrap",
         items=[
