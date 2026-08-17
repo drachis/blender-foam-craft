@@ -35,6 +35,27 @@ the understanding changed, which is usually the more valuable half.
     python tools/blender_bridge.py --port 9885 < tests/test_gp_pattern.py
     python tools/blender_bridge.py --port 9885 < tests/test_curvature_darts.py
 
+**Anything visual gets a GUI Blender, launched in the background.**
+Headless is right for anything that inspects data, and wrong for anything
+that has to be *looked at*: a background Blender has no window, so draw
+handlers never run and there is nothing to capture. Start a windowed one on
+its own port instead, and leave it running for the session:
+
+    python tools/launch_blender.py --port 9886 --gui
+
+It opens without taking focus (`SW_SHOWNOACTIVATE`), which is deliberate --
+the suite starts a Blender per test file and each one grabbing the keyboard
+made the machine unusable. Not minimised and not moved off-screen either:
+a window that is not composited does not draw, and then the screenshots
+come back blank.
+
+Use it whenever the result is a judgement rather than a number -- overlay
+work, and any change to what a cut *looks like*. A screenshot per case,
+through `tools/shot.py` so captures stay in the order they were taken,
+costs almost nothing and is the only way the person reviewing can check the
+thing you are claiming. Numbers say the seam closed; a picture says it
+closed where they drew it.
+
 **No code is one-off.** The same rule, stated the way it kept being broken:
 a "quick probe" written to answer one question during a debugging session is
 the same measurement the next session will need, so it goes in `tests/` at
