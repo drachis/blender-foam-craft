@@ -36,7 +36,7 @@ import traceback
 
 import bpy
 import bmesh
-from mathutils import Vector
+from mathutils import Vector, kdtree
 from mathutils.bvhtree import BVHTree
 
 _MOD = "bl_ext.user_default.foam_craft"
@@ -46,6 +46,15 @@ for _name in [n for n in list(sys.modules) if n.startswith(_MOD)]:
 import bl_ext.user_default.foam_craft.foam_gp_pattern as gp        # noqa: E402
 
 importlib.reload(gp)
+
+
+# The tolerances the check is swept over, in millimetres on a metre-scale
+# model. The loosest is the bar: 1 mm is finer than a hand cutting foam can
+# hold, so a drawn point with no cut vertex within it was not cut at all,
+# as against merely cut a little off. Sweeping rather than picking one
+# number is what separates those two failures -- an imprecise cut sheds
+# points gradually as the tolerance tightens, a missing one does not move.
+TOLERANCES_MM = (0.1, 0.25, 0.5, 1.0)
 
 
 def _clear():
@@ -116,6 +125,165 @@ def _spiral(turns=2.5, count=220, tilt=0.55):
                               math.sin(theta) * math.sin(phi),
                               math.cos(theta))))
     return points
+
+
+def _vertex_distances(drawn, bm, edges):
+    """For each drawn point, how far the nearest vertex of the cut is.
+
+    Distance to the nearest cut *vertex*, not to the nearest seam edge. A
+    point can sit exactly on a seam edge while no vertex was ever made for
+    it -- the edge simply passes by -- and that is the cut skipping detail
+    the maker drew.
+
+    Note this asks whether *a* vertex is near each point, not whether each
+    point got one of its own. At a 1 mm tolerance several drawn points may
+    legitimately share a single vertex; a hand-drawn stroke is sampled far
+    finer than any saw can follow, and collapsing that detail is the cut
+    working, not failing. What must never happen is a stretch of the drawn
+    line with no cut vertex anywhere near it.
+    """
+    cut_verts = {v.index: v for e in edges if e.is_valid for v in e.verts}
+    if not cut_verts:
+        return None
+    tree = kdtree.KDTree(len(cut_verts))
+    for i, v in enumerate(cut_verts.values()):
+        tree.insert(v.co, i)
+    tree.balance()
+
+    surface = BVHTree.FromBMesh(bm)
+    out = []
+    for stroke_index, point_index, point in drawn:
+        # The drawn line is cut where it lies *on* the surface: a stroke
+        # hovering above the mesh (a Shrinkwrap offset, or the sagitta of a
+        # faceted sphere under an analytic curve) is not the cutter missing.
+        landed = surface.find_nearest(point)[0]
+        if landed is None:
+            continue
+        _co, _i, distance = tree.find(landed)
+        out.append((distance, stroke_index, point_index, point, landed))
+    return out
+
+
+def _misses_at(distances, tolerance_mm):
+    """The drawn points with no cut vertex within `tolerance_mm`, described
+    well enough to go and find them on the curve."""
+    limit = tolerance_mm / 1000.0
+    return [{"stroke": si, "point": pi,
+             "drawn_at": tuple(round(c, 5) for c in point),
+             "on_surface_at": tuple(round(c, 5) for c in landed),
+             "nearest_vertex_mm": round(d * 1000.0, 4)}
+            for d, si, pi, point, landed in distances if d > limit]
+
+
+# --- 0. Every drawn point becomes a vertex ------------------------------
+def test_every_drawn_point_becomes_a_cut_vertex():
+    """The whole promise of this module, stated as plainly as it can be:
+    cut the pattern, and every point the maker drew has a vertex of the cut
+    within a hair of it. Anything less means the seam is not the line that
+    was drawn, and in foam that is a piece cut to the wrong shape.
+
+    Run with `snap_distance=0`, so nothing is snapped, welded or otherwise
+    tidied afterwards -- the question is what the cut itself produced, not
+    what survived the clean-up. (The cutter still keeps its own internal
+    epsilon, a thousandth of the shortest edge of the face being cut, to
+    avoid making zero-length edges and the collapsed faces around them.
+    That is the tolerance below, and it is a property of the geometry rather
+    than a setting.)
+
+    Three arrangements, because the failures this suite has actually seen
+    all involved more than one line:
+
+      plane_single   -- one curve on flat ground, where the drawn points lie
+                        exactly on the mesh and there is no projection to
+                        argue about. If this fails, nothing else matters.
+      plane_crossing -- two curves that cross, the shape a pattern is made
+                        of, and where a face's net can be refused.
+      sphere_spiral  -- a curve over a curved, irregularly-cut surface,
+                        sweeping every crossing angle.
+
+    On failure this reports each point that was missed and where it is, in
+    both the drawn frame and on the surface, so it can be found rather than
+    hunted for.
+    """
+    cases = {}
+    for label in ("plane_single", "plane_crossing", "sphere_spiral"):
+        _clear()
+        if label.startswith("plane"):
+            bpy.ops.mesh.primitive_plane_add(size=2.0)
+            me = bpy.context.object.data
+            bm0 = bmesh.new()
+            bm0.from_mesh(me)
+            bmesh.ops.subdivide_edges(bm0, edges=bm0.edges[:], cuts=15,
+                                      use_grid_fill=True)
+            bm0.to_mesh(me)
+            bm0.free()
+            bm = bmesh.new()
+            bm.from_mesh(me)
+            shortest = min(e.calc_length() for e in bm.edges)
+            wiggle = [Vector((-0.94 + 1.88 * i / 59.0,
+                              0.37 * math.sin(i / 59.0 * math.pi * 3.0), 0.0))
+                      for i in range(60)]
+            strokes = [(wiggle, False)]
+            if label == "plane_crossing":
+                strokes.append(
+                    ([Vector((0.21 + 0.3 * math.sin(i / 49.0 * math.pi),
+                              -0.96 + 1.92 * i / 49.0, 0.0))
+                      for i in range(50)], False))
+        else:
+            bm = _sphere()
+            shortest = min(e.calc_length() for e in bm.edges)
+            strokes = [(_spiral(), False)]
+
+        edges, open_ends = gp.cut_strokes(bm, strokes, snap_distance=0.0)
+        for e in edges:
+            e.seam = True
+
+        drawn = [(si, pi, p)
+                 for si, (points, _c) in enumerate(strokes)
+                 for pi, p in enumerate(points)]
+        distances = _vertex_distances(drawn, bm, edges)
+        bm.free()
+        if distances is None:
+            cases[label] = {"points": len(drawn),
+                            "error": "the cut produced no vertices at all"}
+            continue
+
+        worst = max(d for d, _s, _p, _pt, _l in distances)
+        cases[label] = {
+            "points": len(drawn),
+            "worst_mm": round(worst * 1000.0, 4),
+            # The sweep: how many points are left uncut as the tolerance
+            # tightens. A cut that is merely imprecise loses points slowly
+            # as this narrows; one that missed a stretch of the line
+            # entirely shows the same count at every tolerance, which is the
+            # signal worth telling apart.
+            "missed_at_mm": {str(mm): len(_misses_at(distances, mm))
+                             for mm in TOLERANCES_MM},
+            # Named, not just counted, at the loosest tolerance -- anything
+            # failing there is genuinely uncut rather than slightly off.
+            "uncut_at_%gmm" % max(TOLERANCES_MM):
+                _misses_at(distances, max(TOLERANCES_MM))[:8],
+            "open_ends": open_ends,
+        }
+
+    # The bar. A millimetre on a metre-scale sculpt is finer than the thing
+    # will be cut by hand, so a point with no vertex within it was not cut.
+    bar = max(TOLERANCES_MM)
+    out = dict(cases)
+    out["tolerances_mm"] = TOLERANCES_MM
+    out["checks"] = {
+        "every_point_cut_on_a_plane":
+            cases["plane_single"]["missed_at_mm"][str(bar)] == 0,
+        "every_point_cut_where_curves_cross":
+            cases["plane_crossing"]["missed_at_mm"][str(bar)] == 0,
+        "every_point_cut_on_a_sphere":
+            cases["sphere_spiral"]["missed_at_mm"][str(bar)] == 0,
+        # Two-sided: zero misses would also be reported by a run that
+        # measured nothing, so the points have to have been there.
+        "the_points_were_really_checked": all(
+            c.get("points", 0) > 40 for c in cases.values()),
+    }
+    return out
 
 
 # --- 1. The cut lands on the line ---------------------------------------
@@ -281,6 +449,7 @@ def test_bridge_routes_are_sane_on_an_ordinary_curve():
 
 
 TESTS = (
+    test_every_drawn_point_becomes_a_cut_vertex,
     test_cut_lands_on_the_drawn_line,
     test_snap_distance_trades_fidelity_for_welding,
     test_bridge_routes_are_sane_on_an_ordinary_curve,

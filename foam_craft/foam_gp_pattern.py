@@ -1064,6 +1064,7 @@ def _realise_graph(bm, graph, snap_distance):
         if made:
             by_face[face] = made
 
+    spurs = []
     for face, edges in by_face.items():
         if not face.is_valid:
             continue
@@ -1071,6 +1072,43 @@ def _realise_graph(bm, graph, snap_distance):
         live = [e for e in edges if e.is_valid and e not in own]
         if not live:
             continue
+
+        # Prune the spurs out of this face's net before handing it over.
+        #
+        # A drawn line that simply stops in the middle of a face -- the end
+        # of a stroke, which every open stroke has two of -- leaves an edge
+        # reaching the boundary at one end only. `face_split_edgenet`
+        # refuses a net containing one, and refuses it *wholly*: it returns
+        # nothing for the entire face, so the perfectly good crossing that
+        # happened to share that face is destroyed along with the stub. That
+        # is the "open end leaves an uncut area" defect, and it is the
+        # original sin of this module surviving in the one shape a cut-graph
+        # cannot resolve away, since no amount of tidying makes a dangling
+        # end reach a boundary.
+        #
+        # Pruning first lets the rest of the net split the face as it
+        # should. The spurs are not thrown away -- see below.
+        boundary = set(face.verts)
+        pruned, dropped = list(live), True
+        while dropped:
+            dropped = False
+            degree = {}
+            for edge in pruned:
+                for vert in edge.verts:
+                    degree[vert] = degree.get(vert, 0) + 1
+            keep = []
+            for edge in pruned:
+                a, b = edge.verts
+                if ((degree[a] == 1 and a not in boundary)
+                        or (degree[b] == 1 and b not in boundary)):
+                    spurs.append(edge)
+                    dropped = True
+                else:
+                    keep.append(edge)
+            pruned = keep
+        if not pruned:
+            continue
+        live = pruned
         try:
             made = bmesh.utils.face_split_edgenet(face=face, edgenet=live)
         except ValueError as exc:
@@ -1103,13 +1141,24 @@ def _realise_graph(bm, graph, snap_distance):
         new_edges.append(edge)
 
     # Anything still wire went nowhere -- a loose end sitting inside a face,
-    # which cannot bound a piece. The knife removes these too: "Remove
-    # dangling edges, not essential - but nice for users."
-    # (editmesh_knife.cc:2166)
+    # which cannot bound a piece on its own.
+    #
+    # The knife deletes these ("Remove dangling edges, not essential - but
+    # nice for users", editmesh_knife.cc:2166) and this module used to
+    # follow it. It should not, and the difference is what the two tools are
+    # for. The knife is interactive: the person cutting watched the stroke
+    # happen and a tidy result serves them. Here the drawn line *is* the
+    # deliverable -- it is the maker's pattern, and the promise is that
+    # every point they drew has a vertex of the cut near it. Deleting the
+    # stub takes its vertices with it (`context='EDGES'` removes vertices
+    # left isolated), so the last stretch of every open stroke simply
+    # vanished: measured on two crossing curves, the final three points of a
+    # stroke ended up as much as 0.09 from the nearest cut vertex.
+    #
+    # So they are kept, counted, and reported. A loose end is a fact about
+    # the pattern the maker should see -- that piece does not close there --
+    # not a mess to sweep up.
     dangling = [e for e in new_edges if e.is_wire]
-    if dangling:
-        bmesh.ops.delete(bm, geom=dangling, context='EDGES')
-        new_edges = [e for e in new_edges if e.is_valid]
 
     # Marked here, once, now that every stroke that might split one of these
     # edges further has already had its say -- unlike the old per-stroke

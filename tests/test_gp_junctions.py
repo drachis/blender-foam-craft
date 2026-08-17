@@ -631,8 +631,106 @@ def test_line_passing_near_a_corner_is_not_snapped_to_it():
     }
 
 
+# --- 8. A junction where one arm just stops --------------------------------
+def test_junction_with_an_open_arm_still_cuts():
+    """Reported: a T or X junction with an open end leaves an uncut area.
+
+    An arm that stops in the middle of a face is a *spur* in that face's
+    edge net, and `bmesh.utils.face_split_edgenet` refuses a whole face's
+    net when any edge in it fails to reach the boundary -- returning nothing
+    at all, silently, for every edge it was given. So the stub does not
+    merely fail to cut: it takes the perfectly good crossing sharing its
+    face down with it, and the piece boundary opens up right at the
+    junction. This is the original defect of this module
+    (RESEARCH_gp_pattern_seam_gaps.md) surviving in the one shape the
+    cut-graph cannot resolve away, because no amount of graph tidying makes
+    a dangling end reach a boundary.
+
+    Both shapes, since the report named both:
+
+      X -- a crossbar spanning the sheet, and a stem crossing it that stops
+           just past it, leaving a short stub above the junction.
+      T -- the same, but the stem stops *at* the crossbar, so the junction
+           is the stem's own end.
+
+    Known answer for both: the crossbar cuts the sheet in two, and the stem
+    cuts the lower half in two again, so 3 regions. The stub above the
+    crossbar encloses nothing and may be trimmed -- what must not happen is
+    the crossing itself going missing, which shows up as 2.
+    """
+    # Grid lines every 0.125, so the crossbar at y=0.1 sits inside the face
+    # row y in [0, 0.125]. Where the stub ends decides everything: in the
+    # *next* face up it is a spur alone in its own net and harmless, but
+    # inside the junction's own face it shares a net with the crossing, and
+    # that is the arrangement that refuses the whole face.
+    results = {}
+    cases = (
+        # Stub ends in the face above the junction's.
+        ("stub_in_next_face",
+         [Vector((0.3, -1.0, 0.0)), Vector((0.3, 0.16, 0.0))]),
+        # Stub ends inside the junction's own face -- the awkward one.
+        ("stub_in_junction_face",
+         [Vector((0.3, -1.0, 0.0)), Vector((0.3, 0.12, 0.0))]),
+        # Stem stops exactly on the crossbar: a T whose junction is its end.
+        ("t_at_the_bar", [Vector((0.3, -1.0, 0.0)), Vector((0.3, 0.1, 0.0))]),
+    )
+    for label, ends in cases:
+        _clear()
+        me, edge = _grid_plane(cuts=15)
+        crossbar = _densify(
+            [Vector((-1.0, 0.1, 0.0)), Vector((1.0, 0.1, 0.0))], per_segment=30)
+        stem = _densify(ends, per_segment=20)
+
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        edges, open_ends = gp.cut_strokes(bm, [(crossbar, False), (stem, False)],
+                                          snap_distance=0.002)
+        for e in edges:
+            e.seam = True
+        seam_edges = [e for e in bm.edges if e.seam]
+        regions = _seam_regions(bm)
+        # The crossing must survive as a real junction, whatever happens to
+        # the stub above it.
+        junction = Vector((0.3, 0.1, 0.0))
+        arms = 0
+        for v in bm.verts:
+            if (v.co - junction).length > 0.03:
+                continue
+            arms = max(arms, sum(1 for e in v.link_edges if e.seam))
+        # And the crossbar must still be cut all the way across.
+        gap_crossbar = _max_gap_to_seam(crossbar, seam_edges)
+        bm.free()
+
+        results[label] = {
+            "regions": regions,
+            "open_ends": open_ends,
+            "seam_arms_at_junction": arms,
+            "max_gap_crossbar": round(gap_crossbar, 5),
+        }
+
+    out = dict(results)
+    out["checks"] = {
+        # All three arrangements must cut the same three regions: wherever
+        # the stub happens to stop is not something the maker was thinking
+        # about, and it must not decide whether the piece closes.
+        "every_arrangement_cuts_three_regions": all(
+            r["regions"] == 3 for r in results.values()),
+        # The junction exists in all three -- 4 arms where the stem passes
+        # through, 3 where it ends there. Dropping to 2 is the junction not
+        # being there at all.
+        "junction_survives_everywhere": all(
+            r["seam_arms_at_junction"] >= 3 for r in results.values()),
+        # The crossbar is the innocent bystander: it shares faces with the
+        # stub, and it is what gets destroyed when a face's net is refused.
+        "crossbar_survives_everywhere": all(
+            r["max_gap_crossbar"] <= 0.002 for r in results.values()),
+    }
+    return out
+
+
 TESTS = (
     test_self_crossing_stroke_keeps_both_arms,
+    test_junction_with_an_open_arm_still_cuts,
     test_t_junction_is_order_independent,
     test_crossing_at_a_face_corner_still_joins,
     test_crossing_beside_a_face_corner_still_joins,
