@@ -101,92 +101,6 @@ class StrokeCutError(Exception):
     """
 
 
-def _exit_crossing(face, p_from, p_to, min_along):
-    """The next boundary of `face` the segment meets, past `min_along`.
-
-    Returns ``(edge, factor, along)`` or None when nothing lies ahead.
-
-    The *next* crossing, not the furthest: a walk advances one face at a time,
-    and taking the furthest skips the faces in between -- which also strands the
-    walk when a point sits exactly on an edge, since the crossing it needs is at
-    zero distance and the far one belongs to a face it never reaches.
-    """
-    direction = p_to - p_from
-    span = direction.length
-    if span < 1e-12:
-        return None
-    best = None
-    for edge in face.edges:
-        a, b = edge.verts[0].co, edge.verts[1].co
-        hit = intersect_line_line(p_from, p_to, a, b)
-        if hit is None:
-            continue
-        on_segment, on_edge = hit
-        edge_span = b - a
-        denom = edge_span.length_squared
-        if denom < 1e-18:
-            continue
-        edge_fac = (on_edge - a).dot(edge_span) / denom
-        if not (-1e-6 <= edge_fac <= 1.0 + 1e-6):
-            continue
-        along = (on_segment - p_from).dot(direction) / (span * span)
-        if along <= min_along + 1e-7 or along > 1.0 + 1e-9:
-            continue
-        # Skew lines: reject a "crossing" where the two never really meet.
-        if (on_segment - on_edge).length > span * 0.5:
-            continue
-        if best is None or along < best[0]:
-            best = (along, edge, max(0.0, min(1.0, edge_fac)))
-    if best is None:
-        return None
-    return best[1], best[2], best[0]
-
-
-def _walk_faces(face_from, p_from, face_to, p_to, limit=64):
-    """Every face boundary the segment crosses on its way from one face to another.
-
-    Returns a list of ``(edge, factor)``, in order.
-
-    This is the alternative to inventing extra stroke points. When two drawn
-    points land on faces that do not touch, the stroke really did pass through
-    the faces in between, and where it crossed each boundary is computable
-    rather than guessable. Sampling the stroke more finely and hoping the extra
-    points land conveniently was tried, and it is a workaround: the added points
-    become vertices in the finished cut, so it writes detail nobody drew into
-    the pattern. Walking the faces puts the cut exactly where the line goes and
-    adds nothing.
-
-    Returns None if the walk cannot reach the target, so the caller can refuse
-    rather than lay down a cut along a route the stroke never took.
-    """
-    crossings = []
-    current = face_from
-    # Just below zero, so the *first* step may cross at the very start of the
-    # segment. A stroke running along a crease begins each segment sitting on
-    # the boundary it is about to cross, so its first exit is at zero distance;
-    # requiring progress before the first crossing rejected it and stranded the
-    # walk with nowhere to go. Measured: a circle of angular radius 0.9 on a
-    # sphere failed at point 90 of 120 and the whole stroke was dropped.
-    #
-    # Only the first step is affected. Once a crossing is taken, `along` becomes
-    # its own position and every later crossing must be strictly beyond it, so
-    # the walk still cannot sit on one boundary or turn back on itself.
-    along = -1e-6
-    for _ in range(limit):
-        if current is face_to:
-            return crossings
-        step = _exit_crossing(current, p_from, p_to, along)
-        if step is None:
-            return None
-        edge, fac, along = step
-        crossings.append((edge, fac))
-        nxt = next((f for f in edge.link_faces if f is not current), None)
-        if nxt is None:
-            return None
-        current = nxt
-    return None
-
-
 # How close a landed point has to be to an edge or a corner before it counts as
 # being *on* it. This is a geometric epsilon for resolving an exact tie, not a
 # tolerance for how wide a marker tip is -- that is `snap_distance`, and mixing
@@ -465,45 +379,7 @@ def _faces_along(bm, bvh, p_from, p_to, face_from, face_to):
     return faces
 
 
-def _faces_around(face_from, face_to, limit=64):
-    """The patch of mesh the segment could plausibly cross, grown out from
-    `face_from` by vertex adjacency until `face_to` is inside it.
-
-    Vertex adjacency rather than edge adjacency on purpose: the whole point
-    is to include faces that touch only at a corner, which is where the walk
-    this replaces used to get stuck.
-
-    `limit` is a safety stop, not a working bound, and it has to be well
-    clear of what any real segment needs: the loop already stops the moment
-    `face_to` is reached, so a generous cap costs nothing in the ordinary
-    case of two points a face or two apart. It was 4, which quietly failed
-    on long segments -- a sawtooth's near-vertical reset spans as many faces
-    as its amplitude divided by the face size, and at 300 mm on an 83 mm
-    grid that is seven, so the far end was never in the patch, its crossings
-    were never collected, and the seam came out with a hole in it. Nothing
-    reported: the cut simply did not close, and the whole sheet stayed one
-    region.
-    """
-    seen = {face_from}
-    frontier = [face_from]
-    for _ in range(limit):
-        if face_to in seen:
-            break
-        nxt = []
-        for face in frontier:
-            for vert in face.verts:
-                for other in vert.link_faces:
-                    if other not in seen:
-                        seen.add(other)
-                        nxt.append(other)
-        if not nxt:
-            break
-        frontier = nxt
-    return seen
-
-
-def _crossings_along(face_from, face_to, p_from, p_to, weld,
-                     bm=None, bvh=None):
+def _crossings_along(face_from, face_to, p_from, p_to, weld, bm, bvh):
     """Every existing edge or vertex the segment crosses, in order along it.
 
     This is the knife's own method, and it replaces a face-to-face walk that
@@ -529,14 +405,8 @@ def _crossings_along(face_from, face_to, p_from, p_to, weld,
     if span < 1e-18:
         return None
 
-    # Spatially where we can -- see `_faces_along`. The adjacency walk is
-    # kept only for callers that have no surface tree to ask.
-    if bm is not None and bvh is not None:
-        candidates = _faces_along(bm, bvh, p_from, p_to, face_from, face_to)
-    else:
-        candidates = _faces_around(face_from, face_to)
     found = {}
-    for face in candidates:
+    for face in _faces_along(bm, bvh, p_from, p_to, face_from, face_to):
         for edge in face.edges:
             if edge in found:
                 continue
@@ -606,7 +476,7 @@ def _crossings_along(face_from, face_to, p_from, p_to, weld,
     return kept or None
 
 
-def _bridge(hits, stats=None, bm=None, bvh=None):
+def _bridge(hits, stats, bm, bvh):
     """Insert the crossings between points that share no face.
 
     `stats` is an optional counter dict, tallying which route each pair of
@@ -695,37 +565,14 @@ def _bridge(hits, stats=None, bm=None, bvh=None):
             out.append(hit)
             continue
 
-        route = _walk_faces(previous["face"], previous["loc"],
-                            hit["face"], hit["loc"])
-        if not route:
-            # The walk could not find the way across. Falling back on the
-            # shared corner keeps the line connected -- a seam bent to the
-            # corner is worse than one that follows the drawing, but both
-            # beat a hole in the piece boundary.
-            if corner is not None:
-                # Counted *and* measured: this is the one route that
-                # knowingly puts the seam somewhere other than where the
-                # line was drawn, so how far it bent it is worth having in
-                # the log rather than needing a probe to find out.
-                tally("corner_fallback")
-                stats["corner_fallback_worst"] = max(
-                    stats.get("corner_fallback_worst", 0.0), off_line)
-                out.append({"kind": VERT, "elem": corner, "fac": 0.0,
-                            "loc": corner.co.copy(),
-                            "face": previous["face"]})
-                out.append(hit)
-                continue
-            tally("no_route")
-            missed += 1
-            out.append(hit)
-            continue
-        tally("walked")
-        tally("walk_crossings", len(route))
-        for edge, fac in route:
-            a, b = edge.verts[0].co, edge.verts[1].co
-            out.append({"kind": EDGE, "elem": edge, "fac": fac,
-                        "loc": a + (b - a) * fac,
-                        "face": edge.link_faces[0]})
+        # Nothing crossed, and the two points are not in the same face:
+        # there is no honest way to get from one to the other. Counted and
+        # left as a gap rather than papered over. A seam bent to a nearby
+        # corner used to stand in here, and that is worse than a gap --
+        # a gap is visible and gets closed, while a bend looks deliberate
+        # and gets sawn. If this ever climbs above zero the log says so.
+        tally("no_route")
+        missed += 1
         out.append(hit)
     return out, missed
 
@@ -1905,9 +1752,9 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
             all_edges = [e for e in all_edges if e.is_valid]
 
     # How much of the cut went which way. Read this first when a seam comes
-    # out somewhere the drawing does not go: `corner_fallback` above zero is
-    # the cut knowingly bending to a face corner, and `no_route` is a segment
-    # that could not be crossed at all.
+    # out somewhere the drawing does not go: `no_route` above zero is a
+    # segment the cut could not cross at all, and is the only route here
+    # that leaves the pattern incomplete.
     _log.info(foam_log.summary("cut_routes", **route_stats))
 
     # And how faithfully the finished cut followed the line, which is the

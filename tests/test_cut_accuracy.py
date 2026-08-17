@@ -523,8 +523,10 @@ def test_bridge_routes_are_sane_on_an_ordinary_curve():
     This was a probe, written when the workshop file showed a notch in the
     seam: it counted the routes and found 5 segments being sent through a
     shared face corner, dragging the cut as much as 0.075 off the drawn
-    line. `corner_fallback` is that route, now taken only when the proper
-    walk cannot find a way across, and it is the number to watch.
+    line. That route -- and the face walk it fell back from -- have both
+    been deleted rather than kept as a safety net, since collecting the
+    crossings spatially made them unreachable; `no_route` is what remains
+    to watch, and it means a segment the cut could not cross at all.
 
     The same counters go to the log on every bake (`cut_routes`), so this
     check and a real bake report the same thing in the same words.
@@ -538,15 +540,17 @@ def test_bridge_routes_are_sane_on_an_ordinary_curve():
 
     stats = {}
     hits = gp._classify(bm, bvh, stroke)
-    bridged, missed = gp._bridge(hits, stats)
+    bridged, missed = gp._bridge(hits, stats, bm, bvh)
+    routes = dict(stats)
     bm.free()
+    stats = routes
 
     segments = len(stroke) - 1
     # Every route a segment can take. `crossings` is deliberately absent --
     # it counts hits, not segments, and adding it here would break the tally.
     routed = sum(stats.get(k, 0) for k in
                  ("same_face", "shared_edge", "through_corner", "crossed",
-                  "walked", "corner_fallback", "no_route"))
+                  "no_route"))
     return {
         "routes": stats,
         "segments": segments,
@@ -558,16 +562,11 @@ def test_bridge_routes_are_sane_on_an_ordinary_curve():
             "every_segment_accounted_for": routed == segments,
             # No segment left uncrossed.
             "no_segment_without_a_route": stats.get("no_route", 0) == 0,
-            # And none bent to a corner. This was once asserted merely
-            # "rare", because the face walk it fell back from could not
-            # always find its way across -- collecting the crossings and
-            # sorting them, the way the knife does, removed the need for the
-            # fallback rather than making it rarer, so zero is the honest
-            # bar now. A seam bent to a corner is a pattern that does not
-            # match what the maker drew.
-            "no_corner_fallbacks": stats.get("corner_fallback", 0) == 0,
-            # The old face walk should likewise never be needed.
-            "no_face_walks_needed": stats.get("walked", 0) == 0,
+            # Every segment crossed honestly. There is no longer a route
+            # that bends the seam to a nearby corner to keep it connected:
+            # that fallback, and the face walk it backed up, are deleted,
+            # so an uncrossable segment now shows as `no_route` above
+            # rather than as a quiet detour.
             # Bridging inserts crossings, so it can only add points.
             "bridging_added_crossings": len(bridged) > len(stroke),
         },
