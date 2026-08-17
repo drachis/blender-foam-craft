@@ -73,6 +73,8 @@ version of that graph: built up across every stroke in one bake, resolved
 before anything touches ``bmesh``, realised once.
 """
 
+import math
+
 import bmesh
 import bpy
 from mathutils import Vector
@@ -1065,6 +1067,143 @@ def _nearest_on_polyline(point, points, cyclic):
     return best
 
 
+def _end_direction(points, end_index):
+    """Unit vector pointing outward along the stroke at one of its ends.
+
+    "Outward" means the direction the hand was travelling as it left the
+    line: at the tail that is the last drawn step continued forwards, and at
+    the head it is the first step continued backwards. A stroke sampled from
+    a real drawing routinely carries repeated or near-repeated points at its
+    ends -- the pen resting before it moves -- so this walks inward until it
+    finds a step with real length rather than trusting the outermost pair.
+
+    Returns None when the whole stroke is degenerate, which is a stroke with
+    no direction to extend along.
+    """
+    count = len(points)
+    for step in range(1, count):
+        if end_index == 0:
+            outward = points[0] - points[step]
+        else:
+            outward = points[-1] - points[-1 - step]
+        if outward.length > 1e-9:
+            return outward.normalized()
+    return None
+
+
+# How far off its own heading a stroke's end may look for the line it was
+# drawn to meet. A single ray is too brittle for a drawn line: the last
+# sampled segment carries whatever wobble the hand had at the moment the pen
+# lifted, so a ray can miss by a few degrees a junction the eye reads as
+# obvious. A cone forgives that without becoming an omnidirectional snap --
+# at 90 degrees this would be "anything nearby", which is the sideways test
+# it exists to be different from.
+_EXTENSION_CONE_DEGREES = 30.0
+
+# How square the meeting has to be to count as a junction. A cone on its own
+# is not enough, and the reason is geometric rather than a matter of taste:
+# a line running *alongside* another, a hair away, is eventually clipped by
+# any forward cone however narrow -- at a small enough offset there is always
+# some distance ahead where the neighbour falls inside it. So a pure cone
+# test reports a junction for two lines that run side by side and never
+# converge, which is exactly the case the directional test was supposed to
+# reject. Requiring the two to actually meet at an angle separates "drawn
+# into" from "drawn alongside", and it is what makes the extension mean
+# "this line was heading into that one" rather than "that one is nearby".
+_EXTENSION_MIN_MEETING_DEGREES = 20.0
+
+
+def _cone_candidates(tip, direction, half_angle_cos, reach, a, b):
+    """Parameters along segment `a`-`b` worth testing as the nearest point
+    inside the cone: its closest approach to `tip`, and where the segment
+    enters or leaves the cone.
+
+    Both are needed. When the segment's closest point is already inside the
+    cone that is the answer, but when the cone clips the segment part-way --
+    the usual case for a line running past at an angle -- the nearest
+    *admissible* point is exactly on the cone's boundary, which the closest
+    approach never finds.
+
+    The boundary case solves ``(v . d)^2 = cos^2(a) * |v|^2`` along the
+    segment, which is a quadratic in the segment parameter.
+    """
+    span = b - a
+    denom = span.length_squared
+    if denom < 1e-18:
+        return ()
+    w = a - tip
+    out = [max(0.0, min(1.0, -w.dot(span) / denom))]
+
+    p = w.dot(direction)
+    q = span.dot(direction)
+    A = w.length_squared
+    B = w.dot(span)
+    C = denom
+    k = half_angle_cos * half_angle_cos
+    qa = q * q - k * C
+    qb = 2.0 * (p * q - k * B)
+    qc = p * p - k * A
+    if abs(qa) < 1e-18:
+        if abs(qb) > 1e-18:
+            out.append(-qc / qb)
+    else:
+        disc = qb * qb - 4.0 * qa * qc
+        if disc >= 0.0:
+            root = disc ** 0.5
+            out.append((-qb + root) / (2.0 * qa))
+            out.append((-qb - root) / (2.0 * qa))
+    return tuple(t for t in out if -1e-9 <= t <= 1.0 + 1e-9)
+
+
+def _extension_target(tip, direction, reach, other_points, other_cyclic,
+                      half_angle_cos, meeting_cos):
+    """The nearest point of another stroke lying ahead of this one's end,
+    inside a cone about the direction it was travelling. Returns
+    ``(distance, segment_index, factor, location)`` or None.
+
+    This is the near-miss junction case, and the reason a plain
+    nearest-point test is not enough for it: two strokes drawn to meet at a
+    T can stop a whisker short of each other, so the incoming line's tip has
+    no seam within any honest sideways tolerance, yet the drawing plainly
+    shows a junction because the ink overlaps. Asking "how close is the tip
+    to that line" answers the wrong question -- it says yes to a line the
+    stroke was merely passing near, and no to the line it was visibly
+    heading into. Asking "if this line carried on the way it was going,
+    would it run into anything" matches what the maker drew.
+
+    `reach` is how far the line is carried on -- the two pens' summed
+    half-widths, so the test is "would the ink have touched", the same
+    judgement the rest of this module already makes about width.
+    Deliberately short: this closes the gap a hand leaves at a junction, it
+    does not hunt for distant lines to attach to.
+    """
+    best = None
+    count = len(other_points) if other_cyclic else len(other_points) - 1
+    for j in range(max(0, count)):
+        a = other_points[j]
+        b = other_points[(j + 1) % len(other_points)]
+        span = b - a
+        if span.length_squared < 1e-18:
+            continue
+        # Running alongside is not meeting -- see _EXTENSION_MIN_MEETING_DEGREES.
+        if abs(direction.dot(span.normalized())) > meeting_cos:
+            continue
+        for t in _cone_candidates(tip, direction, half_angle_cos, reach, a, b):
+            t = max(0.0, min(1.0, t))
+            q = a + span * t
+            v = q - tip
+            distance = v.length
+            if distance > reach or distance < 1e-12:
+                continue
+            # Inside the cone, and ahead rather than behind: the squared
+            # form above is blind to sign on its own.
+            if v.dot(direction) < half_angle_cos * distance - 1e-9:
+                continue
+            if best is None or distance < best[0]:
+                best = (distance, j, t, q)
+    return best
+
+
 def snap_stroke_ends(strokes, tolerance):
     """Pin each open stroke's ends onto the line they were drawn to meet.
 
@@ -1083,11 +1222,17 @@ def snap_stroke_ends(strokes, tolerance):
     crossings, while the deduplication needed to control that kept unmaking the
     T junctions it existed to serve.
 
-    So: only ends move. An open stroke's end within reach of another stroke is
-    moved onto it, and the landing point is inserted into the other stroke too,
-    so both lines pass through the meeting whichever is cut first. Reach is the
-    two pens' summed half-widths -- ink touching ink -- with `tolerance` as the
-    floor for strokes that carry no width.
+    So: only ends move. An open stroke's end within `tolerance` of another
+    stroke is moved onto it, and the landing point is inserted into the other
+    stroke too, so both lines pass through the meeting whichever is cut first.
+
+    Sideways reach is deliberately the *small* one -- `tolerance`, the snap
+    distance -- while the pen widths buy reach only along the direction the
+    line was travelling (see below). Sideways and forwards are not the same
+    judgement: a line that stopped a whisker short of the one it was heading
+    into was meant to meet it, whereas a line that merely passes within a
+    pen width of another, going its own way, was not. Giving both the full
+    ink-touching-ink distance made every near-approach a junction.
 
     Genuine mid-line crossings need none of this: strokes are cut one after
     another, so a later stroke crossing an earlier one meets real topology and
@@ -1097,11 +1242,31 @@ def snap_stroke_ends(strokes, tolerance):
     trivially at zero distance from its own adjacent segments, and telling
     "near my own middle" from "near my own tail" needs arc-length bookkeeping
     this does not yet have. Ends meeting *ends* are `chain_strokes`.
+
+    Where the tip does not reach at all, the line is carried on in the
+    direction it was travelling to see whether it *would* have met something
+    -- see `_extension_crossing`. That covers the junction a hand leaves a
+    whisker short, which is the common case in a real drawing and the one a
+    nearest-point test cannot tell from a line merely passing nearby. The
+    two behave differently on purpose: a tip already within reach is *moved*
+    onto what it met, while a tip that only reaches by being carried on is
+    *extended* to it, growing a new point and leaving every drawn point where
+    it was. At a T that keeps the crossbar exactly as drawn and lets the stem
+    grow the last fraction to meet it, rather than dragging the drawn tip
+    sideways.
+
+    A stroke that reaches nothing either way is left completely alone --
+    nothing invented, no vertices kept from a speculative extension.
     """
     strokes = [(list(s[0]), s[1], s[2] if len(s) > 2 else 0.0)
                for s in strokes]
     inserts = [{} for _ in strokes]
+    # Extensions are applied after every end has been judged, because
+    # growing a stroke mid-pass would change what a later end measures
+    # against and make the result depend on stroke order.
+    extensions = [{} for _ in strokes]
     moved = 0
+    extended = 0
     for i, (points, cyclic, width) in enumerate(strokes):
         if cyclic or len(points) < 2:
             continue
@@ -1111,26 +1276,51 @@ def snap_stroke_ends(strokes, tolerance):
             for j, (other, other_cyclic, other_width) in enumerate(strokes):
                 if j == i:
                     continue
-                reach = max(tolerance, width + other_width)
                 found = _nearest_on_polyline(tip, other, other_cyclic)
-                if found is None or found[0] > reach:
+                if found is None or found[0] > tolerance:
                     continue
                 if best is None or found[0] < best[1][0]:
                     best = (j, found)
-            if best is None:
+            if best is not None:
+                j, (d, seg, fac, q) = best
+                if d > 1e-9:
+                    points[end_index] = q.copy()
+                    moved += 1
+                inserts[j].setdefault(seg, []).append((fac, q))
                 continue
-            j, (d, seg, fac, q) = best
-            if d > 1e-9:
-                points[end_index] = q.copy()
-                moved += 1
+
+            # Nothing within reach of the tip itself. Carry the line on the
+            # way it was going and see whether it would have met anything.
+            direction = _end_direction(points, end_index)
+            if direction is None:
+                continue
+            reached = None
+            cone_cos = math.cos(math.radians(_EXTENSION_CONE_DEGREES))
+            meeting_cos = math.cos(
+                math.radians(_EXTENSION_MIN_MEETING_DEGREES))
+            for j, (other, other_cyclic, other_width) in enumerate(strokes):
+                if j == i or len(other) < 2:
+                    continue
+                reach = max(tolerance, width + other_width)
+                found = _extension_target(tip, direction, reach, other,
+                                          other_cyclic, cone_cos, meeting_cos)
+                if found is None:
+                    continue
+                if reached is None or found[0] < reached[1][0]:
+                    reached = (j, found)
+            if reached is None:
+                continue
+            j, (_along, seg, fac, q) = reached
+            extensions[i][end_index] = q.copy()
             inserts[j].setdefault(seg, []).append((fac, q))
+            extended += 1
 
     out = []
     for index, (points, cyclic, width) in enumerate(strokes):
-        if not inserts[index]:
-            out.append((points, cyclic, width))
-            continue
         grown = []
+        head = extensions[index].get(0)
+        if head is not None and (head - points[0]).length > 1e-9:
+            grown.append(head)
         for i, point in enumerate(points):
             grown.append(point)
             for _fac, q in sorted(inserts[index].get(i, []),
@@ -1138,11 +1328,15 @@ def snap_stroke_ends(strokes, tolerance):
                 # Two stems landing on the same spot insert it once.
                 if (q - grown[-1]).length > 1e-9:
                     grown.append(q.copy())
+        tail = extensions[index].get(len(points) - 1)
+        if tail is not None and (tail - grown[-1]).length > 1e-9:
+            grown.append(tail)
         out.append((grown, cyclic, width))
 
-    if moved:
+    if moved or extended:
         _log.info(foam_log.summary(
-            "stroke_ends_snapped", ends=moved, tolerance=tolerance))
+            "stroke_ends_snapped", ends=moved, extended=extended,
+            tolerance=tolerance))
     return out
 
 

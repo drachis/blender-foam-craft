@@ -262,9 +262,178 @@ def test_t_junction_is_order_independent():
     return out
 
 
+# --- 3. A T whose stem stops a whisker short of the crossbar ------------
+def test_near_miss_t_junction_extends_to_meet():
+    """The junction a hand actually leaves: the stem stops just short of the
+    crossbar, so the two curves never touch, but the drawn ink plainly
+    overlaps and the maker meant a junction. Tested at both ends of the stem
+    (a stroke drawn upward toward the bar, and one drawn downward away from
+    it) because a stroke's head and tail are equally likely to be the end
+    that meets something.
+
+    The gap is 0.012 -- larger than the 0.01 snap tolerance, so a
+    nearest-point test *cannot* close it, which is the point: this only
+    passes if the stem is carried on in its own direction of travel. The
+    pen half-widths (0.02 each) put the crossbar well inside that reach.
+
+    Known answer: 3 regions, same as a T that actually touches -- the
+    crossbar splits the sheet top/bottom, and the stem splits the bottom
+    half left/right. A stem that fails to reach leaves 2.
+
+    Also checks the crossbar was not dragged: its own drawn points must
+    still have seam within tolerance along their original line, since the
+    user's rule is that the T's top stays as drawn and the incoming line is
+    what grows.
+    """
+    results = {}
+    for label, flip in (("stem_tail_meets", False), ("stem_head_meets", True)):
+        _clear()
+        me, edge = _grid_plane(cuts=15)
+        crossbar = _densify(
+            [Vector((-1.0, 0.1, 0.0)), Vector((1.0, 0.1, 0.0))], per_segment=30)
+        # Stops at y=0.088, a 0.012 gap below the crossbar at y=0.1.
+        stem = _densify(
+            [Vector((0.3, -1.0, 0.0)), Vector((0.3, 0.088, 0.0))],
+            per_segment=20)
+        if flip:
+            stem = list(reversed(stem))
+        strokes = [(crossbar, False, 0.02), (stem, False, 0.02)]
+
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        edges, open_ends = gp.cut_strokes(bm, strokes, snap_distance=0.01)
+        for e in edges:
+            e.seam = True
+        seam_edges = [e for e in bm.edges if e.seam]
+        regions = _seam_regions(bm)
+        gap_all = _max_gap_to_seam(crossbar + stem, seam_edges)
+        gap_crossbar = _max_gap_to_seam(crossbar, seam_edges)
+        n_wire = sum(1 for e in edges if e.is_valid and e.is_wire)
+        bm.free()
+
+        results[label] = {
+            "regions": regions,
+            "open_ends": open_ends,
+            "max_gap_to_seam": round(gap_all, 5),
+            "max_gap_crossbar": round(gap_crossbar, 5),
+            "wire_edges_remaining": n_wire,
+        }
+
+    tolerance = 0.01
+    out = dict(results)
+    out["tolerance"] = tolerance
+    out["gap_drawn"] = 0.012
+    out["checks"] = {
+        "stem_tail_reaches_crossbar": results["stem_tail_meets"]["regions"] == 3,
+        "stem_head_reaches_crossbar": results["stem_head_meets"]["regions"] == 3,
+        "every_drawn_point_has_nearby_seam":
+            results["stem_tail_meets"]["max_gap_to_seam"] <= tolerance and
+            results["stem_head_meets"]["max_gap_to_seam"] <= tolerance,
+        # The crossbar keeps its own line -- it is the stem that grows.
+        "crossbar_not_dragged":
+            results["stem_tail_meets"]["max_gap_crossbar"] <= tolerance and
+            results["stem_head_meets"]["max_gap_crossbar"] <= tolerance,
+        "no_open_ends":
+            results["stem_tail_meets"]["open_ends"] == 0 and
+            results["stem_head_meets"]["open_ends"] == 0,
+        "no_wire_left_behind":
+            results["stem_tail_meets"]["wire_edges_remaining"] == 0 and
+            results["stem_head_meets"]["wire_edges_remaining"] == 0,
+    }
+    return out
+
+
+# --- 4. Only a line aimed at another may reach it -----------------------
+def test_near_miss_only_extends_along_direction_of_travel():
+    """The negative cases, and the reason the rule is directional rather
+    than just a wider tolerance: "if it does, yay cut, if not, don't keep
+    those verts and keep going else where."
+
+    Tested against `snap_stroke_ends` directly rather than through a full
+    cut. That function is pure -- point lists in, point lists out -- so what
+    it decided can be read exactly, where a region count downstream also
+    reflects whether each stroke happened to reach the sheet's boundary and
+    would confound "did not connect" with "connected but enclosed nothing".
+
+    The stems below end beyond the 0.01 snap tolerance from the crossbar, so
+    none of them can reach it sideways; only being carried on in their own
+    direction can close the gap, and only if they were pointing at it:
+
+      aimed      -- 0.012 short, runs at the crossbar. Must grow onto it.
+      parallel   -- 0.012 away, runs alongside it, never converging. Must
+                    not: passing near is not meeting.
+      off_end    -- 0.012 short and aimed squarely at where the crossbar's
+                    *line* lies, but past the end of the crossbar as
+                    actually drawn. Must not -- nothing is there to meet.
+      too_far    -- aimed at it, but 0.08 short, well past the 0.04 the two
+                    pens' widths justify. Must not: this is meant to close
+                    the gap a hand leaves at a junction, not to hunt for
+                    distant lines to attach to.
+
+    Note there is no "tip near it but pointing away" case: for a straight
+    stroke that is not constructible, since whichever end lies nearest the
+    crossbar necessarily has its outward direction pointing toward it. The
+    realistic ways to not-be-a-junction are the three above.
+    """
+    crossbar = _densify(
+        [Vector((-1.0, 0.1, 0.0)), Vector((0.0, 0.1, 0.0))], per_segment=30)
+    cases = {
+        "aimed": [Vector((-0.5, -0.6, 0.0)), Vector((-0.5, 0.088, 0.0))],
+        "parallel": [Vector((-0.7, 0.088, 0.0)), Vector((-0.2, 0.088, 0.0))],
+        # Aimed at y=0.1, but at x=+0.5 -- the crossbar stops at x=0.0.
+        "off_end": [Vector((0.5, -0.6, 0.0)), Vector((0.5, 0.088, 0.0))],
+        "too_far": [Vector((-0.5, -0.6, 0.0)), Vector((-0.5, 0.02, 0.0))],
+    }
+
+    results = {}
+    for label, ends in cases.items():
+        stem = _densify(ends, per_segment=20)
+        strokes = [(list(crossbar), False, 0.02), (stem, False, 0.02)]
+        out = gp.snap_stroke_ends(strokes, 0.01)
+        stem_out = out[1][0]
+        crossbar_out = out[0][0]
+        # Did the stem gain a point, and does anything in it now reach the
+        # crossbar's own line (y=0.1) within the pen's reach?
+        grew = len(stem_out) - len(stem)
+        touches = min(abs(p.y - 0.1) for p in stem_out)
+        results[label] = {
+            "points_before": len(stem),
+            "points_after": len(stem_out),
+            "grew_by": grew,
+            "closest_approach_to_crossbar_line": round(touches, 5),
+            "crossbar_points_before": len(crossbar),
+            "crossbar_points_after": len(crossbar_out),
+        }
+
+    out = dict(results)
+    out["checks"] = {
+        # The one genuine junction: the stem grows to meet the crossbar.
+        "aimed_reaches": results["aimed"]["grew_by"] > 0 and
+                         results["aimed"]["closest_approach_to_crossbar_line"] <= 1e-6,
+        # And the crossbar gains the meeting point too, so both lines pass
+        # through it whichever is cut first.
+        "crossbar_gains_the_junction":
+            results["aimed"]["crossbar_points_after"] >
+            results["aimed"]["crossbar_points_before"],
+        "parallel_left_alone": results["parallel"]["grew_by"] == 0,
+        "off_end_left_alone": results["off_end"]["grew_by"] == 0,
+        "too_far_left_alone": results["too_far"]["grew_by"] == 0,
+        # Two-sided: the three negatives passing would be trivially
+        # satisfied by an extension that never fires at all, so the
+        # crossbar must be untouched by them specifically.
+        "negatives_did_not_touch_crossbar": all(
+            results[label]["crossbar_points_after"] ==
+            results[label]["crossbar_points_before"]
+            for label in ("parallel", "off_end", "too_far")),
+    }
+    return out
+
+
 TESTS = (
     test_self_crossing_stroke_keeps_both_arms,
     test_t_junction_is_order_independent,
+    test_near_miss_t_junction_extends_to_meet,
+    test_near_miss_only_extends_along_direction_of_travel,
 )
 
 result = {}

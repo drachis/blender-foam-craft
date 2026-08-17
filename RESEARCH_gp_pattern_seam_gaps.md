@@ -399,27 +399,108 @@ reintroduce:
    `test_theta_cuts_identically_every_time`'s "every_run_agrees" check
    completely (five identical runs now agree exactly).
 
-**Known remaining residual, not yet fixed:** in
-`test_face_numbering_does_not_change_the_cut`, the exact same geometry
-presented with three different face orderings (as-built, sorted, reversed)
-now agrees on regions, region sizes, vertex count and face count -- but the
-raw `seam_edges` count differs by 2 between "as-built" and the other two
-(174 vs. 176), with no topological difference. Fixing #4 above made every
-*repeated* run of one numbering agree exactly, but a genuinely *different*
-numbering still changes `bvh.find_nearest`'s tie-break on points sitting
-exactly on an edge (the same tie this project has hit before, see
-`test_points_on_an_edge_land_on_the_same_face_every_time`'s own docstring),
-which can shift a handful of `_realise_on_edge` weld decisions by a hair.
-Given this is an extreme, adversarial construction (a stroke drawn exactly
-along an existing edge loop, crossed by another stroke at a point also
-exactly on that edge) and has zero effect on the actual seam/region
-structure, it was left as a known residual rather than chased further in
-this session -- worth a fresh look if it recurs somewhere less contrived.
+## Near-miss junction extension (item 4) -- built 2026-08-16
 
-**Not yet built:** item 4, the near-miss junction extension heuristic (both
-head and tail of an open stroke). This is genuinely new logic with no knife
-equivalent to check against, greenlit by the user but not yet designed in
-enough detail to implement -- see the open items in the plan above.
+Two strokes drawn to meet at a T routinely stop a whisker short of each
+other: the ink overlaps and the eye reads a junction, but the curves never
+touch, so no sideways tolerance small enough to be honest can join them.
+`snap_stroke_ends` now handles this by *carrying the line on the way it was
+going* and seeing whether it runs into anything, at both the head (direction
+from point 1 back through point 0) and the tail (point -2 through point -1)
+of every open stroke.
+
+The pieces, and why each is there -- each of the last three was forced by a
+case the previous version got wrong, so none of them is decoration:
+
+- **Sideways and forward reach are different distances.** The sideways snap
+  (a tip already within reach of another line, moved onto it) uses
+  `snap_distance` alone. The forward extension uses the two pens' summed
+  half-widths -- "would the ink have touched". Originally both used the
+  pen widths, which made the extension dead code: for a stroke aimed
+  squarely at another, the sideways distance and the forward distance to
+  the same point are the *same number*, so the sideways test always fired
+  first and the directional test never got a say. Splitting them is what
+  makes the extension mean anything.
+- **A cone, not a ray.** A drawn line's last segment carries whatever wobble
+  the hand had as the pen lifted, so a single ray misses junctions the eye
+  reads as obvious. `_extension_target` searches a 30-degree half-angle cone
+  about the direction of travel, solving for where each candidate segment
+  enters or leaves the cone (`_cone_candidates`) rather than sampling, since
+  the nearest admissible point is usually exactly on the cone boundary and
+  the closest approach never finds it.
+- **The meeting must be at an angle.** A cone alone is not enough, for a
+  geometric reason rather than a matter of taste: a line running *alongside*
+  another a hair away is eventually clipped by any forward cone however
+  narrow -- at a small enough offset there is always some distance ahead
+  where the neighbour falls inside it. So a pure cone test called two
+  side-by-side lines a junction, which is exactly what the directional test
+  existed to reject. `_EXTENSION_MIN_MEETING_DEGREES` (20 degrees) requires
+  the two to actually converge.
+- **Extended, not dragged.** A tip that only reaches by being carried on
+  *grows a new point* onto what it met; every drawn point stays where it was
+  drawn. At a T that keeps the crossbar exactly as the maker drew it and
+  lets the stem grow the last fraction, which is the behaviour the user
+  asked for ("the T junction top should stay the same and the incoming line
+  should be extended"). A tip already within sideways reach is still moved,
+  as before.
+- **Nothing is invented.** A stroke that reaches nothing either way is left
+  completely alone -- no speculative vertices kept ("if not, don't keep
+  those verts and keep going else where").
+
+Covered by `test_near_miss_t_junction_extends_to_meet` (a 0.012 gap closed
+from both the head and the tail, with the crossbar verified undragged) and
+`test_near_miss_only_extends_along_direction_of_travel`, which pins the
+three ways to *not* be a junction: running parallel, aimed past the end of
+the target as actually drawn, and aimed but beyond the reach the pen widths
+justify. That second test drives `snap_stroke_ends` directly rather than
+through a full cut, because it is a pure function and a region count
+downstream would confound "did not connect" with "connected but enclosed
+nothing".
+
+One case is deliberately absent from the negative tests: "tip near the
+target but pointing away". For a straight stroke it is not constructible --
+whichever end lies nearest the target necessarily has its outward direction
+pointing toward it.
+
+## Known remaining residual: seam positions vary slightly between runs
+
+Not fixed, and worth stating precisely because the headline numbers look
+stable and hide it.
+
+Across five identical cuts of the theta pattern (a circle crossed by a bar
+drawn exactly along a UV sphere's equator, `tests/test_determinism.py`):
+region count, region sizes, vertex count, face count, degenerate-face count
+and the *total* number of seamed mesh edges (200) are identical every run.
+But a fingerprint of the seam edges' actual midpoint coordinates is **not**
+identical, and the edge list `cut_strokes` returns varies between 174 and
+176. So the same cut is landing in very slightly different places run to
+run, without changing its structure.
+
+`test_face_numbering_does_not_change_the_cut` shows the same thing under a
+deliberately renumbered mesh, and `test_theta_cuts_identically_every_time`'s
+`every_run_agrees` check fails on the `seam_edges` field for the same
+reason.
+
+What is already ruled out: classification is stable
+(`test_points_on_an_edge_land_on_the_same_face_every_time` passes, so
+`_classify` returns the same kind and location for every point every run),
+and the sphere fixture is rebuilt identically
+(`test_the_sphere_is_rebuilt_identically` passes). Both `_CutGraph.add` and
+`_CutGraph.connect` were found iterating `set`s of `BMFace` and are now
+sorted by face index, which fixed a larger version of this.
+
+Prime remaining suspect, not yet confirmed: the `bmesh.ops.remove_doubles`
+weld at the end of `cut_strokes`, which is seeded from
+`sorted(touched, key=lambda v: v.index)`. Vertex *indices* are assigned by
+the order geometry was created during the cut, so if anything upstream still
+varies, the weld keeps a different survivor and moves the result by a
+fraction. This is the exact failure mode CLAUDE.md already records twice
+(the uvsphere primitive's `remove_doubles` and `uv_islands`' `set.pop()`).
+
+Practical impact is small -- the pattern's structure, piece count and piece
+sizes are all stable, and the drifting distance is far below the
+`snap_distance` -- but this is a project that has been bitten by exactly
+this class of bug before, so it should not be left implicit.
 
 ## Diagnostic script (the "17 dangling" trace above)
 
