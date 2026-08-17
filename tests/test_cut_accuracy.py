@@ -286,6 +286,132 @@ def test_every_drawn_point_becomes_a_cut_vertex():
     return out
 
 
+def _strays(edges, strokes_on_surface, tolerance_mm):
+    """Cut edges that do not lie along any drawn stroke.
+
+    The pair to `_vertex_distances`. That one asks whether everything drawn
+    got cut; this asks whether anything got cut that was not drawn. Both
+    have to hold: a cutter can satisfy either alone -- cut nothing extra by
+    cutting nothing, or cover every drawn point by cutting the whole mesh --
+    and only together do they say the seam *is* the pattern.
+
+    An edge is judged by its midpoint rather than its ends, deliberately.
+    Ends are shared with legitimate neighbours and sit on the drawn line
+    even when the edge itself wanders off it: a spurious edge between two
+    real cut vertices -- a crossbar across the mouth of a V, a Y sprouting
+    at a T -- has both ends exactly on the pattern and only its middle
+    gives it away.
+    """
+    limit = tolerance_mm / 1000.0
+    out = []
+    for edge in edges:
+        if not edge.is_valid:
+            continue
+        mid = (edge.verts[0].co + edge.verts[1].co) * 0.5
+        best = None
+        for points in strokes_on_surface:
+            for a, b in zip(points, points[1:]):
+                span = b - a
+                denom = span.length_squared
+                t = 0.0 if denom < 1e-18 \
+                    else max(0.0, min(1.0, (mid - a).dot(span) / denom))
+                d = (mid - (a + span * t)).length
+                if best is None or d < best:
+                    best = d
+        if best is not None and best > limit:
+            out.append({
+                "midpoint": tuple(round(c, 5) for c in mid),
+                "from": tuple(round(c, 5) for c in edge.verts[0].co),
+                "to": tuple(round(c, 5) for c in edge.verts[1].co),
+                "off_the_pattern_mm": round(best * 1000.0, 4),
+                "length_mm": round(edge.calc_length() * 1000.0, 4),
+            })
+    return out
+
+
+# --- 0b. Nothing is cut that was not drawn ------------------------------
+def test_no_edges_are_cut_away_from_the_drawn_line():
+    """The pair to the check above, and the other half of the same promise:
+    the cut must not invent geometry the maker never drew.
+
+    Reported from the workshop file as two shapes, both of which are an
+    edge appearing where no pen went:
+
+      C beside a V -- the two do not cut, and a crossbar appears across the
+                      inside of the V's elbow.
+      T junction   -- comes out as a Y, with a short limb leaving the
+                      junction along no drawn line at all.
+
+    A stray edge is worse than a missing one. A gap in a seam is visible
+    and the maker closes it; a crossbar looks exactly like a deliberate cut
+    and gets sawn, and the piece is wrong.
+
+    Cut with `snap_distance=0` so nothing here can be blamed on welding,
+    and judged at 1 mm on a metre-scale model -- an edge whose middle is
+    further than that from every drawn stroke is not a wobble, it is a line
+    nobody asked for.
+    """
+    cases = {}
+
+    def run(label, strokes):
+        _clear()
+        bpy.ops.mesh.primitive_plane_add(size=2.0)
+        me = bpy.context.object.data
+        bm0 = bmesh.new()
+        bm0.from_mesh(me)
+        bmesh.ops.subdivide_edges(bm0, edges=bm0.edges[:], cuts=15,
+                                  use_grid_fill=True)
+        bm0.to_mesh(me)
+        bm0.free()
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        on_surface = [_project(bm, pts) for pts, _c in strokes]
+        edges, open_ends = gp.cut_strokes(bm, strokes, snap_distance=0.0)
+        for e in edges:
+            e.seam = True
+        strays = {str(mm): _strays(edges, on_surface, mm)
+                  for mm in TOLERANCES_MM}
+        bm.free()
+        bar = str(max(TOLERANCES_MM))
+        cases[label] = {
+            "cut_edges": len(edges),
+            "strays_at_mm": {mm: len(v) for mm, v in strays.items()},
+            "worst_strays": sorted(strays[bar],
+                                   key=lambda s: -s["off_the_pattern_mm"])[:6],
+            "open_ends": open_ends,
+        }
+
+    def line(a, b, n=40):
+        return [a + (b - a) * (i / (n - 1.0)) for i in range(n)]
+
+    # A V with a sharp elbow, and a C curving past just outside it. Neither
+    # touches the other; nothing should join them.
+    v_stroke = (line(Vector((-0.6, 0.55, 0.0)), Vector((-0.02, -0.5, 0.0)))
+                + line(Vector((-0.02, -0.5, 0.0)), Vector((0.56, 0.55, 0.0)))[1:])
+    c_stroke = [Vector((0.34 * math.cos(a), -0.66 + 0.34 * math.sin(a), 0.0))
+                for a in [math.pi * (0.15 + 0.7 * i / 39.0) for i in range(40)]]
+    run("c_beside_a_v", [(v_stroke, False), (c_stroke, False)])
+
+    # A plain T: a crossbar, and a stem ending on it.
+    run("t_junction", [
+        (line(Vector((-0.94, 0.22, 0.0)), Vector((0.94, 0.22, 0.0)), 50), False),
+        (line(Vector((0.11, -0.94, 0.0)), Vector((0.11, 0.22, 0.0)), 40), False),
+    ])
+
+    bar = str(max(TOLERANCES_MM))
+    out = dict(cases)
+    out["tolerances_mm"] = TOLERANCES_MM
+    out["checks"] = {
+        "no_crossbar_across_the_v": cases["c_beside_a_v"]["strays_at_mm"][bar] == 0,
+        "t_junction_is_a_t_not_a_y": cases["t_junction"]["strays_at_mm"][bar] == 0,
+        # Two-sided: "no strays" is trivially true of a cut that produced
+        # nothing, so both arrangements must have really cut something.
+        "both_arrangements_cut_something": all(
+            c["cut_edges"] > 20 for c in cases.values()),
+    }
+    return out
+
+
 # --- 1. The cut lands on the line ---------------------------------------
 def test_cut_lands_on_the_drawn_line():
     """With a snap distance small relative to the mesh, the seam should sit
@@ -450,6 +576,7 @@ def test_bridge_routes_are_sane_on_an_ordinary_curve():
 
 TESTS = (
     test_every_drawn_point_becomes_a_cut_vertex,
+    test_no_edges_are_cut_away_from_the_drawn_line,
     test_cut_lands_on_the_drawn_line,
     test_snap_distance_trades_fidelity_for_welding,
     test_bridge_routes_are_sane_on_an_ordinary_curve,

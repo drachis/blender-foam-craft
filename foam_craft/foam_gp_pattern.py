@@ -770,6 +770,31 @@ class _CutGraph:
         self._by_key = {}       # (kind, id(elem), fac?) -> hit index, for reuse
         self.face_hits = {}     # BMFace -> [hit indices] landing in/on it
         self.face_edges = {}    # BMFace -> [edge indices] whose home is it
+        # BMEdge -> [(lo, hi)] stretches of an *existing* mesh edge that a
+        # drawn stroke actually ran along, as factors. See `cover`.
+        self.edge_spans = {}
+
+    def cover(self, edge, fac_a, fac_b):
+        """Record that a stroke ran along `edge` between these two factors.
+
+        Only these stretches may be joined up when the cut is realised. The
+        distinction matters because several strokes can touch one mesh edge
+        without any of them running along it -- a V's elbow and a C curving
+        past outside it, both crossing the same edge at different heights.
+        Joining every hit on an edge into one chain, which is what this
+        replaces, laid a bar between those two down the mesh edge: a cut
+        nobody drew, straight across the mouth of the V. Recording who
+        actually travelled the edge keeps the join to the stroke that
+        earned it.
+        """
+        lo, hi = (fac_a, fac_b) if fac_a <= fac_b else (fac_b, fac_a)
+        self.edge_spans.setdefault(edge, []).append((lo, hi))
+
+    def covered(self, edge, fac):
+        spans = self.edge_spans.get(edge)
+        if not spans:
+            return False
+        return any(lo - 1e-9 <= fac <= hi + 1e-9 for lo, hi in spans)
 
     @staticmethod
     def _key(hit):
@@ -926,10 +951,12 @@ def _add_stroke_to_graph(bm, bvh, graph, points, cyclic, snap_distance,
             continue
         if trivial == "same_edge":
             # Deliberately no edge added here -- see `_locally_trivial`.
-            # `_realise_graph`'s per-edge chain connects every hit on this
-            # edge, from every stroke, in the correct order; adding a direct
-            # edge here too would risk skipping over a point a different
-            # stroke placed between these two along the very same edge.
+            # `_realise_graph` joins up this stretch of the mesh edge for
+            # us, in the right order and including any point a *different*
+            # stroke placed between these two along it. Adding a direct edge
+            # here would skip over such a point. But it only joins stretches
+            # a stroke really travelled, which is what this records.
+            graph.cover(hits[p]["elem"], hits[p]["fac"], hits[q]["fac"])
             continue
 
         scan_faces = _hit_faces(hits[p]) | _hit_faces(hits[q])
@@ -1021,8 +1048,14 @@ def _realise_graph(bm, graph, snap_distance):
         # its own, leaving one unsealed edge exactly where the two were
         # supposed to meet -- which is all it takes to leak an otherwise
         # fully enclosed region into its neighbour.
-        chain_verts = [realised[index] for index, _fac in ordered]
-        for va, vb in zip(chain_verts, chain_verts[1:]):
+        for (index_a, fac_a), (index_b, fac_b) in zip(ordered, ordered[1:]):
+            # Only the stretches a stroke actually ran along -- see
+            # `_CutGraph.cover`. Judged at the middle of the stretch, since
+            # its two ends are exactly where hits sit and a hit belonging to
+            # some other stroke is precisely what must not drag a bar across.
+            if not graph.covered(edge, (fac_a + fac_b) * 0.5):
+                continue
+            va, vb = realised[index_a], realised[index_b]
             if va is vb or not (va.is_valid and vb.is_valid):
                 continue
             chain_edge = bm.edges.get((va, vb))
