@@ -448,6 +448,13 @@ what exists so far:
   order-dependent T-junction spurs are both fixed and covered by
   `tests/test_gp_junctions.py`; the near-miss (non-touching) junction case is
   still open.
+- [RESEARCH_theta_seam_edge_nondeterminism.md](RESEARCH_theta_seam_edge_nondeterminism.md)
+  -- why `test_determinism.py`'s theta case marks 174 or 176 seam edges at
+  random while the cut geometry itself is identical every run. Confirmed
+  pre-existing (fails 6 of 6 at `f87affb`, before the merge_fraction work).
+  The nearest-face lookup, each stroke alone, and a plain circle are all
+  ruled out by passing cases, which leaves junction handling. Root cause not
+  yet pinned; the two differing edges have not been identified.
 
 ## Good test shapes
 - **Torus, 12 major x 5 minor** — the craftability reference case: it needs

@@ -171,6 +171,11 @@ Honest list of what is unresolved as of 0.1:
   behind the grade presets give a sensible *ordering*, not calibrated physical
   values. Calibrate against a bend test on your actual stock before trusting
   the dart spacing on a tight curve.
+- **The seam flags are not perfectly repeatable.** Cutting the same pattern
+  twice can mark a couple of edges differently as seams. The pieces
+  themselves are stable -- same count, same sizes, same geometry every time --
+  so this has not been seen to change a cut pattern, but it is a known open
+  defect rather than a settled one.
 - **Bevel angles are computed, not proven.** The geometry is checked against
   shapes with arithmetically known answers (a sphere's curvature totals 4π, a
   cylinder's is zero, a cube's edges are all exactly 90°). That is a strong
