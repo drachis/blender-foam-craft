@@ -206,7 +206,11 @@ def main():
     git("checkout", "-b", branch)
     try:
         for path in stripping:
-            git("rm", "-r", "--quiet", "--", path)
+            # --force because removing the submodule directories stages
+            # a .gitmodules change, which then blocks .gitmodules' own
+            # removal. This is a throwaway branch built from a verified
+            # clean tree, so there is nothing here to lose.
+            git("rm", "-r", "--quiet", "--force", "--", path)
         version = set_manifest_version(number)
         git("add", "--", "%s/blender_manifest.toml" % PACKAGE)
         git("commit", "-m",
