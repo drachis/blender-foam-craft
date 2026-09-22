@@ -142,10 +142,13 @@ def set_manifest_version(number):
     path = os.path.join(ROOT, PACKAGE, "blender_manifest.toml")
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    new = re.sub(r'^version = "[^"]*"$', 'version = "0.%d.0"' % number,
-                 text, count=1, flags=re.M)
-    if new == text:
-        raise SystemExit("could not rewrite version in %s" % path)
+    # Count the substitutions, not whether the text moved. Cutting 0.01 from a
+    # manifest that already reads 0.1.0 is the normal case for a first release,
+    # and an unchanged file there means "already correct", not "failed".
+    new, count = re.subn(r'^version = "[^"]*"$', 'version = "0.%d.0"' % number,
+                         text, count=1, flags=re.M)
+    if count != 1:
+        raise SystemExit("no version line to rewrite in %s" % path)
     with open(path, "w", encoding="utf-8") as f:
         f.write(new)
     return "0.%d.0" % number
