@@ -39,11 +39,11 @@ import bmesh
 from mathutils import Vector, kdtree
 from mathutils.bvhtree import BVHTree
 
-_MOD = "bl_ext.user_default.foam_craft"
+_MOD = "bl_ext.user_default.foamcraft_drachis"
 for _name in [n for n in list(sys.modules) if n.startswith(_MOD)]:
     del sys.modules[_name]
 
-import bl_ext.user_default.foam_craft.foam_gp_pattern as gp        # noqa: E402
+import bl_ext.user_default.foamcraft_drachis.foam_gp_pattern as gp        # noqa: E402
 
 importlib.reload(gp)
 

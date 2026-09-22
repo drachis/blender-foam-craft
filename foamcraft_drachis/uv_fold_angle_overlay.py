@@ -17,7 +17,7 @@ from gpu_extras.batch import batch_for_shader
 from . import foam_angle_core
 
 
-class FoldAngleOverlaySettings(bpy.types.PropertyGroup):
+class FOAMCRAFT_DRACHIS_PG_fold_angle_settings(bpy.types.PropertyGroup):
     # Off by default. This overlay labels every mesh edge, which is right for
     # paper but unreadable on a foam pattern, and with both overlays enabled
     # the two sets of numbers sit on top of each other. Whichever workflow the
@@ -53,9 +53,9 @@ class FoldAngleOverlaySettings(bpy.types.PropertyGroup):
 def draw_callback():
     context = bpy.context
     scene = context.scene
-    if scene is None or not hasattr(scene, "fold_angle_overlay"):
+    if scene is None or not hasattr(scene, "foamcraft_drachis_fold_angles"):
         return
-    settings = scene.fold_angle_overlay
+    settings = scene.foamcraft_drachis_fold_angles
     if not settings.show:
         return
 
@@ -118,16 +118,16 @@ def draw_callback():
         gpu.state.blend_set('NONE')
 
 
-class IMAGE_PT_fold_angle_overlay(bpy.types.Panel):
+class IMAGE_PT_foamcraft_drachis_fold_angles(bpy.types.Panel):
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "Fold Angles"
     bl_label = "Fold Angle Overlay"
 
     def draw(self, context):
-        if not hasattr(context.scene, "fold_angle_overlay"):
+        if not hasattr(context.scene, "foamcraft_drachis_fold_angles"):
             return
-        s = context.scene.fold_angle_overlay
+        s = context.scene.foamcraft_drachis_fold_angles
         layout = self.layout
         layout.prop(s, "show")
 
@@ -155,14 +155,14 @@ class IMAGE_PT_fold_angle_overlay(bpy.types.Panel):
 
 
 _draw_handle = None
-_classes = (FoldAngleOverlaySettings, IMAGE_PT_fold_angle_overlay)
+_classes = (FOAMCRAFT_DRACHIS_PG_fold_angle_settings, IMAGE_PT_foamcraft_drachis_fold_angles)
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.fold_angle_overlay = bpy.props.PointerProperty(
-        type=FoldAngleOverlaySettings)
+    bpy.types.Scene.foamcraft_drachis_fold_angles = bpy.props.PointerProperty(
+        type=FOAMCRAFT_DRACHIS_PG_fold_angle_settings)
 
     global _draw_handle
     # Never stack handlers: a reload that registers without unregistering
@@ -186,6 +186,6 @@ def unregister():
             pass
         _draw_handle = None
 
-    del bpy.types.Scene.fold_angle_overlay
+    del bpy.types.Scene.foamcraft_drachis_fold_angles
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

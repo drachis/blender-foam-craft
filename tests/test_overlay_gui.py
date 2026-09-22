@@ -33,7 +33,7 @@ import bmesh
 # inspect a fresh empty copy and report "nothing to draw" about an overlay that
 # is working. Measured that way once -- draw handle unset, timer unregistered,
 # cache empty -- with the add-on apparently loaded.
-_ADDON = "bl_ext.user_default.foam_craft"
+_ADDON = "bl_ext.user_default.foamcraft_drachis"
 if bpy.context.object and bpy.context.object.mode != 'OBJECT':
     bpy.ops.object.mode_set(mode='OBJECT')
 try:
@@ -44,7 +44,7 @@ for _name in [n for n in list(sys.modules) if n.startswith(_ADDON)]:
     del sys.modules[_name]
 bpy.ops.preferences.addon_enable(module=_ADDON)
 
-import bl_ext.user_default.foam_craft.foam_overlay as overlay   # noqa: E402
+import bl_ext.user_default.foamcraft_drachis.foam_overlay as overlay   # noqa: E402
 
 _TOOLS = "O:/Work/BlenderPlugin/FoamCraft/tools"
 # Every Nth pixel. Comparing several million floats in Python is slow and adds
@@ -146,7 +146,7 @@ def test_overlay_draws_into_the_uv_editor():
     if area is None or region is None:
         return {"skipped": "no usable area", "checks": {"found_uv_area": False}}
 
-    settings = bpy.context.scene.foam_craft
+    settings = bpy.context.scene.foamcraft_drachis
     settings.show_overlay = False
     off = _capture(area, region, "overlay_off")
 
@@ -160,7 +160,7 @@ def test_overlay_draws_into_the_uv_editor():
     # and the test would blame the draw handler for it.
     try:
         with bpy.context.temp_override(area=area, region=region):
-            bpy.ops.foam.refresh_overlay()
+            bpy.ops.foamcraft_drachis.refresh_overlay()
         if hasattr(overlay, "_timer_tick"):
             overlay._timer_tick()
     except RuntimeError:

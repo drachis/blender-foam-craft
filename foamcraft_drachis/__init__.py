@@ -27,7 +27,7 @@ from . import uv_fold_angle_overlay
 from . import paper_model_export
 
 # Submodules exposing register()/unregister(). Settings register first; every
-# foam module reads scene.foam_craft from it.
+# foam module reads scene.foamcraft_drachis from it.
 _modules = [
     foam_settings,
     uv_fold_angle_overlay,

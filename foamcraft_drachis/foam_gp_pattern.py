@@ -1951,10 +1951,10 @@ def strokes_from_grease_pencil(gp_object, target_object, at_frame=None,
     return out
 
 
-class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_bake_pattern(bpy.types.Operator):
     """Cut the drawn strokes into a copy of this sculpt and unwrap the pieces"""
 
-    bl_idname = "object.foam_bake_pattern"
+    bl_idname = "foamcraft_drachis.bake_pattern"
     bl_label = "Bake Pattern"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -1998,7 +1998,7 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         state right after drawing, since the Grease Pencil is what you had
         selected. Three unrelated causes all showed as the same silent grey.
         """
-        settings = getattr(context.scene, "foam_craft", None)
+        settings = getattr(context.scene, "foamcraft_drachis", None)
         if settings is None:
             return "FoamCraft settings are unavailable"
         if settings.pattern_source is None:
@@ -2020,7 +2020,7 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         return cls.blocked_because(context) is None
 
     def invoke(self, context, event):
-        settings = getattr(context.scene, "foam_craft", None)
+        settings = getattr(context.scene, "foamcraft_drachis", None)
         if settings is not None:
             self.snap_distance = settings.snap_distance
             self.merge_fraction = settings.merge_fraction
@@ -2031,7 +2031,7 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         if blocked:
             self.report({'ERROR'}, blocked)
             return {'CANCELLED'}
-        settings = context.scene.foam_craft
+        settings = context.scene.foamcraft_drachis
         source = settings.pattern_source
         gp_object = settings.gp_object
         if context.object and context.object.mode != 'OBJECT':
@@ -2141,7 +2141,7 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class IMAGE_PT_foam_pattern(bpy.types.Panel):
+class IMAGE_PT_foamcraft_drachis_pattern(bpy.types.Panel):
     """One panel, in the UV editor, alongside the rest of FoamCraft.
 
     A modifier would be the natural home -- this is mesh modification with
@@ -2173,7 +2173,7 @@ class IMAGE_PT_foam_pattern(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        settings = getattr(context.scene, "foam_craft", None)
+        settings = getattr(context.scene, "foamcraft_drachis", None)
         if settings is None:
             layout.label(text="FoamCraft settings unavailable", icon='ERROR')
             return
@@ -2181,7 +2181,7 @@ class IMAGE_PT_foam_pattern(bpy.types.Panel):
         layout.prop(settings, "pattern_source", text="Sculpt")
         layout.prop(settings, "gp_object", text="Strokes")
 
-        blocked = OBJECT_OT_foam_bake_pattern.blocked_because(context)
+        blocked = FOAMCRAFT_DRACHIS_OT_bake_pattern.blocked_because(context)
         if blocked:
             # Say it rather than only greying the button out.
             layout.label(text=blocked, icon='INFO')
@@ -2193,7 +2193,7 @@ class IMAGE_PT_foam_pattern(bpy.types.Panel):
         row = layout.row()
         row.scale_y = 1.4
         row.enabled = blocked is None
-        row.operator("object.foam_bake_pattern",
+        row.operator("foamcraft_drachis.bake_pattern",
                      text="Re-bake Pattern" if existing else "Bake Pattern",
                      icon='MOD_BOOLEAN')
         if existing is not None:
@@ -2203,8 +2203,8 @@ class IMAGE_PT_foam_pattern(bpy.types.Panel):
 
 
 _classes = (
-    OBJECT_OT_foam_bake_pattern,
-    IMAGE_PT_foam_pattern,
+    FOAMCRAFT_DRACHIS_OT_bake_pattern,
+    IMAGE_PT_foamcraft_drachis_pattern,
 )
 
 

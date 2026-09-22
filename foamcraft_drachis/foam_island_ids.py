@@ -191,11 +191,11 @@ def _walk_order(adjacency, centroids, origin):
 
 # --- Operator ----------------------------------------------------------
 
-class MESH_OT_foam_assign_island_ids(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_assign_island_ids(bpy.types.Operator):
     """Assign persistent foam_island_id numbers to UV islands, walking 3D
     adjacency outward from a chosen origin"""
 
-    bl_idname = "mesh.foam_assign_island_ids"
+    bl_idname = "foamcraft_drachis.assign_island_ids"
     bl_label = "Assign Foam Piece Numbers"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -240,7 +240,7 @@ class MESH_OT_foam_assign_island_ids(bpy.types.Operator):
             self.report({'INFO'}, "No faces found.")
             return {'CANCELLED'}
 
-        settings = context.scene.foam_craft
+        settings = context.scene.foamcraft_drachis
         if settings.origin_object is not None:
             origin = settings.origin_object.matrix_world.translation.copy()
         else:
@@ -285,7 +285,7 @@ class MESH_OT_foam_assign_island_ids(bpy.types.Operator):
         return {'FINISHED'}
 
 
-_classes = (MESH_OT_foam_assign_island_ids,)
+_classes = (FOAMCRAFT_DRACHIS_OT_assign_island_ids,)
 
 
 def register():

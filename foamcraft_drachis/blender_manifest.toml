@@ -1,18 +1,24 @@
 schema_version = "1.0.0"
 
-id = "foam_craft"
+id = "foamcraft_drachis"
 version = "0.1.0"
 name = "FoamCraft"
 tagline = "Bevel angles, darts and cut patterns for foam panels"
-maintainer = "FoamCraft"
+maintainer = "Toli <drachis@gmail.com>"
 type = "add-on"
-blender_version_min = "4.2.0"
+
+website = "https://github.com/drachis/blender-foam-craft"
+support = "https://github.com/drachis/blender-foam-craft/issues"
+blender_version_min = "5.2.0"
 
 license = [
   "SPDX:GPL-3.0-or-later",
 ]
 
 tags = ["Modeling", "Mesh"]
+
+[permissions]
+files = "Write cut-pattern SVG files and a diagnostic log"
 
 [build]
 # Keep build artefacts and editor leftovers out of the shipped package. The

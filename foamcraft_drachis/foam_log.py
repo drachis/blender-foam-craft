@@ -8,7 +8,7 @@ overlap.
 
 The log lives at::
 
-    <Blender user data>/foam_craft/foam_craft.log
+    <Blender user data>/foamcraft_drachis/foamcraft_drachis.log
 
 which is stable across sessions, unlike ``bpy.app.tempdir``. The exact path is
 shown in the FoamCraft sidebar so it can be found without guessing.
@@ -28,8 +28,8 @@ import os
 
 import bpy
 
-_LOGGER_NAME = "foam_craft"
-_FILENAME = "foam_craft.log"
+_LOGGER_NAME = "foamcraft_drachis"
+_FILENAME = "foamcraft_drachis.log"
 
 # Rotate rather than truncate: a crash is usually explained by what happened
 # just before it, and truncating on load throws exactly that away.
@@ -39,7 +39,7 @@ _BACKUPS = 3
 
 def log_dir():
     """Directory holding the log file, created if missing."""
-    return bpy.utils.user_resource('DATAFILES', path="foam_craft", create=True)
+    return bpy.utils.user_resource('DATAFILES', path="foamcraft_drachis", create=True)
 
 
 def log_path():

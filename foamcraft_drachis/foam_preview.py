@@ -1,8 +1,8 @@
 """3D viewport preview and debugging for foam panel layouts.
 
 Two operators:
-- OBJECT_OT_foam_preview_thickness: Show the sculpt with real foam thickness.
-- OBJECT_OT_foam_layout_preview: Generate mesh geometry for each UV island
+- FOAMCRAFT_DRACHIS_OT_preview_thickness: Show the sculpt with real foam thickness.
+- FOAMCRAFT_DRACHIS_OT_layout_preview: Generate mesh geometry for each UV island
   (FLAT, BENT, or DART_CUT modes) so pieces can be inspected in the viewport.
 
 Collections: generated objects placed in 'FoamCraft Preview', cleared on each run.
@@ -16,14 +16,14 @@ from . import foam_angle_core as core
 
 # --- Thickness preview operator -----------------------------------------------
 
-class OBJECT_OT_foam_preview_thickness(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_preview_thickness(bpy.types.Operator):
     """Show the sculpt with real foam thickness using a Solidify modifier.
 
     Per-source replacement: only the existing preview for this source object
     is deleted; previews belonging to other objects are left untouched.
     """
 
-    bl_idname = "object.foam_preview_thickness"
+    bl_idname = "foamcraft_drachis.preview_thickness"
     bl_label = "Preview Foam Thickness"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -33,7 +33,7 @@ class OBJECT_OT_foam_preview_thickness(bpy.types.Operator):
             self.report({'ERROR'}, "Select a mesh object")
             return {'CANCELLED'}
 
-        settings = context.scene.foam_craft
+        settings = context.scene.foamcraft_drachis
         thickness = settings.foam_thickness
 
         # Delete any existing preview for this source object.
@@ -74,7 +74,7 @@ def _delete_preview_for_source(source_name):
 
 # --- Layout preview operator ---------------------------------------------------
 
-class OBJECT_OT_foam_layout_preview(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_layout_preview(bpy.types.Operator):
     """Generate real mesh geometry for foam pieces in the 3D viewport.
 
     Modes:
@@ -83,7 +83,7 @@ class OBJECT_OT_foam_layout_preview(bpy.types.Operator):
     - DART_CUT: FLAT mode plus marker geometry for relief darts.
     """
 
-    bl_idname = "object.foam_layout_preview"
+    bl_idname = "foamcraft_drachis.layout_preview"
     bl_label = "Preview Foam Layout"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -107,7 +107,7 @@ class OBJECT_OT_foam_layout_preview(bpy.types.Operator):
             self.report({'ERROR'}, "Select a mesh object")
             return {'CANCELLED'}
 
-        settings = context.scene.foam_craft
+        settings = context.scene.foamcraft_drachis
 
         # Get or create the FoamCraft Preview collection.
         collection = _get_or_create_collection("FoamCraft Preview", context)
@@ -414,8 +414,8 @@ def _apply_vertex_colors(obj, mesh, bm, island_faces, uv_layer, settings):
 # --- Registration ---------------------------------------------------------------
 
 _classes = (
-    OBJECT_OT_foam_preview_thickness,
-    OBJECT_OT_foam_layout_preview,
+    FOAMCRAFT_DRACHIS_OT_preview_thickness,
+    FOAMCRAFT_DRACHIS_OT_layout_preview,
 )
 
 

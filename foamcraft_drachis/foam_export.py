@@ -14,7 +14,7 @@ tracing workflow, and reads UV positions directly off the active UV map.
 The heavy lifting (``generate_svg``) is a plain function of ``(bm, uv_layer,
 settings, scale_length)`` rather than a method on the operator, so it can be
 unit-tested against a stand-in settings object without registering anything or
-touching ``context.scene.foam_craft``.
+touching ``context.scene.foamcraft_drachis``.
 """
 
 from math import radians, tan
@@ -368,10 +368,10 @@ def _rgba_to_hex(rgba):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-class EXPORT_OT_foam_panel_pattern(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_export_panel_pattern(bpy.types.Operator):
     """Export flat foam cut patterns (outlines, darts and bevel labels) as an SVG"""
 
-    bl_idname = "export_mesh.foam_panel_pattern"
+    bl_idname = "foamcraft_drachis.export_panel_pattern"
     bl_label = "Export Foam Panel Pattern (SVG)"
     bl_options = {'PRESET'}
 
@@ -400,7 +400,7 @@ class EXPORT_OT_foam_panel_pattern(bpy.types.Operator):
                 self.report({'ERROR'}, "This mesh has no active UV map. Unwrap it first.")
                 return {'CANCELLED'}
 
-            settings = context.scene.foam_craft
+            settings = context.scene.foamcraft_drachis
             svg_text = generate_svg(bm, uv_layer, settings,
                                     context.scene.unit_settings.scale_length)
         finally:
@@ -417,15 +417,15 @@ class EXPORT_OT_foam_panel_pattern(bpy.types.Operator):
 
 
 def menu_func_export(self, context):
-    self.layout.operator(EXPORT_OT_foam_panel_pattern.bl_idname,
+    self.layout.operator(FOAMCRAFT_DRACHIS_OT_export_panel_pattern.bl_idname,
                          text="Foam Panel Pattern (.svg)")
 
 
 def register():
-    bpy.utils.register_class(EXPORT_OT_foam_panel_pattern)
+    bpy.utils.register_class(FOAMCRAFT_DRACHIS_OT_export_panel_pattern)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
-    bpy.utils.unregister_class(EXPORT_OT_foam_panel_pattern)
+    bpy.utils.unregister_class(FOAMCRAFT_DRACHIS_OT_export_panel_pattern)

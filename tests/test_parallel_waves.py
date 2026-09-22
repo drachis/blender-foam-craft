@@ -40,11 +40,11 @@ from mathutils import Vector
 
 sys.path.insert(0, r"O:\Work\BlenderPlugin\FoamCraft\tools")
 
-_MOD = "bl_ext.user_default.foam_craft"
+_MOD = "bl_ext.user_default.foamcraft_drachis"
 for _name in [n for n in list(sys.modules) if n.startswith(_MOD)]:
     del sys.modules[_name]
 
-import bl_ext.user_default.foam_craft.foam_gp_pattern as gp        # noqa: E402
+import bl_ext.user_default.foamcraft_drachis.foam_gp_pattern as gp        # noqa: E402
 
 importlib.reload(gp)
 

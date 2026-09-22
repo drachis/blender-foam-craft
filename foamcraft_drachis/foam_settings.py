@@ -1,7 +1,7 @@
 """Shared scene settings for the foam workflow.
 
 Every foam module reads from this one PropertyGroup, reached as
-``context.scene.foam_craft``. Keeping it in its own module means the overlay,
+``context.scene.foamcraft_drachis``. Keeping it in its own module means the overlay,
 the exporter, the numbering operator and the previews can be developed against
 a stable contract without importing each other.
 
@@ -34,7 +34,7 @@ THICKNESS_MAX = 0.0508     # 2"
 THICKNESS_DEFAULT = 0.0127  # 1/2"
 
 
-class FoamPanelSettings(bpy.types.PropertyGroup):
+class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
     # --- Material
     foam_grade: bpy.props.EnumProperty(
         name="Foam Grade",
@@ -317,15 +317,15 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
         min=0, max=1, subtype='COLOR', size=4)
 
 
-class FOAM_OT_estimate_tolerances(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_estimate_tolerances(bpy.types.Operator):
     """Suggest deviation and angle tolerances from the foam grade and thickness"""
 
-    bl_idname = "foam.estimate_tolerances"
+    bl_idname = "foamcraft_drachis.estimate_tolerances"
     bl_label = "Estimate From Foam"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        s = context.scene.foam_craft
+        s = context.scene.foamcraft_drachis
         deviation, angle = core.estimate_flex_tolerance(s.foam_grade,
                                                         s.foam_thickness)
         s.max_chord_deviation = deviation
@@ -337,16 +337,16 @@ class FOAM_OT_estimate_tolerances(bpy.types.Operator):
         return {'FINISHED'}
 
 
-_classes = (FoamPanelSettings, FOAM_OT_estimate_tolerances)
+_classes = (FOAMCRAFT_DRACHIS_PG_panel_settings, FOAMCRAFT_DRACHIS_OT_estimate_tolerances)
 
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.foam_craft = bpy.props.PointerProperty(type=FoamPanelSettings)
+    bpy.types.Scene.foamcraft_drachis = bpy.props.PointerProperty(type=FOAMCRAFT_DRACHIS_PG_panel_settings)
 
 
 def unregister():
-    del bpy.types.Scene.foam_craft
+    del bpy.types.Scene.foamcraft_drachis
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

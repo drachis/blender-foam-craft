@@ -17,10 +17,10 @@ import mathutils as M
 from . import foam_angle_core
 
 
-class ExportPaperModelAngles(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_export_paper_model_angles(bpy.types.Operator):
     """Export a companion SVG labeling the fold/bevel angle at every edge"""
 
-    bl_idname = "export_mesh.paper_model_angles"
+    bl_idname = "foamcraft_drachis.export_paper_model_angles"
     bl_label = "Export Paper Model Fold Angles (SVG)"
     bl_options = {'PRESET'}
 
@@ -143,15 +143,15 @@ class ExportPaperModelAngles(bpy.types.Operator):
 
 
 def menu_func_export(self, context):
-    self.layout.operator(ExportPaperModelAngles.bl_idname,
+    self.layout.operator(FOAMCRAFT_DRACHIS_OT_export_paper_model_angles.bl_idname,
                          text="Paper Model Fold Angles (.svg)")
 
 
 def register():
-    bpy.utils.register_class(ExportPaperModelAngles)
+    bpy.utils.register_class(FOAMCRAFT_DRACHIS_OT_export_paper_model_angles)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
-    bpy.utils.unregister_class(ExportPaperModelAngles)
+    bpy.utils.unregister_class(FOAMCRAFT_DRACHIS_OT_export_paper_model_angles)

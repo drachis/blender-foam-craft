@@ -109,7 +109,7 @@ _findings = []
 
 
 def _settings(context):
-    return getattr(context.scene, "foam_craft", None)
+    return getattr(context.scene, "foamcraft_drachis", None)
 
 
 def _uv_fingerprint(bm, uv_layer):
@@ -754,10 +754,10 @@ def draw_callback():
             blf.draw(font_id, text)
 
 
-class FOAM_OT_refresh_overlay(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_refresh_overlay(bpy.types.Operator):
     """Recompute the cut runs shown in the UV editor"""
 
-    bl_idname = "foam.refresh_overlay"
+    bl_idname = "foamcraft_drachis.refresh_overlay"
     bl_label = "Refresh Overlay"
 
     def execute(self, context):
@@ -767,10 +767,10 @@ class FOAM_OT_refresh_overlay(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class FOAM_OT_check_craftability(bpy.types.Operator):
+class FOAMCRAFT_DRACHIS_OT_check_craftability(bpy.types.Operator):
     """Check whether this mesh and unwrap can actually be built from foam"""
 
-    bl_idname = "foam.check_craftability"
+    bl_idname = "foamcraft_drachis.check_craftability"
     bl_label = "Check Craftability"
 
     @classmethod
@@ -818,7 +818,7 @@ _SEVERITY_ICON = {'blocker': 'CANCEL', 'warn': 'ERROR',
                   'info': 'INFO', 'ok': 'CHECKMARK'}
 
 
-class IMAGE_PT_foam_craft(bpy.types.Panel):
+class IMAGE_PT_foamcraft_drachis(bpy.types.Panel):
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "FoamCraft"
@@ -845,9 +845,9 @@ class IMAGE_PT_foam_craft(bpy.types.Panel):
         box.prop(s, "max_chord_deviation")
         box.prop(s, "max_angle_variation_deg")
         box.prop(s, "max_tilt_deg")
-        box.operator("foam.estimate_tolerances", icon='SHADERFX')
+        box.operator("foamcraft_drachis.estimate_tolerances", icon='SHADERFX')
         box.label(text=f"{len(_cache.runs)} run(s) cached")
-        box.operator(FOAM_OT_refresh_overlay.bl_idname, icon='FILE_REFRESH')
+        box.operator(FOAMCRAFT_DRACHIS_OT_refresh_overlay.bl_idname, icon='FILE_REFRESH')
 
         box = col.box()
         box.label(text="Show")
@@ -861,12 +861,12 @@ class IMAGE_PT_foam_craft(bpy.types.Panel):
         box.prop(s, "overlay_scale")
 
 
-class IMAGE_PT_foam_craft_display(bpy.types.Panel):
+class IMAGE_PT_foamcraft_drachis_display(bpy.types.Panel):
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "FoamCraft"
     bl_label = "Display"
-    bl_parent_id = "IMAGE_PT_foam_craft"
+    bl_parent_id = "IMAGE_PT_foamcraft_drachis"
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
@@ -911,12 +911,12 @@ class IMAGE_PT_foam_craft_display(bpy.types.Panel):
         layout.prop(s, "island_id_color")
 
 
-class IMAGE_PT_foam_craft_advice(bpy.types.Panel):
+class IMAGE_PT_foamcraft_drachis_advice(bpy.types.Panel):
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "FoamCraft"
     bl_label = "Craftability"
-    bl_parent_id = "IMAGE_PT_foam_craft"
+    bl_parent_id = "IMAGE_PT_foamcraft_drachis"
 
     def draw(self, context):
         layout = self.layout
@@ -948,7 +948,7 @@ class IMAGE_PT_foam_craft_advice(bpy.types.Panel):
         row.prop(s, "sheet_width")
         row.prop(s, "sheet_height")
         layout.prop(s, "stretch_tolerance")
-        layout.operator(FOAM_OT_check_craftability.bl_idname, icon='VIEWZOOM')
+        layout.operator(FOAMCRAFT_DRACHIS_OT_check_craftability.bl_idname, icon='VIEWZOOM')
 
         if not _findings:
             layout.label(text="Not checked yet")
@@ -999,11 +999,11 @@ def _wrap(text, width):
 
 
 _classes = (
-    FOAM_OT_refresh_overlay,
-    FOAM_OT_check_craftability,
-    IMAGE_PT_foam_craft,
-    IMAGE_PT_foam_craft_display,
-    IMAGE_PT_foam_craft_advice,
+    FOAMCRAFT_DRACHIS_OT_refresh_overlay,
+    FOAMCRAFT_DRACHIS_OT_check_craftability,
+    IMAGE_PT_foamcraft_drachis,
+    IMAGE_PT_foamcraft_drachis_display,
+    IMAGE_PT_foamcraft_drachis_advice,
 )
 
 

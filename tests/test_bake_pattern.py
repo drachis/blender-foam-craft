@@ -30,12 +30,12 @@ import bpy
 import bmesh
 from mathutils import Vector
 
-_MOD = "bl_ext.user_default.foam_craft"
+_MOD = "bl_ext.user_default.foamcraft_drachis"
 for _name in [n for n in list(sys.modules) if n.startswith(_MOD)]:
     del sys.modules[_name]
 
-import bl_ext.user_default.foam_craft.foam_gp_pattern as gp     # noqa: E402
-import bl_ext.user_default.foam_craft.foam_angle_core as core   # noqa: E402
+import bl_ext.user_default.foamcraft_drachis.foam_gp_pattern as gp     # noqa: E402
+import bl_ext.user_default.foamcraft_drachis.foam_angle_core as core   # noqa: E402
 
 importlib.reload(gp)
 importlib.reload(core)
@@ -77,7 +77,7 @@ def _clear():
         bpy.ops.object.mode_set(mode='OBJECT')
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete(use_global=False)
-    settings = getattr(bpy.context.scene, "foam_craft", None)
+    settings = getattr(bpy.context.scene, "foamcraft_drachis", None)
     if settings is not None:
         settings.gp_object = None
         settings.pattern_source = None
@@ -128,7 +128,7 @@ def _build_scene(ring_z=0.3137, n=160, offset=(0.0, 0.0, 0.0)):
         cyclic = drawing.attributes.new("cyclic", 'BOOLEAN', 'CURVE')
     cyclic.data[0].value = True
 
-    settings = bpy.context.scene.foam_craft
+    settings = bpy.context.scene.foamcraft_drachis
     settings.gp_object = gp_obj
     settings.pattern_source = sculpt
     # Left active on purpose: right after drawing, the Grease Pencil is what is
@@ -210,7 +210,7 @@ def test_bake_makes_pieces_without_touching_inputs():
     before = _mesh_counts(sculpt)
     strokes_before = _stroke_count(gp_obj)
 
-    result = bpy.ops.object.foam_bake_pattern(snap_distance=0.002)
+    result = bpy.ops.foamcraft_drachis.bake_pattern(snap_distance=0.002)
     pattern = _pattern_of(sculpt)
     islands, seams = _island_count(pattern) if pattern else (0, 0)
 
@@ -255,7 +255,7 @@ def test_rebake_replaces_the_copy():
     left another copy behind, the loop would come with a cleanup chore."""
     sculpt, gp_obj = _build_scene()
     for _ in range(3):
-        bpy.ops.object.foam_bake_pattern(snap_distance=0.002)
+        bpy.ops.foamcraft_drachis.bake_pattern(snap_distance=0.002)
 
     patterns = [o for o in bpy.data.objects if o.get("foam_pattern_source")]
     pattern = _pattern_of(sculpt)
@@ -263,11 +263,11 @@ def test_rebake_replaces_the_copy():
 
     # Naming the pattern copy as the sculpt must be refused: it is an output,
     # and cutting it again would compound the pattern into itself.
-    bpy.context.scene.foam_craft.pattern_source = pattern
+    bpy.context.scene.foamcraft_drachis.pattern_source = pattern
     try:
         # Reports an error, which bpy.ops turns into an exception rather than a
         # CANCELLED return, so refusal has to be caught rather than inspected.
-        bpy.ops.object.foam_bake_pattern(snap_distance=0.002)
+        bpy.ops.foamcraft_drachis.bake_pattern(snap_distance=0.002)
         second = ['FINISHED']
     except RuntimeError:
         second = ['CANCELLED']
@@ -352,12 +352,12 @@ def _bake_strokes_on_sphere(strokes, segments=64, rings=32):
     # a particular name.
     _LABEL[1] = sculpt.name
     gp_obj = _gp_from_strokes(strokes)
-    bpy.context.scene.foam_craft.gp_object = gp_obj
-    bpy.context.scene.foam_craft.pattern_source = sculpt
+    bpy.context.scene.foamcraft_drachis.gp_object = gp_obj
+    bpy.context.scene.foamcraft_drachis.pattern_source = sculpt
     bpy.context.view_layer.objects.active = gp_obj
 
     shots = []
-    outcome = bpy.ops.object.foam_bake_pattern(snap_distance=0.004)
+    outcome = bpy.ops.foamcraft_drachis.bake_pattern(snap_distance=0.004)
     pattern = _pattern_of(sculpt)
     if pattern is None:
         return {"failed": list(outcome), "shots": shots}, None
