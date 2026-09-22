@@ -569,11 +569,256 @@ def test_a_stack_of_parallel_lines_inside_one_another_s_ink():
     return out
 
 
+
+# --- merge_fraction -------------------------------------------------------
+#
+# `join_touching_strokes` has two different answers available when two marks
+# overlap, and `merge_fraction` picks between them:
+#
+#   below it        the marks are two lines that happen to touch, so each
+#                   touching stretch gets a junction and both strokes stay;
+#   at or above it  the marks are one line drawn twice, so they collapse to a
+#                   single stroke running down the middle of the two.
+#
+# Counting the strokes that come back separates those outright: joining leaves
+# two, merging leaves one. Every case below is that count against a shape
+# whose coverage is known by construction rather than measured afterwards.
+
+_MERGE_LEN = 1.0            # marks run from -0.5 to +0.5
+_MERGE_SAMPLES = 101
+_MERGE_NIB = 0.005          # so ink meets ink within 2 * 0.005 = 0.010
+_MERGE_OFFSET = 0.004       # inside that, so these two marks do overlap
+
+
+def _straight(y, x0=-0.5, x1=0.5, samples=_MERGE_SAMPLES):
+    return [Vector((x0 + (x1 - x0) * (i / (samples - 1.0)), y, 0.0))
+            for i in range(samples)]
+
+
+def _veering(frac):
+    """Parallel to the x axis for `frac` of its length, then away sharply.
+
+    Built so *both* coverages come out at about `frac`: the stretch lying
+    inside the other mark's ink is the same stretch on both curves, because
+    over it the two are parallel and `_MERGE_OFFSET` apart. That is what makes
+    `frac` the knob the threshold is compared against, rather than something
+    that has to be measured after the fact.
+    """
+    out = []
+    for i in range(_MERGE_SAMPLES):
+        f = i / (_MERGE_SAMPLES - 1.0)
+        x = -0.5 + f
+        y = _MERGE_OFFSET if f <= frac else _MERGE_OFFSET + (f - frac) * 2.0
+        out.append(Vector((x, y, 0.0)))
+    return out
+
+
+def test_merge_fraction_collapses_a_retraced_line():
+    """Two marks drawn along each other for their whole length are one mark.
+
+    Known by construction: the two are parallel and 4 mm apart with a 5 mm nib
+    on each, so every point of either lies inside the other's ink and both
+    coverages are exactly 1.0. At merge_fraction 0.5 that is over the
+    threshold, so the pair must come back as a single stroke -- and that
+    stroke must run down the middle, at 2 mm, not along either original.
+
+    The same input at merge_fraction 0.0 must come back as two, because zero
+    switches merging off. Both bounds, so a rule that merged everything and a
+    rule that merged nothing each fail one of them.
+    """
+    a = _straight(0.0)
+    b = _straight(_MERGE_OFFSET)
+    strokes = [(a, False, _MERGE_NIB), (b, False, _MERGE_NIB)]
+
+    merged = gp.join_touching_strokes(strokes, 0.0002, merge_fraction=0.5)
+    off = gp.join_touching_strokes(strokes, 0.0002, merge_fraction=0.0)
+
+    midline_error = None
+    if len(merged) == 1:
+        ys = [p.y for p in merged[0][0]]
+        # Every point of the survivor should sit on the midline, 2 mm.
+        midline_error = max(abs(y - _MERGE_OFFSET / 2.0) for y in ys)
+
+    return {
+        "strokes_in": 2,
+        "strokes_out_merging_at_0_5": len(merged),
+        "strokes_out_merging_off": len(off),
+        "midline_target_mm": round(_MERGE_OFFSET / 2.0 * 1000, 3),
+        "worst_midline_error_mm":
+            None if midline_error is None else round(midline_error * 1000, 4),
+        "checks": {
+            "full_overlap_becomes_one_mark": len(merged) == 1,
+            # Within a tenth of a millimetre of the true midline. The two
+            # inputs sit 2 mm either side of it, so anything that merely kept
+            # one original would miss by 2 mm and fail this.
+            "the_survivor_runs_down_the_middle":
+                midline_error is not None and midline_error < 0.0001,
+            "zero_switches_merging_off": len(off) == 2,
+        },
+    }
+
+
+def test_merge_fraction_leaves_a_crossing_alone():
+    """A deliberate X must not be swallowed into one line.
+
+    Crossing two strokes is how a maker closes a region into a piece, so this
+    is the case that matters most: the two marks genuinely touch, and they
+    must still come back as two. Known by construction -- each line lies
+    inside the other's ink only within about one ink-reach of the centre, so
+    both coverages are near 0.01 / 1.41, far under 0.5.
+
+    This is the bound a merge rule keyed to "do they touch at all" rather than
+    "how much of them overlaps" would fail.
+    """
+    d = 0.5
+    n = _MERGE_SAMPLES
+    a = [Vector((-d + 2 * d * (i / (n - 1.0)),
+                 -d + 2 * d * (i / (n - 1.0)), 0.0)) for i in range(n)]
+    b = [Vector((-d + 2 * d * (i / (n - 1.0)),
+                 d - 2 * d * (i / (n - 1.0)), 0.0)) for i in range(n)]
+    strokes = [(a, False, _MERGE_NIB), (b, False, _MERGE_NIB)]
+
+    out = gp.join_touching_strokes(strokes, 0.0002, merge_fraction=0.5)
+    return {
+        "strokes_in": 2,
+        "strokes_out": len(out),
+        "checks": {
+            "a_crossing_stays_two_marks": len(out) == 2,
+        },
+    }
+
+
+def test_merge_fraction_switches_at_its_threshold():
+    """Sweep how much of the pair overlaps and check the switch sits where the
+    setting says it does -- and that it only ever flips one way.
+
+    `_veering` puts a known fraction of both marks inside the other's ink, so
+    with merge_fraction at 0.5 the answer is arithmetic: 0.2 and 0.4 stay two
+    marks, 0.6 and 0.8 become one. The monotonic check is the one that
+    survives a change of constants -- drawing *more* of a mark on top of
+    another may never make it less merged.
+    """
+    rows = {}
+    for frac in (0.2, 0.4, 0.6, 0.8):
+        strokes = [(_straight(0.0), False, _MERGE_NIB),
+                   (_veering(frac), False, _MERGE_NIB)]
+        out = gp.join_touching_strokes(strokes, 0.0002, merge_fraction=0.5)
+        rows["overlap_%d_pct" % round(frac * 100)] = {
+            "overlap_fraction": frac,
+            "strokes_out": len(out),
+            "merged": len(out) == 1,
+        }
+
+    ordered = [rows["overlap_%d_pct" % p] for p in (20, 40, 60, 80)]
+    flags = [r["merged"] for r in ordered]
+    out = dict(rows)
+    out["checks"] = {
+        "under_the_threshold_stays_two_marks":
+            flags[0] is False and flags[1] is False,
+        "over_the_threshold_becomes_one_mark":
+            flags[2] is True and flags[3] is True,
+        # More overlap may never mean less merging, whatever the constants.
+        "more_overlap_never_merges_less":
+            all(flags[i] <= flags[i + 1] for i in range(len(flags) - 1)),
+    }
+    return out
+
+
+def test_a_short_retrace_over_a_long_mark_merges():
+    """A short mark lying along a long one is a retrace, not a second line.
+
+    This pins a semantic that is easy to get wrong by accident. Coverage is
+    taken as the *larger* of the two, so a 100 mm mark drawn along a 1 m one
+    merges even though only a tenth of the long mark is covered -- the short
+    mark is entirely inside the long one's ink, and there is nothing else it
+    could be. Were the rule the smaller of the two, or their mean, this would
+    come back as two marks and the maker would get a spurious junction at
+    each end of the retrace.
+    """
+    long_mark = _straight(0.0)
+    short_mark = _straight(_MERGE_OFFSET, x0=-0.05, x1=0.05, samples=21)
+    out = gp.join_touching_strokes(
+        [(long_mark, False, _MERGE_NIB), (short_mark, False, _MERGE_NIB)],
+        0.0002, merge_fraction=0.5)
+    return {
+        "long_mark_points": len(long_mark),
+        "short_mark_points": len(short_mark),
+        "strokes_out": len(out),
+        # The long mark is the spine, so the survivor keeps its point count.
+        "survivor_points": len(out[0][0]) if len(out) == 1 else None,
+        "checks": {
+            "a_retrace_merges": len(out) == 1,
+            "the_longer_mark_is_the_spine":
+                len(out) == 1 and len(out[0][0]) == len(long_mark),
+        },
+    }
+
+
+
+def test_merge_fraction_reaches_the_cutter():
+    """The setting has to survive the trip into `cut_strokes`, not just work
+    when `join_touching_strokes` is called directly.
+
+    That trip is where this feature was left unfinished once already: the
+    parameter existed and was correct, and nothing passed it, so the merge
+    branch was unreachable from the panel. Cutting the same pair of marks
+    both ways and counting the edges is the cheapest check that the wire is
+    connected -- one line laid into the mesh costs about half the edges of
+    two, and no arrangement of two separate cuts costs less than one.
+
+    Measured 2026-09-21: 219 edges unmerged, 108 merged. The bound is stated
+    as a ratio rather than those literals so a change to the plane's density
+    does not have to be mirrored here.
+    """
+    rows = {}
+    for label, merge in (("merge_off", 0.0), ("merge_on", 0.5)):
+        _clear()
+        obj = _plane()
+        strokes = [(_straight(0.0), False, _MERGE_NIB),
+                   (_straight(_MERGE_OFFSET), False, _MERGE_NIB)]
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        edges, open_ends = gp.cut_strokes(
+            bm, strokes, snap_distance=0.0002, chain_tolerance=0.0002,
+            merge_fraction=merge)
+        for e in edges:
+            e.seam = True
+        rows[label] = {
+            "merge_fraction": merge,
+            "cut_edges": len(edges),
+            "open_ends": open_ends,
+            "seam_networks": _seam_networks(bm),
+            "enclosed_pieces": _enclosed_regions(bm),
+        }
+        bm.free()
+
+    off, on = rows["merge_off"], rows["merge_on"]
+    out = dict(rows)
+    out["checks"] = {
+        # The wire is connected at all: the two bakes must differ.
+        "the_setting_changes_the_cut": on["cut_edges"] != off["cut_edges"],
+        # And it differs the right way, by about half.
+        "merging_costs_about_half_the_edges":
+            on["cut_edges"] < off["cut_edges"] * 0.75,
+        # Both bounds: merging must not cost so little that it cut nothing.
+        "merging_still_cuts_a_line":
+            on["cut_edges"] > off["cut_edges"] * 0.25,
+        # One mark down the middle leaves no sliver between the originals.
+        "no_sliver_between_the_two_marks": on["enclosed_pieces"] == 0,
+    }
+    return out
+
+
 TESTS = (
     test_a_stack_of_parallel_lines_inside_one_another_s_ink,
     test_sine_against_sawtooth_across_amplitudes,
     test_joining_follows_the_ink_not_the_distance,
     test_two_parallel_sines,
+    test_merge_fraction_collapses_a_retraced_line,
+    test_merge_fraction_leaves_a_crossing_alone,
+    test_merge_fraction_switches_at_its_threshold,
+    test_a_short_retrace_over_a_long_mark_merges,
+    test_merge_fraction_reaches_the_cutter,
 )
 
 result = {}

@@ -1257,7 +1257,7 @@ def _segment_closest(a0, a1, b0, b1):
     return (qa - qb).length, s, qa, t, qb
 
 
-def join_touching_strokes(strokes, tolerance):
+def join_touching_strokes(strokes, tolerance, merge_fraction=0.0):
     """Join strokes whose ink overlaps but whose centrelines never meet.
 
     A hand draws with a nib that has width; the curve taken from it is
@@ -1286,15 +1286,40 @@ def join_touching_strokes(strokes, tolerance):
     hundreds; taking the local minimum of each stretch is what tells "these
     two touch here" from "these two run together".
     """
-    strokes = [(list(s[0]), s[1], s[2] if len(s) > 2 else 0.0)
+    strokes = [[list(s[0]), s[1], s[2] if len(s) > 2 else 0.0]
                for s in strokes]
     inserts = [{} for _ in strokes]
-    joins = 0
+    absorbed = set()
+    joins, merges = 0, 0
     for i in range(len(strokes)):
+        if i in absorbed:
+            continue
         points_a, _cyclic_a, width_a = strokes[i]
         for j in range(i + 1, len(strokes)):
+            if j in absorbed:
+                continue
             points_b, _cyclic_b, width_b = strokes[j]
             reach = max(tolerance, width_a + width_b)
+
+            # How much of each mark lies inside the other's ink. Two lines
+            # that overlap for their whole length are one thick line and
+            # should cut as one; two that overlap only in patches are two
+            # lines that happen to touch, and the maker sorts out the
+            # patches. Where the line between those falls is a matter of
+            # taste, so it is `merge_fraction`, set in the panel.
+            if merge_fraction > 0.0:
+                covered_a = _covered_fraction(points_a, points_b, reach)
+                covered_b = _covered_fraction(points_b, points_a, reach)
+                if max(covered_a, covered_b) >= merge_fraction:
+                    spine, other = ((i, j) if len(points_a) >= len(points_b)
+                                    else (j, i))
+                    strokes[spine][0] = _midline(strokes[spine][0],
+                                                 strokes[other][0], reach)
+                    absorbed.add(other)
+                    merges += 1
+                    if other == i:
+                        break
+                    continue
 
             # How near the other mark runs, all along this one. Walking one
             # stroke and asking "how far is the other from here" turns the
@@ -1339,6 +1364,8 @@ def join_touching_strokes(strokes, tolerance):
 
     out = []
     for index, (points, cyclic, width) in enumerate(strokes):
+        if index in absorbed:
+            continue
         if not inserts[index]:
             out.append((points, cyclic, width))
             continue
@@ -1351,9 +1378,55 @@ def join_touching_strokes(strokes, tolerance):
                     grown.append(middle.copy())
         out.append((grown, cyclic, width))
 
-    if joins:
+    if joins or merges:
         _log.info(foam_log.summary(
-            "strokes_joined_by_ink", junctions=joins, tolerance=tolerance))
+            "strokes_joined_by_ink", junctions=joins, merged=merges,
+            tolerance=tolerance, merge_fraction=merge_fraction))
+    return out
+
+
+def _covered_fraction(points, other, reach):
+    """What proportion of `points` lies inside `other`'s ink."""
+    if not points:
+        return 0.0
+    inside = 0
+    for p in points:
+        for a, b in zip(other, other[1:]):
+            span = b - a
+            denom = span.length_squared
+            if denom < 1e-18:
+                t = 0.0
+            else:
+                t = max(0.0, min(1.0, (p - a).dot(span) / denom))
+            if (p - (a + span * t)).length <= reach:
+                inside += 1
+                break
+    return inside / float(len(points))
+
+
+def _midline(spine, other, reach):
+    """One line down the middle of two that overlap.
+
+    Where the spine runs inside the other's ink the two marks are one, so
+    the cut belongs between them; where it runs clear the spine is on its
+    own and stays where it was drawn. Following the spine rather than
+    resampling keeps every point the maker put down.
+    """
+    out = []
+    for p in spine:
+        best = None
+        for a, b in zip(other, other[1:]):
+            span = b - a
+            denom = span.length_squared
+            if denom < 1e-18:
+                t = 0.0
+            else:
+                t = max(0.0, min(1.0, (p - a).dot(span) / denom))
+            q = a + span * t
+            d = (p - q).length
+            if best is None or d < best[0]:
+                best = (d, q)
+        out.append((p + best[1]) * 0.5 if best and best[0] <= reach else p)
     return out
 
 
@@ -1631,7 +1704,7 @@ def snap_stroke_ends(strokes, tolerance):
 
 
 def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
-                chain_tolerance=0.0):
+                chain_tolerance=0.0, merge_fraction=0.0):
     """Cut every stroke into `bm` through one shared cut-graph, then realise
     the whole thing at once. Returns (edges, open_ends).
 
@@ -1666,7 +1739,8 @@ def cut_strokes(bm, strokes, snap_distance=0.0, project_tolerance=0.0,
     # `join_touching_strokes`. After the ends, because an end that reaches
     # its target properly should do so on its own terms rather than being
     # read as a blot.
-    strokes = join_touching_strokes(strokes, snap_distance)
+    strokes = join_touching_strokes(strokes, snap_distance,
+                                    merge_fraction)
     strokes = [(s[0], s[1]) for s in strokes]
     # Ends meeting *ends* is the same judgement at a corner: two marks within a
     # pen width of each other were one mark.
@@ -1896,6 +1970,13 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
                     "scale for it to mean anything",
         default=0.002, min=0.0, max=0.05,
         subtype='DISTANCE', unit='LENGTH', precision=4)
+    merge_fraction: bpy.props.FloatProperty(
+        name="Merge Overlapping",
+        description="Default for the bake. How much of one mark has to lie "
+                    "inside another's ink before the two are cut as a single "
+                    "thick line rather than as two lines meeting at a "
+                    "junction. Zero switches merging off",
+        default=0.5, min=0.0, max=1.0, subtype='FACTOR')
     unwrap_method: bpy.props.EnumProperty(
         name="Unwrap",
         items=[
@@ -1942,6 +2023,7 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
         settings = getattr(context.scene, "foam_craft", None)
         if settings is not None:
             self.snap_distance = settings.snap_distance
+            self.merge_fraction = settings.merge_fraction
         return self.execute(context)
 
     def execute(self, context):
@@ -2007,7 +2089,8 @@ class OBJECT_OT_foam_bake_pattern(bpy.types.Operator):
             # it is the same judgement, that two marks this close were one mark.
             edges, open_ends = cut_strokes(bm, strokes,
                                            snap_distance=self.snap_distance,
-                                           chain_tolerance=self.snap_distance)
+                                           chain_tolerance=self.snap_distance,
+                                           merge_fraction=self.merge_fraction)
             bm.to_mesh(mesh)
             mesh.update()
         except StrokeCutError as exc:
@@ -2116,6 +2199,7 @@ class IMAGE_PT_foam_pattern(bpy.types.Panel):
         if existing is not None:
             layout.label(text="Replaces %s" % existing.name, icon='OBJECT_DATA')
         layout.prop(settings, "snap_distance")
+        layout.prop(settings, "merge_fraction", slider=True)
 
 
 _classes = (

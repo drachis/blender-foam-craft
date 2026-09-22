@@ -159,6 +159,18 @@ class FoamPanelSettings(bpy.types.PropertyGroup):
         # the right grain for a thing cut by hand at metre scale -- finer
         # steps would be tuning below what the cutting can hold anyway.
         subtype='DISTANCE', unit='LENGTH', precision=4)
+    merge_fraction: bpy.props.FloatProperty(
+        name="Merge Overlapping",
+        description="When two marks run over each other, how much of one has "
+                    "to lie inside the other's ink before they are treated as "
+                    "a single thick line and cut down the middle. Two lines "
+                    "that overlap for their whole length are one line drawn "
+                    "twice; two that overlap only in patches are two lines "
+                    "that happen to touch, and those get a junction at each "
+                    "patch instead. Where between those the line falls is a "
+                    "matter of taste, which is why it is here. Zero switches "
+                    "merging off and leaves every overlap as a junction",
+        default=0.5, min=0.0, max=1.0, subtype='FACTOR')
 
     # --- Stock, for craftability checks
     sheet_width: bpy.props.FloatProperty(
