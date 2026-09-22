@@ -107,11 +107,28 @@ def next_number():
     return (max(used) + 1) if used else 1
 
 
+def tracked_paths():
+    """Every path git has under version control, as a set of top-level names.
+
+    Existence on disk is the wrong question. screenshots/ is gitignored, so it
+    is present in the working tree and absent from the index -- and `git rm`
+    on it fails the whole cut. What can be removed from a branch is what the
+    branch contains.
+    """
+    out = git("ls-files")
+    return {line.split("/")[0] for line in out.splitlines() if line}
+
+
 def dev_paths_present():
-    """DEV_PATHS that actually exist, plus whatever matches DEV_PATTERNS."""
-    present = [p for p in DEV_PATHS if os.path.exists(os.path.join(ROOT, p))]
+    """DEV_PATHS that git tracks, plus whatever matches DEV_PATTERNS.
+
+    Untracked dev clutter needs no action: it is not in the branch, so it
+    cannot reach anyone who clones or downloads it.
+    """
+    tracked = tracked_paths()
+    present = [p for p in DEV_PATHS if p in tracked]
     for name in sorted(os.listdir(ROOT)):
-        if any(p.match(name) for p in DEV_PATTERNS):
+        if name in tracked and any(p.match(name) for p in DEV_PATTERNS):
             present.append(name)
     return present
 
@@ -173,10 +190,15 @@ def main():
                          "branch afterwards.")
 
     stripping = dev_paths_present()
+    untracked_dev = [p for p in DEV_PATHS
+                     if p not in stripping
+                     and os.path.exists(os.path.join(ROOT, p))]
     print("release branch : %s" % branch)
     print("cut from       : %s (%s)" % (args.from_branch, git("rev-parse", "--short", "HEAD")))
     print("manifest version: 0.%d.0" % number)
     print("stripping      : %s" % ", ".join(stripping))
+    if untracked_dev:
+        print("already untracked (nothing to do): %s" % ", ".join(untracked_dev))
     if args.dry_run:
         print("\n--dry-run: nothing changed.")
         return 0
