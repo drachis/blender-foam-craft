@@ -54,18 +54,42 @@ import blender_bridge  # noqa: E402
 
 # Explicit rather than globbed: a file that fails to import should be a visible
 # failure, not a silently skipped test.
+#
+# The list is the weak point in that argument, and it has already failed once:
+# test_cut_accuracy, test_gp_junctions and test_parallel_waves existed for
+# weeks without ever being added here, so they never ran and the suite
+# reported green without them. A globbed list cannot forget a file; an
+# explicit one can, and did. Keeping it explicit for the stated reason means
+# accepting that adding a test file is a two-step job -- write it, then list
+# it -- so check this tuple whenever tests/ gains a file.
 TEST_FILES = (
     # First, because it is the one that says whether the rest can be believed.
     "tests/test_determinism.py",
     # Second, because everything else is built on this primitive.
     "tests/test_edgenet_cut.py",
     "tests/test_gp_pattern.py",
+    "tests/test_gp_junctions.py",
+    "tests/test_cut_accuracy.py",
+    "tests/test_parallel_waves.py",
     "tests/test_curvature_darts.py",
     "tests/test_bake_pattern.py",
     "tests/test_region_pattern.py",
     "tests/test_shape_sweep.py",
     "tests/test_overlay_gui.py",
 )
+
+
+def _unlisted_test_files():
+    """Test files on disk that TEST_FILES does not mention.
+
+    The gap above went unnoticed because nothing ever compared the list to the
+    directory. This does, and the runner prints the difference rather than
+    silently running a subset -- which keeps the explicit list honest without
+    giving up the visible-import-failure property that motivates it.
+    """
+    listed = {f.split("/")[-1] for f in TEST_FILES}
+    on_disk = {p.name for p in (ROOT / "tests").glob("test_*.py")}
+    return sorted(on_disk - listed)
 
 LAUNCHER = ROOT / "tools" / "launch_blender.py"
 
@@ -180,6 +204,17 @@ def main():
 
     print("\n%d test(s), %d failure(s) in %.0fs"
           % (total, failures, time.time() - started_at))
+
+    # Say so loudly rather than quietly running a subset. A suite that reports
+    # green while three of its files were never listed is worse than a red one.
+    unlisted = _unlisted_test_files()
+    if unlisted and not args.only:
+        print("\nWARNING: %d test file(s) on disk are not in TEST_FILES and "
+              "did not run:" % len(unlisted))
+        for name in unlisted:
+            print("    tests/%s" % name)
+        print("Add them to TEST_FILES in this file, or delete them.")
+
     return 1 if failures else 0
 
 

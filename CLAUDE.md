@@ -56,6 +56,14 @@ costs almost nothing and is the only way the person reviewing can check the
 thing you are claiming. Numbers say the seam closed; a picture says it
 closed where they drew it.
 
+But a capture only counts as evidence if it can resolve the difference being
+claimed. Two marks 4 mm apart on a 2 m plane, framed whole-object, come back
+as one line whether they merged or not -- the screenshot is real, and it
+shows nothing. Frame for the judgement, and when the picture cannot answer
+the question, say so plainly rather than presenting it as confirmation. The
+number is sometimes simply better: that merge was settled by the survivor
+measuring 0.0 mm from the midline, which no framing could have shown.
+
 **No code is one-off.** The same rule, stated the way it kept being broken:
 a "quick probe" written to answer one question during a debugging session is
 the same measurement the next session will need, so it goes in `tests/` at
@@ -256,8 +264,28 @@ Nudging UV coordinates from a script is not a transform. Until a human has
 dragged a UV by hand, an interactive fix is not verified — say so plainly
 rather than reporting it fixed.
 
-**Verify the verification.** Three separate checks reported the draw path
-wrongly in one session: `inspect.getsource` served stale lines from `linecache`
+**Verify the verification.** Two shapes of this, both live here.
+
+A check must ask the application the way the *user* reaches the thing. A probe
+that an operator had registered a new property read `cls.bl_rna.properties`,
+found nothing, and reported it unregistered -- but that lists the `Operator`
+**base** RNA and never an operator's own properties, so it reports every
+operator in Blender as having none. The property had been registered all
+along, and working code was one step from being "fixed". Read
+`cls.__annotations__` for what the class declares, and
+`bpy.ops.<category>.<name>.get_rna_type().properties` for what the redo panel
+will drive.
+
+And a patch that edits source can fail silently. A `\`-continuation does not
+survive a shell heredoc -- the shell joins the lines first -- so a script
+written to repair such a line produces replacement text identical to the text
+it is replacing. `str.replace` succeeds, the occurrence count asserts fine,
+the script prints the number of edits it meant to make, and the file is
+unchanged. Write patch scripts to a file, prefer a plain `if`/`else` to a
+wrapped ternary, and read the file back rather than trusting an edit count.
+
+The original three, from an earlier session: three separate checks reported
+the draw path wrongly in one session: `inspect.getsource` served stale lines from `linecache`
 after a file edit, and two string slices ran past the end of the function. A
 claim of "fixed" survived a crash twice because the measurement was as broken
 as the code. Extract real function bounds, prefer reading state back out of

@@ -276,6 +276,15 @@ not being tested. Each returned a confident, wrong answer.
 - When a result contradicts a previous measurement, suspect the measurement
   before the code. A 13% "failure" in outward normals turned out to be a
   centroid test that is simply invalid on concave shapes; the code was exact.
+- Ask the application the way the *user* reaches the thing. A check that an
+  operator had registered a new property read `cls.bl_rna.properties` and
+  reported it missing -- but that lists the `Operator` **base** RNA, never an
+  operator's own properties, so it would report every operator in Blender as
+  having none. The property was registered the whole time, and a "fix" to
+  working code was one step away. The reads that answer the question are
+  `cls.__annotations__` for what the class declares and
+  `bpy.ops.<category>.<name>.get_rna_type().properties` for what the redo
+  panel will actually drive.
 
 ---
 
@@ -292,9 +301,41 @@ For anything that draws, numbers are not enough — read the image back.
   that looks exactly like a real bug.
 - Pick a subject that can actually show the feature. A cube demonstrates
   nothing about relief cuts, because flat panels need none.
+- Frame for the *judgement being made*, and check the difference is bigger
+  than a pixel before claiming the picture as evidence. Two marks 4 mm apart
+  on a 2 m plane, captured whole-object, render as one line whether or not
+  they merged -- the capture succeeded and showed nothing. When the picture
+  cannot resolve the question, say so and lean on the number instead of
+  counting it as confirmation. Here the number was better anyway: the merged
+  line measured 0.0 mm from the midline, which no screenshot could establish.
 
 Sequence-number captures so they sort chronologically; alphabetical names jump
 around as topics change. Name them for *what changed*, never "final".
+
+---
+
+## 7b. Do not patch source through a shell heredoc
+
+A `\`-continuation does not survive one. The shell joins the two lines before
+Python ever sees them, so this:
+
+    t = 0.0 if denom < 1e-18 \
+        else max(0.0, min(1.0, ...))
+
+arrives as one 103-character line with the continuation gone. That is how two
+such lines came to be malformed in `foam_gp_pattern.py` in the first place.
+
+The failure has a second edge that is worse than the first. Fixing one of
+those lines *through another heredoc* mangles the replacement in exactly the
+same way, so the new text comes out byte-identical to the text being replaced
+-- and `str.replace` then succeeds, changes nothing, and reports success. The
+assertion counting occurrences passes, the script prints the edit count it
+expected, and the file is untouched. Nothing fails; the bug simply survives.
+
+So: write the patch script to a file and run it, or restructure the code so no
+continuation is needed (a plain `if`/`else` reads better than a wrapped
+ternary anyway). And verify the edit by reading the file back -- the edit
+count a patch script prints is not evidence that anything changed.
 
 ---
 
