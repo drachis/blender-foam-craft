@@ -110,16 +110,46 @@ edges returned for seam-flagging at a reused junction vertex, not the split
 itself. The split is provably stable: same verts, same faces, same regions,
 same region sizes, every run.
 
+## The edges are at the crossings (2026-09-22)
+
+Measured by `test_which_edges_the_theta_disagrees_about`, added to
+`tests/test_determinism.py`. It cuts the test's own theta `RUNS` times,
+records the midpoint of every edge `cut_strokes` returns, and takes the
+symmetric difference across runs. Midpoints rather than indices, because
+BMesh renumbers and an index is not a name.
+
+The theta's two crossings sit at phi = +/-0.28 on the equator. Three
+consecutive sessions:
+
+| run | counts per cut | stable | unstable | distance to nearer crossing |
+|---|---|---|---|---|
+| 1 | `[174, 176, 176, 174, 176]` | 169 | **10** | 0.0054 x2, 0.0073 x4, 0.0071 x2, then 0.208, 0.220 |
+| 2 | `[176, 176, 176, 176, 176]` | 175 | **2** | 0.078, 0.090 |
+| 3 | `[176, 176, 176, 176, 176]` | 175 | **2** | 0.078, 0.090 |
+
+**Eight of the ten wandering edges on the failing run sit within 7 mm of a
+crossing**, in symmetric pairs about both of them -- midpoints at
+`y = +/-0.2760, z = +/-0.0072` and `y = +/-0.2813, z = 0`. That is a cluster at
+the two points where the bar meets the circle, not a scatter. The junction
+diagnosis above is confirmed.
+
+**And the passing runs are not deterministic either.** Runs 2 and 3 returned
+176 edges on every cut, so `seam_edges` agreed and
+`test_theta_cuts_identically_every_time` went green -- while the edge *sets*
+still differed by two. The existing check compares counts, so it catches only
+the subset of the instability where the count happens to move. The defect is
+wider than its failure rate suggests, and the test **understates** the problem
+rather than overstating it. That is worth stating plainly, because the
+tempting reading of an intermittent test is that the test is at fault.
+
+Bounding the practical impact: `regions` is 3 and `sizes` is `[4564, 40, 40]`
+on every run recorded in this file, failing ones included. The island
+decomposition is stable, so the pieces a maker would cut appear unaffected by
+which of these edges comes back. That is an observation about the fields this
+test records, not a verification of the exported pattern.
+
 ## What is not known
 
-- **Which two edges.** Not identified. An attempt to isolate them by cutting a
-  theta 8 times and diffing the sets of marked-edge midpoints returned **0
-  unstable edges** — the probe used its own fixture (radius 0.35, a 48×24
-  sphere, `snap_distance` 0.002) rather than the test's (radius 0.28, and the
-  test's own sphere and snap), and did not reproduce the symptom. A probe
-  matching the test's fixture exactly is the obvious next measurement, and per
-  this project's rules it belongs in `tests/test_determinism.py` rather than
-  in a scratch file.
 - **Why the rate changed** from 6-of-6 at `f87affb` to 5-of-6 at `99d5fb0`. It
   may be noise across a small sample; it has not been measured enough times to
   say. No mechanism is proposed.
@@ -135,7 +165,13 @@ same region sizes, every run.
 
 ## Candidate next steps, none tried
 
-- Reproduce inside `tests/test_determinism.py` with the test's own fixture,
+- Compare `seam_edges` as a *set* rather than a count in
+  `test_theta_cuts_identically_every_time`, so the runs that currently
+  pass with two edges differing are caught too. More honest, and it would
+  fail far more often -- that is the trade-off.
+- Bake twice and diff the exported SVG, to settle whether any of this
+  reaches the pattern a maker actually cuts from.
+- (Done, 2026-09-22) Reproduce with the test's own fixture,
   recording midpoints of the marked edges per run and diffing them — cheap, and
   it names the two edges outright. Costs nothing but a measurement.
 - Instrument `_CutGraph` to log the order junction vertices are created and

@@ -453,8 +453,11 @@ what exists so far:
   random while the cut geometry itself is identical every run. Confirmed
   pre-existing (fails 6 of 6 at `f87affb`, before the merge_fraction work).
   The nearest-face lookup, each stroke alone, and a plain circle are all
-  ruled out by passing cases, which leaves junction handling. Root cause not
-  yet pinned; the two differing edges have not been identified.
+  ruled out by passing cases, which leaves junction handling -- now
+  confirmed: 8 of the 10 wandering edges on a failing run sit within 7 mm
+  of the theta's two crossings, in symmetric pairs. Note the check
+  understates the defect, comparing edge *counts* rather than sets: runs
+  that pass still differ by two edges. Mechanism still unknown.
 
 ## Good test shapes
 - **Torus, 12 major x 5 minor** — the craftability reference case: it needs

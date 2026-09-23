@@ -470,8 +470,82 @@ def test_face_numbering_does_not_change_the_cut():
     }
 
 
+
+def test_which_edges_the_theta_disagrees_about():
+    """Name the edges that come and go, instead of only counting them.
+
+    test_theta_cuts_identically_every_time says `seam_edges` is 174 or 176 and
+    stops there, which is enough to fail a build and not enough to fix
+    anything. A count cannot say whether the two extra edges are at the
+    crossings, at the stroke ends, or scattered -- and those are three
+    different bugs.
+
+    So: cut the same theta repeatedly, record the midpoint of every edge the
+    cutter returns, and take the symmetric difference across runs. Midpoints
+    rather than indices, because BMesh renumbers and an index is not a name
+    (CLAUDE.md, "Verify the fixture before chasing the code").
+
+    The theta crosses itself exactly twice, at the two points where the bar
+    meets the circle. Those sit at phi = +/- radius along the equator, and are
+    reported alongside so the comparison is arithmetic rather than by eye.
+
+    No expected value is asserted for *where* they are, because that is the
+    open question. What is asserted is the shape of the answer: the unstable
+    edges must be few, and they must be a strict subset of what a single run
+    returns -- if every edge were unstable the cut would not be reproducible
+    at all, and the diagnosis above would be wrong.
+    """
+    radius = 0.28
+    strokes = _theta(radius)
+
+    runs = []
+    for _ in range(RUNS):
+        _clear()
+        bm = _sphere_bmesh()
+        try:
+            edges, _open = gp.cut_strokes(bm, strokes, snap_distance=SNAP)
+            # Copy out floats immediately -- a BMEdge must not outlive the
+            # call that produced it.
+            runs.append({tuple(round(c, 5) for c in
+                               ((e.verts[0].co + e.verts[1].co) / 2.0))
+                         for e in edges})
+        finally:
+            bm.free()
+
+    common = set.intersection(*runs)
+    union = set.union(*runs)
+    unstable = sorted(union - common)
+
+    # Where the bar crosses the circle, by construction.
+    crossings = [_point(1.5708, -radius), _point(1.5708, radius)]
+
+    def _nearest_crossing(point):
+        v = Vector(point)
+        return round(min((v - c).length for c in crossings), 5)
+
+    return {
+        "counts_per_run": [len(r) for r in runs],
+        "stable_edges": len(common),
+        "unstable_edges": len(unstable),
+        "unstable_midpoints": unstable,
+        # How far each wandering edge sits from the nearer crossing. If the
+        # junction theory is right these are small; if they are large the
+        # theory is wrong and the write-up needs correcting.
+        "distance_to_nearest_crossing":
+            [_nearest_crossing(p) for p in unstable],
+        "crossings": [[round(c, 5) for c in pt] for pt in crossings],
+        "checks": {
+            # The cut is mostly reproducible, or nothing above means anything.
+            "most_edges_are_stable": len(common) > 0.9 * len(union),
+            # Both bounds: a run that returned nothing would satisfy the above.
+            "the_cut_happened": len(common) > 0,
+        },
+    }
+
+
 TESTS = (
     test_theta_cuts_identically_every_time,
+    test_which_edges_the_theta_disagrees_about,
     test_circle_cuts_identically_every_time,
     test_each_theta_stroke_alone_is_stable,
     test_points_on_an_edge_land_on_the_same_face_every_time,
