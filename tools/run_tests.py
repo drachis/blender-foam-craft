@@ -79,6 +79,9 @@ TEST_FILES = (
     "tests/test_region_pattern.py",
     "tests/test_shape_sweep.py",
     "tests/test_export_svg.py",
+    # Pure arithmetic, no scene -- it also runs standalone with
+    #     python tests/test_tile_svg.py
+    "tests/test_tile_svg.py",
     "tests/test_overlay_gui.py",
 )
 
