@@ -487,9 +487,10 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
             outlines.append(f'<polygon points="{pts_str}"/>')
 
         # --- fill: one colour per piece, behind everything else.
-        rings = [[(p.x, p.y) for p in
-                  (isl.to_sheet(l[uv_layer].uv) for l in cyc)]
-                 for cyc in sorted(isl.cycles, key=len, reverse=True)]
+        rings = core.order_rings_outer_first(
+            [[(p.x, p.y) for p in
+              (isl.to_sheet(l[uv_layer].uv) for l in cyc)]
+             for cyc in isl.cycles])
         if settings.island_fill and rings:
             # One path with every cycle as a subpath and fill-rule evenodd, so
             # a piece with a hole in it reads as a hole rather than a disc.
@@ -513,9 +514,15 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
             # in the piece's widest part so the digits have room.
             (px, py), room = core.pole_of_inaccessibility(rings)
             if px is not None:
-                # Shrink a number that will not fit rather than letting it
-                # spill over the cut lines of a small piece.
-                size = min(number_font_mm, max(room * 1.2, 0.1))
+                # Shrink a number that will not fit rather than letting
+                # it spill over the cut lines of a small piece -- but never
+                # below something a person can read. The floor used to be
+                # 0.1 mm, which is not a smaller label, it is an invisible
+                # one; three pieces on a test sphere printed their number at
+                # that size and looked simply absent.
+                room_mm = max(room, 0.0)
+                size = min(number_font_mm, max(room_mm * 1.2,
+                                               number_font_mm * 0.25))
                 numbers.append(
                     f'<text x="{_fmt(px)}" y="{_fmt(py)}" '
                     f'font-size="{_fmt(size)}">{isl.piece_id}</text>')

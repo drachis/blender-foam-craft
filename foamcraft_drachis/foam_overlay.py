@@ -211,8 +211,9 @@ def _island_uv_centroid(faces, uv_layer):
     different place on each is the most confusing kind of disagreement.
     """
     cycles = core.island_boundary_cycles(faces, uv_layer)
-    rings = [[(l[uv_layer].uv.x, l[uv_layer].uv.y) for l in cyc]
-             for cyc in sorted(cycles, key=len, reverse=True)]
+    rings = core.order_rings_outer_first(
+        [[(l[uv_layer].uv.x, l[uv_layer].uv.y) for l in cyc]
+         for cyc in cycles])
     if rings:
         (px, py), _room = core.pole_of_inaccessibility(rings)
         if px is not None:

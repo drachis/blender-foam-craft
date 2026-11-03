@@ -151,10 +151,48 @@ def _distance_to_rings(x, y, rings):
     return best if _point_in_rings(x, y, rings) else -best
 
 
+def ring_area(ring):
+    """Twice the signed area of a closed polygon. Sign follows winding."""
+    total = 0.0
+    n = len(ring)
+    for i in range(n):
+        ax, ay = ring[i]
+        bx, by = ring[(i + 1) % n]
+        total += ax * by - bx * ay
+    return total
+
+
+def order_rings_outer_first(rings):
+    """Put the enclosing boundary first and the holes after it.
+
+    `pole_of_inaccessibility` takes [outer, hole, hole, ...] and treats
+    everything after the first entry as a hole, so getting this order wrong
+    does not merely degrade the answer -- it inverts the shape. The small
+    circle becomes the outline, the big one becomes a hole punched through
+    it, the region is empty, and every distance comes back negative.
+
+    Ordering by vertex count is the obvious wrong answer, and it was the one
+    used here first. A UV ring unwrapped from a sphere band has exactly as
+    many vertices on its inner boundary as its outer, so the comparison is a
+    tie and the order falls through to however the cycles happened to be
+    built -- which put the hole first for three of eight islands on a test
+    sphere. Those three printed their piece number at a font size of 0.1 mm,
+    because the "room" the label was given was the radius of a region that
+    did not exist.
+
+    Area cannot tie that way: the enclosing ring is larger than anything it
+    contains, by definition.
+    """
+    return sorted(rings, key=lambda r: abs(ring_area(r)), reverse=True)
+
+
 def pole_of_inaccessibility(rings, precision_ratio=0.01):
     """The point inside `rings` furthest from any edge, and that distance.
 
-    `rings` is [outer, hole, hole, ...], each a list of (x, y).
+    `rings` is [outer, hole, hole, ...], each a list of (x, y), and the
+    order matters -- everything after the first entry is treated as a hole.
+    Use `order_rings_outer_first` to build it; sorting by vertex count ties
+    on an annulus and silently inverts the shape.
 
     Why this rather than a centroid: the centroid of a crescent, a C or a
     ring lies outside the shape, so a piece number placed there sits on the

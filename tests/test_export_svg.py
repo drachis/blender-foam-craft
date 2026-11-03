@@ -426,6 +426,19 @@ def test_every_piece_number_lands_inside_its_piece():
     asking whether that point is inside the island it belongs to, using the
     same ray-casting test the placement relies on. Both bounds: every number
     inside, and one number per island so none was dropped to make that true.
+
+    And its *size* is checked, which this case originally did not. A label is
+    shrunk to fit the room its piece has, and the floor on that was 0.1 mm --
+    not a smaller label, an invisible one. Three islands on a panelled sphere
+    printed at exactly that, because their boundary cycles had been ordered
+    by vertex count: an annulus unwrapped from a sphere band has as many
+    vertices inside as out, the comparison tied, and the hole was taken for
+    the outline. The region was then empty, every distance negative, and the
+    "room" zero.
+
+    The original checks all passed through that, which is the more useful
+    lesson. "Inside some island" was asked where "inside its own island" was
+    meant, and nothing asked whether the number could actually be seen.
     """
     obj = _seamed_cube()
     bm = _bmesh_of(obj)
@@ -446,24 +459,40 @@ def test_every_piece_number_lands_inside_its_piece():
                  for cyc in sorted(isl.cycles, key=len, reverse=True)])
 
         group = re.search(r'<g id="numbers".*?</g>', svg, re.S)
-        placed = [(float(x), float(y)) for x, y in re.findall(
-            r'<text x="([-\d.]+)" y="([-\d.]+)"',
-            group.group(0) if group else "")]
+        placed = re.findall(
+            r'<text x="([-\d.]+)" y="([-\d.]+)" font-size="([\d.]+)">'
+            r'([^<]*)</text>',
+            group.group(0) if group else "")
 
-        hits = 0
-        for px, py in placed:
-            if any(core._point_in_rings(px, py, rings)
-                   for rings in rings_per_island):
-                hits += 1
+        # Island index by piece id, so each number is tested against its OWN
+        # piece rather than against any of them.
+        by_piece = {str(isl.piece_id): rings_per_island[i]
+                    for i, isl in enumerate(islands)}
 
+        own_piece, sizes = 0, []
+        for x, y, size, label in placed:
+            px, py, size = float(x), float(y), float(size)
+            sizes.append(size)
+            rings = by_piece.get(label)
+            if rings and core._point_in_rings(px, py, rings):
+                own_piece += 1
+
+        readable = [s for s in sizes if s >= 1.0]
         return {
             "islands": len(islands),
             "numbers_placed": len(placed),
-            "numbers_inside_a_piece": hits,
+            "numbers_inside_their_own_piece": own_piece,
+            "font_sizes_mm": [round(s, 2) for s in sorted(sizes)],
+            "smallest_font_mm": round(min(sizes), 3) if sizes else None,
             "checks": {
                 "one_number_per_island": len(placed) == len(islands),
-                "every_number_is_inside_its_piece": hits == len(placed),
-                # Both bounds: zero numbers would satisfy "all inside".
+                # Its own piece, not merely some piece.
+                "every_number_is_inside_its_own_piece":
+                    own_piece == len(placed),
+                # And large enough to see. A millimetre is generous as a
+                # floor and still catches a collapse to nothing.
+                "every_number_is_legible": len(readable) == len(sizes),
+                # Both bounds: zero numbers would satisfy everything above.
                 "numbers_were_actually_placed": len(placed) > 0,
             },
         }
@@ -789,6 +818,52 @@ def test_relief_cuts_are_off_by_default():
     }
 
 
+
+def test_an_annulus_is_not_mistaken_for_its_own_hole():
+    """A ring's outline is the big circle, whatever the vertex counts say.
+
+    pole_of_inaccessibility takes [outer, hole, ...] and treats everything
+    after the first entry as a hole, so the order is not a detail -- getting
+    it wrong inverts the shape. Ordering by vertex count ties on a ring
+    unwrapped from a sphere band, which has as many vertices inside as out.
+
+    Asserted against arithmetic. A ring of outer radius 10 and inner radius 4
+    has its widest point in the band, 3 from either boundary, at radius 7
+    from the centre. Order the rings the wrong way round and the answer is
+    not merely worse, it is negative: there is no region at all.
+    """
+    import math as _m
+    outer = [(10.0 * _m.cos(2 * _m.pi * i / 24.0),
+              10.0 * _m.sin(2 * _m.pi * i / 24.0)) for i in range(24)]
+    inner = [(4.0 * _m.cos(2 * _m.pi * i / 24.0),
+              4.0 * _m.sin(2 * _m.pi * i / 24.0)) for i in range(24)]
+
+    ordered = core.order_rings_outer_first([inner, outer])
+    (px, py), room = core.pole_of_inaccessibility(ordered)
+    radius = (px * px + py * py) ** 0.5
+
+    # What the old vertex-count ordering produced, kept so the failure is
+    # visible rather than merely described.
+    (_bx, _by), bad_room = core.pole_of_inaccessibility([inner, outer])
+
+    return {
+        "outer_first": ordered[0] is outer,
+        "pole_radius_from_centre": round(radius, 2),
+        "room": round(room, 2),
+        "room_if_ordered_wrongly": round(bad_room, 2),
+        "checks": {
+            "the_bigger_ring_is_taken_as_the_outline": ordered[0] is outer,
+            # Midway through the band: (10 + 4) / 2 = 7, give or take the
+            # polygon's own flattening.
+            "pole_sits_in_the_band": 6.5 <= radius <= 7.5,
+            # Half the band width, 3, less the flattening.
+            "room_is_about_half_the_band_width": 2.5 <= room <= 3.1,
+            # And the wrong order really is catastrophic, not just worse.
+            "wrong_order_finds_no_region": bad_room < 0.0,
+        },
+    }
+
+
 TESTS = (
     test_the_cube_fixture_is_what_we_think,
     test_the_sheet_reproduces_the_uv_layout,
@@ -797,6 +872,7 @@ TESTS = (
     test_the_labels_are_large_enough_to_read_on_the_sheet,
     test_every_piece_number_lands_inside_its_piece,
     test_a_crescent_piece_gets_its_number_inside,
+    test_an_annulus_is_not_mistaken_for_its_own_hole,
     test_island_fill_colours_are_distinct_and_toggleable,
     test_the_scale_ruler_is_in_real_millimetres,
     test_alignment_ticks_are_paired_across_every_seam,
