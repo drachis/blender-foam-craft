@@ -556,9 +556,129 @@ def test_which_edges_the_theta_disagrees_about():
     }
 
 
+
+# --- 5. The same mesh with its edges pointing the other way -------------
+
+def _reversed_edge_copy(bm):
+    """A vertex-for-vertex copy of `bm` with every edge created the other way.
+
+    bmesh offers no way to reverse an existing edge, but `bm.edges.new` keeps
+    the pair in the order given, so the copy is built edge by edge from the
+    reversed pairs. Vertex coordinates, vertex order, face order and face
+    winding all carry over unchanged; the only difference between the two
+    meshes is which end of each edge is `verts[0]`.
+
+    That is supposed to be invisible. Blender promises nothing about edge
+    orientation, and CLAUDE.md already records being caught reading it once
+    before, in the hand-rolled convex/concave sign test that disagreed with
+    Blender on half of a torus.
+    """
+    out = bmesh.new()
+    vmap = {}
+    for v in bm.verts:
+        nv = out.verts.new(v.co)
+        vmap[v.index] = nv
+    out.verts.ensure_lookup_table()
+    out.verts.index_update()
+
+    for e in bm.edges:
+        a, b = e.verts[1].index, e.verts[0].index      # the whole point
+        try:
+            out.edges.new((vmap[a], vmap[b]))
+        except ValueError:
+            pass                                        # already there
+    out.edges.ensure_lookup_table()
+
+    for f in bm.faces:
+        try:
+            nf = out.faces.new([vmap[v.index] for v in f.verts])
+            nf.normal_update()
+        except ValueError:
+            pass
+    out.faces.ensure_lookup_table()
+    out.faces.index_update()
+    out.edges.index_update()
+    return out
+
+
+def test_edge_vertex_order_does_not_change_the_cut():
+    """The same mesh with its edges pointing the other way must cut the same.
+
+    This is the root cause of test_theta_cuts_identically_every_time's
+    intermittent failure, isolated. Measured 2026-11-03: rebuilding the test's
+    own sphere three times gives identical vertex coordinates and an identical
+    set of edges, while 670 to 678 of its 9120 edges come back with verts[0]
+    and verts[1] swapped. primitive_uv_sphere_add finishes with a weld, and a
+    weld does not order its output.
+
+    A cut factor measured from verts[0] then arrives as 1 - f on those edges,
+    and the position interpolated back from it differs in the last couple of
+    bits, because a + t*(b - a) and b + (1 - t)*(a - b) are not bit-identical.
+    That is enough to tip a `<= weld` distance comparison where two cut points
+    nearly coincide, which is why the edges that come and go sit within 7 mm
+    of the theta's two crossings and why the count moves by exactly two.
+
+    Edge orientation is arbitrary -- Blender makes no promise about it, and
+    CLAUDE.md already records being bitten by reading it once before. So the
+    cut must not depend on it, and that is what this asserts.
+    """
+    rows = {}
+    _clear()
+    built = _sphere_bmesh()
+    reversed_copy = _reversed_edge_copy(built)
+
+    # How much actually differs between the two, so a copy that silently
+    # failed to reverse anything cannot pass this test by being identical.
+    flipped = 0
+    pairs = {frozenset((e.verts[0].index, e.verts[1].index)):
+             (e.verts[0].index, e.verts[1].index) for e in built.edges}
+    for e in reversed_copy.edges:
+        key = frozenset((e.verts[0].index, e.verts[1].index))
+        if key in pairs and pairs[key] != (e.verts[0].index, e.verts[1].index):
+            flipped += 1
+
+    for label, bm in (("as_built", built), ("edges_reversed", reversed_copy)):
+        try:
+            edges, open_ends = gp.cut_strokes(bm, _theta(0.28),
+                                              snap_distance=SNAP)
+            for e in edges:
+                e.seam = True
+            sizes = _regions(bm)
+            rows[label] = {
+                "regions": len(sizes),
+                "sizes": sizes[:6],
+                "seam_edges": len(edges),
+                "open_ends": open_ends,
+                "verts": len(bm.verts),
+                "faces": len(bm.faces),
+            }
+        except Exception:
+            raise
+
+    for bm in (built, reversed_copy):
+        bm.free()
+
+    a, b = rows["as_built"], rows["edges_reversed"]
+    differing = sorted(k for k in a if a[k] != b[k])
+    out = dict(rows)
+    out["edges_actually_reversed"] = flipped
+    out["fields_that_differ"] = differing
+    out["checks"] = {
+        "the_cut_is_identical": not differing,
+        # Both bounds. A cut that produced nothing would have no fields to
+        # differ and would pass the above while meaning nothing; and a copy
+        # that reversed no edges would compare a mesh with itself.
+        "the_cut_happened": a["seam_edges"] > 0,
+        "the_theta_closed_its_regions": a["regions"] >= 3,
+        "the_copy_really_is_reversed": flipped > 1000,
+    }
+    return out
+
+
 TESTS = (
     test_theta_cuts_identically_every_time,
     test_which_edges_the_theta_disagrees_about,
+    test_edge_vertex_order_does_not_change_the_cut,
     test_circle_cuts_identically_every_time,
     test_each_theta_stroke_alone_is_stable,
     test_points_on_an_edge_land_on_the_same_face_every_time,

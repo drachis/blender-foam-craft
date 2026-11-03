@@ -148,6 +148,93 @@ decomposition is stable, so the pieces a maker would cut appear unaffected by
 which of these edges comes back. That is an observation about the fields this
 test records, not a verification of the exported pattern.
 
+## Root cause: the cut depends on BMEdge vertex order (2026-11-03)
+
+**A cut factor is measured from `edge.verts[0]`, and which vertex that is does
+not survive rebuilding the mesh.**
+
+Confirmed in two steps, neither of them a reading.
+
+### 1. The decision that diverges
+
+`_CutGraph.add` was wrapped to record every decision it makes -- reuse an
+existing graph vertex or create one -- and four identical cuts were run in one
+process, using the test's own sphere with its face sort already applied. The
+traces are 232 steps long and agree until step 65:
+
+    run 0:  EDGE  index 64  new  y = 0.243392825  fac = 0.790894392
+    run 1:  EDGE  index 64  new  y = 0.243392795  fac = 0.209105887
+
+`0.790894392 + 0.209105887 = 1.000000279`. It is the same point on the same
+edge, measured from opposite ends.
+
+### 2. Why the ends swap
+
+The test fixture already sorts *faces* by their vertex indices, because
+`primitive_uv_sphere_add` renumbers faces on every call. Nothing normalises
+*edges*. Building that sphere three times and comparing:
+
+| | |
+|---|---|
+| edges | 9120, 9120, 9120 |
+| vertex coordinates identical | yes |
+| same set of edges (same vertex pairs) | yes |
+| **edges whose `verts[0]`/`verts[1]` are swapped** | **670, then 678** |
+
+About 7% of edges come back pointing the other way. The primitive finishes
+with a `remove_doubles` weld (`bmo_create_uvsphere_exec`), and a weld does not
+order its output -- the same reason the face table moves, already recorded in
+CLAUDE.md.
+
+### 3. How that reaches the seam count
+
+A factor arriving as `1 - f` instead of `f` is not merely a relabelling,
+because the position is interpolated back from it, and
+
+    a + t * (b - a)        and        b + (1 - t) * (a - b)
+
+are not bit-identical in floating point. The two runs above differ in `y` at
+the eighth decimal. `_CutGraph.add` decides reuse with
+`(existing.loc - hit.loc).length <= weld`, so where two cut points very nearly
+coincide, that last-bit difference decides whether they are welded into one
+graph vertex or kept apart -- which changes how many edges the realised cut
+contains.
+
+That is why the edges that come and go sit within 7 mm of the theta's two
+crossings, and why the count moves by exactly two: two crossings, one marginal
+weld each.
+
+### 4. Reproduced deterministically
+
+`test_edge_vertex_order_does_not_change_the_cut` in `tests/test_determinism.py`
+copies the sphere vertex-for-vertex with every edge created the other way
+round -- `bm.edges.new` keeps the order it is given -- and cuts the same theta
+into both. Vertex coordinates, vertex order, face order and winding all carry
+over; the only difference is edge orientation. Measured:
+
+| | as built | edges reversed |
+|---|---|---|
+| **seam_edges** | **176** | **174** |
+| regions, sizes | 3, [4564, 40, 40] | 3, [4564, 40, 40] |
+| verts, faces | 4702, 4644 | 4702, 4644 |
+| open ends | 0 | 0 |
+
+The same 174/176 pair the intermittent test produces, with nothing left to
+chance. All 9120 edges were verified reversed, so the comparison is not a mesh
+against itself.
+
+This also explains why the failure looked intermittent rather than constant:
+the orientation of any given edge is decided afresh by each rebuild, so
+whether the two marginal welds fall the same way in all five of a run's cuts
+is a coin toss.
+
+### What this is not
+
+Not the nearest-face tie, which `test_points_on_an_edge_land_on_the_same_face_
+every_time` rules out and which stays stable. Not face renumbering, which the
+fixture's face sort already handles. And not the merge_fraction work, which
+post-dates it -- the defect reproduces at `f87affb`.
+
 ## What is not known
 
 - **Why the rate changed** from 6-of-6 at `f87affb` to 5-of-6 at `99d5fb0`. It

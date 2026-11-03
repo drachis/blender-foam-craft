@@ -415,6 +415,17 @@ Measured directly in a running session, not inferred from docs.
 - `mathutils.bvhtree.BVHTree.FromObject(obj, depsgraph).find_nearest(pt)` works
   for closest-point reprojection. Note it must break ties arbitrarily for a point
   landing on an edge, where two faces are exactly as near.
+- **BMEdge vertex order is not stable across rebuilds of the same mesh.**
+  Building the same UV sphere three times gives identical vertex coordinates
+  and an identical set of edges, with **670 to 678 of 9120 edges** having
+  `verts[0]` and `verts[1]` swapped -- the `remove_doubles` weld that ends the
+  primitive does not order its output, the same reason the face table moves.
+  So `verts[0]` is not a landmark: anything measured from it (a factor along
+  the edge, a direction, a sign) is measuring from an arbitrary end, and two
+  geometrically identical meshes will disagree. This is the second time this
+  project has been caught reading edge orientation -- the first was the
+  hand-rolled convex/concave sign test, which `calc_face_angle_signed`
+  replaced.
 - `mesh.attributes.new(name, type='INT', domain='FACE')` works for per-face
   integer piece IDs.
 - Blender Labs MCP add-on socket protocol (port 9876): newline is not the
@@ -450,14 +461,15 @@ what exists so far:
   still open.
 - [RESEARCH_theta_seam_edge_nondeterminism.md](RESEARCH_theta_seam_edge_nondeterminism.md)
   -- why `test_determinism.py`'s theta case marks 174 or 176 seam edges at
-  random while the cut geometry itself is identical every run. Confirmed
-  pre-existing (fails 6 of 6 at `f87affb`, before the merge_fraction work).
-  The nearest-face lookup, each stroke alone, and a plain circle are all
-  ruled out by passing cases, which leaves junction handling -- now
-  confirmed: 8 of the 10 wandering edges on a failing run sit within 7 mm
-  of the theta's two crossings, in symmetric pairs. Note the check
-  understates the defect, comparing edge *counts* rather than sets: runs
-  that pass still differ by two edges. Mechanism still unknown.
+  random. **Root cause found (2026-11-03): the cut depends on BMEdge vertex
+  order, which a rebuild does not preserve.** A cut factor is measured from
+  `edge.verts[0]`; rebuilding the same sphere flips `verts[0]`/`verts[1]` on
+  about 670 of its 9120 edges, so the factor arrives as `1 - f` and the
+  position interpolated back from it differs in the last bits -- enough to
+  tip a `<= weld` comparison where two cut points nearly coincide, at the
+  theta's two crossings. Reproduced deterministically (176 vs 174) by
+  `test_edge_vertex_order_does_not_change_the_cut`, which cuts the same mesh
+  twice with every edge reversed. Not yet fixed; see the doc for the options.
 
 ## Good test shapes
 - **Torus, 12 major x 5 minor** — the craftability reference case: it needs
