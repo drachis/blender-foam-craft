@@ -99,6 +99,151 @@ def find_paper_model_module():
     )
 
 
+
+# --- Where to put a label so it lands on the piece -----------------------
+
+def _point_in_rings(x, y, rings):
+    """True when (x, y) is inside the outer ring and outside every hole.
+
+    Ray casting, counting crossings of a ray going in +x. Works on any
+    simple polygon, convex or not, which is the point -- a cut foam panel is
+    routinely a crescent or a C.
+    """
+    inside = False
+    for ring_index, ring in enumerate(rings):
+        crossings = 0
+        n = len(ring)
+        for i in range(n):
+            ax, ay = ring[i]
+            bx, by = ring[(i + 1) % n]
+            if (ay > y) != (by > y):
+                t = (y - ay) / (by - ay)
+                if x < ax + t * (bx - ax):
+                    crossings += 1
+        if crossings % 2:
+            if ring_index == 0:
+                inside = True
+            else:
+                return False          # in a hole
+        elif ring_index == 0:
+            return False              # outside the outer ring
+    return inside
+
+
+def _distance_to_rings(x, y, rings):
+    """Distance from (x, y) to the nearest edge, signed: + inside, - outside."""
+    best = float("inf")
+    for ring in rings:
+        n = len(ring)
+        for i in range(n):
+            ax, ay = ring[i]
+            bx, by = ring[(i + 1) % n]
+            dx, dy = bx - ax, by - ay
+            denom = dx * dx + dy * dy
+            if denom < 1e-18:
+                t = 0.0
+            else:
+                t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / denom))
+            px, py = ax + t * dx, ay + t * dy
+            d = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+            if d < best:
+                best = d
+    return best if _point_in_rings(x, y, rings) else -best
+
+
+def pole_of_inaccessibility(rings, precision_ratio=0.01):
+    """The point inside `rings` furthest from any edge, and that distance.
+
+    `rings` is [outer, hole, hole, ...], each a list of (x, y).
+
+    Why this rather than a centroid: the centroid of a crescent, a C or a
+    ring lies outside the shape, so a piece number placed there sits on the
+    sheet next to the piece instead of on it. That is invisible once the
+    pattern is used as a texture on the model, which is the whole reason the
+    number is printed. This point is guaranteed inside, and it is the middle
+    of the piece's widest part, so the number has room around it.
+
+    Mapbox's polylabel algorithm: quarter the bounding box repeatedly, always
+    expanding the cell that could still contain a better answer, where a
+    cell's optimistic bound is its centre distance plus its half-diagonal.
+    Returns ((x, y), radius). Radius is useful on its own -- it is how much
+    room the label has, so a caller can shrink text that will not fit.
+    """
+    import heapq
+
+    if not rings or len(rings[0]) < 3:
+        return None, 0.0
+    outer = rings[0]
+    min_x = min(p[0] for p in outer)
+    max_x = max(p[0] for p in outer)
+    min_y = min(p[1] for p in outer)
+    max_y = max(p[1] for p in outer)
+    width, height = max_x - min_x, max_y - min_y
+    if width <= 0 or height <= 0:
+        return (min_x, min_y), 0.0
+
+    cell = min(width, height) / 2.0
+    if cell <= 0:
+        return (min_x, min_y), 0.0
+    precision = min(width, height) * precision_ratio
+
+    def _cell(cx, cy, h):
+        d = _distance_to_rings(cx, cy, rings)
+        # Optimistic bound: nothing in this cell can beat its centre distance
+        # plus the distance to its furthest corner.
+        return (-(d + h * 1.41421356), cx, cy, h, d)
+
+    queue = []
+    x = min_x
+    while x < max_x:
+        y = min_y
+        while y < max_y:
+            heapq.heappush(queue, _cell(x + cell, y + cell, cell))
+            y += cell * 2
+        x += cell * 2
+
+    # Seed with the bounding-box centre so a shape whose grid misses entirely
+    # still has an answer to improve on.
+    best = _cell(min_x + width / 2.0, min_y + height / 2.0, 0.0)
+    best_point, best_d = (best[1], best[2]), best[4]
+
+    guard = 0
+    while queue and guard < 100000:
+        guard += 1
+        _bound, cx, cy, h, d = heapq.heappop(queue)
+        if d > best_d:
+            best_point, best_d = (cx, cy), d
+        if -_bound - best_d <= precision:
+            continue
+        h2 = h / 2.0
+        for ox, oy in ((-h2, -h2), (h2, -h2), (-h2, h2), (h2, h2)):
+            heapq.heappush(queue, _cell(cx + ox, cy + oy, h2))
+
+    return best_point, best_d
+
+
+def island_palette_color(index, total):
+    """A distinct fill colour per island, as (r, g, b) floats in 0..1.
+
+    Spread around the hue circle the way a UV checker map is, so neighbouring
+    pieces are told apart at a glance on the model. Kept pale -- these sit
+    behind black outlines and printed numbers, and a saturated fill makes both
+    harder to read.
+
+    Deterministic in the index, so the same pattern gets the same colours
+    every export and a piece can be matched between two printings.
+    """
+    import colorsys
+    if total <= 0:
+        total = 1
+    # The golden-ratio step keeps consecutive indices far apart in hue even
+    # when `total` is small, which a plain index/total division does not.
+    hue = (index * 0.61803398875) % 1.0
+    # Alternate lightness a little so two pieces landing on a similar hue are
+    # still distinguishable.
+    light = 0.80 if index % 2 == 0 else 0.88
+    return colorsys.hls_to_rgb(hue, light, 0.55)
+
 # --- Foam bevel geometry -------------------------------------------------
 
 FOAM_GRADES = (

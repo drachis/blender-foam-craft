@@ -196,6 +196,19 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
     show_overlay: bpy.props.BoolProperty(name="Show Overlay", default=True)
     show_brackets: bpy.props.BoolProperty(name="Cut Runs", default=True)
     show_island_ids: bpy.props.BoolProperty(name="Piece Numbers", default=True)
+    island_fill: bpy.props.BoolProperty(
+        name="Colour Pieces", default=True,
+        description="Fill each piece with its own colour, the way a UV "
+                    "checker map does, so a piece can be matched between the "
+                    "flat pattern and the model when the sheet is applied as "
+                    "a texture. Turn it off to print: a home printer on plain "
+                    "paper wants outlines and numbers, not full-bleed colour")
+    show_scale_ruler: bpy.props.BoolProperty(
+        name="Scale Ruler", default=True,
+        description="Print a ruler and a one-inch square in a strip below the "
+                    "pattern. Measure it on the paper before cutting: if it "
+                    "is not exactly right the print was scaled, and every "
+                    "piece on the sheet is the wrong size")
     show_heat_form: bpy.props.BoolProperty(name="Heat-form Warnings", default=True)
     show_dart_colors: bpy.props.BoolProperty(name="Convex/Concave Colour", default=True)
     only_selected: bpy.props.BoolProperty(

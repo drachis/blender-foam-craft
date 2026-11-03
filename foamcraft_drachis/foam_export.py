@@ -33,6 +33,16 @@ from . import foam_angle_core as core
 DART_SLIT_WIDTH_MM = 0.6
 MARGIN_MM = 10.0
 
+# The scale strip. Every number here is an absolute millimetre and must stay
+# that way: the ruler's whole job is to be measurable against a real ruler
+# held to the paper, so it is the one thing on the sheet that must NOT scale
+# with the pattern.
+RULER_STRIP_MM = 34.0
+RULER_LENGTH_MM = 100.0
+RULER_TICK_MM = 4.0
+RULER_FONT_MM = 4.0
+INCH_MM = 25.4
+
 # Annotation sizes are *not* physical. They are parts per thousand of the UV
 # sheet, exactly as the overlay draws them (foam_overlay.py:480-482 computes
 # `permille / 1000 * px_per_uv * overlay_scale`; here the same expression runs
@@ -219,6 +229,60 @@ def _boundary_angle_deg(run_a, run_b):
     return None
 
 
+def _rgb_to_hex(r, g, b):
+    return "#%02x%02x%02x" % (int(max(0.0, min(1.0, r)) * 255),
+                              int(max(0.0, min(1.0, g)) * 255),
+                              int(max(0.0, min(1.0, b)) * 255))
+
+
+def _scale_strip(sheet_width, top_y):
+    """A ruler and a one-inch square, in absolute millimetres.
+
+    Printers scale. "Fit to page" silently shrinks a sheet by a few percent,
+    and a pattern that is 3% small produces panels that do not meet -- which
+    is only discovered after the foam is cut. Measuring a printed ruler is the
+    cheapest check there is, so one goes on every sheet.
+
+    Both units, because the stock and the tools rarely agree: foam sheet is
+    sold in metric here and blade settings are often imperial.
+    """
+    out = []
+    x0 = MARGIN_MM
+    y = top_y + RULER_STRIP_MM * 0.45
+
+    # 100 mm bar with a tick every 10 mm, taller every 50.
+    out.append(f'<line x1="{_fmt(x0)}" y1="{_fmt(y)}" '
+               f'x2="{_fmt(x0 + RULER_LENGTH_MM)}" y2="{_fmt(y)}"/>')
+    step = 10.0
+    n = int(RULER_LENGTH_MM / step)
+    for i in range(n + 1):
+        tx = x0 + i * step
+        tall = RULER_TICK_MM * (1.6 if i % 5 == 0 else 1.0)
+        out.append(f'<line x1="{_fmt(tx)}" y1="{_fmt(y)}" '
+                   f'x2="{_fmt(tx)}" y2="{_fmt(y - tall)}"/>')
+    out.append(f'<text x="{_fmt(x0)}" y="{_fmt(y + RULER_FONT_MM * 1.6)}" '
+               f'font-size="{_fmt(RULER_FONT_MM)}">0</text>')
+    out.append(f'<text x="{_fmt(x0 + RULER_LENGTH_MM)}" '
+               f'y="{_fmt(y + RULER_FONT_MM * 1.6)}" '
+               f'font-size="{_fmt(RULER_FONT_MM)}">100 mm</text>')
+
+    # A one-inch square, which is far easier to check by eye than a bar.
+    sq_x = x0 + RULER_LENGTH_MM + 18.0
+    sq_y = y - INCH_MM
+    out.append(f'<rect x="{_fmt(sq_x)}" y="{_fmt(sq_y)}" '
+               f'width="{_fmt(INCH_MM)}" height="{_fmt(INCH_MM)}" '
+               f'fill="none"/>')
+    out.append(f'<text x="{_fmt(sq_x + INCH_MM / 2)}" '
+               f'y="{_fmt(y + RULER_FONT_MM * 1.6)}" '
+               f'font-size="{_fmt(RULER_FONT_MM)}">1 inch</text>')
+
+    out.append(f'<text x="{_fmt(sq_x + INCH_MM + 14.0)}" y="{_fmt(y)}" '
+               f'font-size="{_fmt(RULER_FONT_MM)}">'
+               f'measure this: if it is not exact, the print was scaled'
+               f'</text>')
+    return out
+
+
 def generate_svg(bm, uv_layer, settings, scale_length=1.0):
     """Build the full SVG pattern as a string. Pure function -- no file I/O,
     no bpy.context -- so it can be exercised directly in tests."""
@@ -235,6 +299,11 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
                 isl.piece_id = rep[id_layer]
 
     total_width, total_height = sheet.width, sheet.height
+    if settings.show_scale_ruler:
+        # Added below the pattern, so the pattern's own coordinates --
+        # and therefore its fidelity to the UV layout -- are unchanged.
+        total_height += RULER_STRIP_MM
+        total_width = max(total_width, MARGIN_MM * 2 + 210.0)
 
     thickness_mm = settings.foam_thickness * scale_length * 1000.0
     dart_depth_mm = settings.notch_depth_ratio * thickness_mm
@@ -257,6 +326,7 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
         runs_by_island[r.island_index].append(r)
 
     outlines, darts, ticks, angles, numbers, heatform = [], [], [], [], [], []
+    fills = []
 
     for isl in islands:
         # --- outlines: one polygon per boundary cycle (an island with a hole
@@ -268,14 +338,39 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
             pts_str = " ".join(f"{_fmt(p.x)},{_fmt(p.y)}" for p in pts)
             outlines.append(f'<polygon points="{pts_str}"/>')
 
-        # --- numbers: piece ID at the outer cycle's centroid.
-        if settings.show_island_ids and isl.cycles:
-            outer = max(isl.cycles, key=len)
-            pts = [isl.to_sheet(l[uv_layer].uv) for l in outer]
-            c = _polygon_centroid(pts)
-            numbers.append(
-                f'<text x="{_fmt(c.x)}" y="{_fmt(c.y)}" '
-                f'font-size="{_fmt(number_font_mm)}">{isl.piece_id}</text>')
+        # --- fill: one colour per piece, behind everything else.
+        rings = [[(p.x, p.y) for p in
+                  (isl.to_sheet(l[uv_layer].uv) for l in cyc)]
+                 for cyc in sorted(isl.cycles, key=len, reverse=True)]
+        if settings.island_fill and rings:
+            # One path with every cycle as a subpath and fill-rule evenodd, so
+            # a piece with a hole in it reads as a hole rather than a disc.
+            subpaths = []
+            for ring in rings:
+                head = "M %s" % " L ".join("%s,%s" % (_fmt(x), _fmt(y))
+                                           for x, y in ring)
+                subpaths.append(head + " Z")
+            r, g, b = core.island_palette_color(isl.index, len(islands))
+            fills.append(
+                f'<path d="{" ".join(subpaths)}" fill-rule="evenodd" '
+                f'fill="{_rgb_to_hex(r, g, b)}"/>')
+
+        # --- numbers: piece ID where it actually lands on the piece.
+        if settings.show_island_ids and rings:
+            # Not the centroid. The centroid of a crescent or a C lies outside
+            # the shape, so the number printed there sits on the sheet beside
+            # the piece -- and vanishes entirely once the pattern is used as a
+            # texture on the model, which is the main reason it is printed.
+            # The pole of inaccessibility is inside by construction, and sits
+            # in the piece's widest part so the digits have room.
+            (px, py), room = core.pole_of_inaccessibility(rings)
+            if px is not None:
+                # Shrink a number that will not fit rather than letting it
+                # spill over the cut lines of a small piece.
+                size = min(number_font_mm, max(room * 1.2, 0.1))
+                numbers.append(
+                    f'<text x="{_fmt(px)}" y="{_fmt(py)}" '
+                    f'font-size="{_fmt(size)}">{isl.piece_id}</text>')
 
         # --- angles + heatform: one entry per run.
         for run in runs_by_island[isl.index]:
@@ -384,6 +479,10 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
         f"#darts polygon{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.7)};}}"
         f"#ticks line{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.7)};}}"
         "#numbers text{text-anchor:middle;dominant-baseline:middle;fill:#000;}"
+        "#fills path{stroke:none;}"
+        f"#ruler line{{stroke:#000;stroke-width:0.3;}}"
+        f"#ruler rect{{stroke:#000;stroke-width:0.3;}}"
+        "#ruler text{font-family:sans-serif;text-anchor:middle;fill:#000;}"
         f"#angles text{{text-anchor:middle;dominant-baseline:middle;}}"
         f"#angles text.convex{{fill:{convex_hex};}}"
         f"#angles text.concave{{fill:{concave_hex};}}"
@@ -399,12 +498,16 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
         f"width='{total_width:.3f}mm' height='{total_height:.3f}mm' "
         f"viewBox='0 0 {total_width:.3f} {total_height:.3f}'>",
         style,
+        group("fills", "fills", fills),
         group("outlines", "outlines", outlines),
         group("darts", "darts", darts),
         group("ticks", "ticks", ticks),
         group("angles", "angles", angles),
         group("numbers", "numbers", numbers),
         group("heatform", "heatform", heatform),
+        group("ruler", "ruler",
+              _scale_strip(total_width, sheet.height)
+              if settings.show_scale_ruler else []),
         "</svg>",
     ]
     return "\n".join(lines)

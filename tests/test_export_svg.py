@@ -278,8 +278,16 @@ def test_the_angle_threshold_is_not_what_hides_the_labels():
 
     Measured 2026-11-03, and the guess was wrong. On a sphere panelled into
     bands the folds come out at about 15 degrees -- three times the threshold
-    -- and every one of the 528 runs is labelled, at the default setting and
-    at zero alike. The threshold is not touching them.
+    -- and every one of the 22 runs is labelled, at the default setting and at
+    zero alike. The threshold is not touching them.
+
+    The run count in this docstring said 528 when the case was first written.
+    That number is not reproducible: the same fixture and settings now give 22,
+    and a separate probe across two sphere radii agrees. Whatever produced 528
+    was a code state that no longer exists, so the figure is corrected here
+    rather than left to be trusted. The conclusion is unchanged -- the folds
+    clear the threshold by three times either way -- but a number nobody can
+    reproduce is worse than no number, because the next session will try.
 
     Kept rather than deleted, because it is the cheapest way to re-rule-out
     the same hypothesis next time, and because the numbers say something
@@ -404,12 +412,218 @@ def test_the_labels_are_large_enough_to_read_on_the_sheet():
     return out
 
 
+
+def test_every_piece_number_lands_inside_its_piece():
+    """A number printed outside its piece is worse than no number.
+
+    The sheet doubles as a texture: applied to the model, each panel should
+    carry its own number. A label placed at the island's centroid fails that
+    whenever the island is not convex -- the centroid of a crescent, a C or a
+    ring lies in the gap, so the number sits on the sheet beside the piece and
+    disappears entirely once the pattern is on the model.
+
+    Checked by taking every number's coordinates straight out of the SVG and
+    asking whether that point is inside the island it belongs to, using the
+    same ray-casting test the placement relies on. Both bounds: every number
+    inside, and one number per island so none was dropped to make that true.
+    """
+    obj = _seamed_cube()
+    bm = _bmesh_of(obj)
+    try:
+        uv_layer = bm.loops.layers.uv.active
+        settings = _settings()
+        svg = fx.generate_svg(bm, uv_layer, settings, 1.0)
+
+        islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
+        sheet = fx._Sheet(islands_faces, uv_layer, 1.0)
+        islands = [fx._Island(i, faces, uv_layer, sheet)
+                   for i, faces in enumerate(islands_faces)]
+        rings_per_island = []
+        for isl in islands:
+            rings_per_island.append(
+                [[(p.x, p.y) for p in
+                  (isl.to_sheet(l[uv_layer].uv) for l in cyc)]
+                 for cyc in sorted(isl.cycles, key=len, reverse=True)])
+
+        group = re.search(r'<g id="numbers".*?</g>', svg, re.S)
+        placed = [(float(x), float(y)) for x, y in re.findall(
+            r'<text x="([-\d.]+)" y="([-\d.]+)"',
+            group.group(0) if group else "")]
+
+        hits = 0
+        for px, py in placed:
+            if any(core._point_in_rings(px, py, rings)
+                   for rings in rings_per_island):
+                hits += 1
+
+        return {
+            "islands": len(islands),
+            "numbers_placed": len(placed),
+            "numbers_inside_a_piece": hits,
+            "checks": {
+                "one_number_per_island": len(placed) == len(islands),
+                "every_number_is_inside_its_piece": hits == len(placed),
+                # Both bounds: zero numbers would satisfy "all inside".
+                "numbers_were_actually_placed": len(placed) > 0,
+            },
+        }
+    finally:
+        bm.free()
+
+
+def test_a_crescent_piece_gets_its_number_inside():
+    """The shape a centroid gets wrong, asserted directly.
+
+    The cube's islands are convex, so the case above would pass even with the
+    old centroid placement. This is the one that would not: a C whose centroid
+    is provably outside it. Testing the geometry rather than a bake, because
+    producing a reliably crescent-shaped UV island is a test about unwrapping
+    and this is a test about label placement.
+    """
+    c_shape = [(0.0, 0.0), (10.0, 0.0), (10.0, 3.0), (3.0, 3.0),
+               (3.0, 7.0), (10.0, 7.0), (10.0, 10.0), (0.0, 10.0)]
+    cx = sum(p[0] for p in c_shape) / len(c_shape)
+    cy = sum(p[1] for p in c_shape) / len(c_shape)
+    (px, py), room = core.pole_of_inaccessibility([c_shape])
+
+    # A square, where the answer is arithmetic: dead centre, radius half the
+    # side. A wrong implementation cannot survive this.
+    square = [(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)]
+    (sx, sy), sr = core.pole_of_inaccessibility([square])
+
+    # A square with a hole: the label must not land in the hole.
+    holed = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    hole = [(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0)]
+    (hx, hy), hr = core.pole_of_inaccessibility([holed, hole])
+
+    return {
+        "crescent_centroid": [round(cx, 3), round(cy, 3)],
+        "crescent_centroid_inside": core._point_in_rings(cx, cy, [c_shape]),
+        "crescent_pole": [round(px, 3), round(py, 3)],
+        "crescent_pole_inside": core._point_in_rings(px, py, [c_shape]),
+        "square_pole": [round(sx, 3), round(sy, 3), round(sr, 3)],
+        "holed_pole_inside":
+            core._point_in_rings(hx, hy, [holed, hole]),
+        "checks": {
+            # The failure being fixed, stated as a fact about the fixture.
+            "the_centroid_really_is_outside":
+                not core._point_in_rings(cx, cy, [c_shape]),
+            "the_pole_is_inside":
+                core._point_in_rings(px, py, [c_shape]),
+            # Arithmetic, to a hundredth: centre of an 8x8 square, radius 4.
+            "square_answer_is_exact":
+                abs(sx - 4.0) < 0.01 and abs(sy - 4.0) < 0.01
+                and abs(sr - 4.0) < 0.01,
+            "a_hole_is_avoided": core._point_in_rings(hx, hy, [holed, hole]),
+        },
+    }
+
+
+def test_island_fill_colours_are_distinct_and_toggleable():
+    """One colour per piece, and a way to turn them off for a home printer."""
+    obj = _seamed_cube()
+    bm = _bmesh_of(obj)
+    try:
+        uv_layer = bm.loops.layers.uv.active
+        settings = _settings()
+        islands = len(core.uv_islands(bm, uv_layer, only_selected=False))
+
+        original = settings.island_fill
+        try:
+            settings.island_fill = True
+            on = fx.generate_svg(bm, uv_layer, settings, 1.0)
+            settings.island_fill = False
+            off = fx.generate_svg(bm, uv_layer, settings, 1.0)
+        finally:
+            settings.island_fill = original
+
+        def _fill_colours(svg):
+            g = re.search(r'<g id="fills".*?</g>', svg, re.S)
+            return re.findall(r'fill="(#[0-9a-f]{6})"', g.group(0) if g else "")
+
+        on_colours = _fill_colours(on)
+        off_colours = _fill_colours(off)
+        return {
+            "islands": islands,
+            "fills_when_on": len(on_colours),
+            "distinct_colours": len(set(on_colours)),
+            "fills_when_off": len(off_colours),
+            "sample": on_colours[:4],
+            "checks": {
+                "one_fill_per_island": len(on_colours) == islands,
+                # Distinct, or two neighbouring pieces cannot be told apart,
+                # which is the entire purpose.
+                "colours_are_all_different":
+                    len(set(on_colours)) == len(on_colours),
+                "the_toggle_removes_them": len(off_colours) == 0,
+            },
+        }
+    finally:
+        bm.free()
+
+
+def test_the_scale_ruler_is_in_real_millimetres():
+    """The ruler must not scale with the pattern -- that is its whole job.
+
+    Everything else on the sheet is sized in thousandths of the UV sheet so it
+    reads at any pattern size. The ruler is the exception: it is measured
+    against a real ruler held to the paper, so a 100 mm bar has to be 100 mm
+    of SVG user units, whatever the pattern around it is doing.
+
+    Checked across two patterns of very different size. The bar and the inch
+    square must come out identical in both.
+    """
+    rows = {}
+    for label, builder in (("seamed_cube", _seamed_cube),
+                           ("panelled_sphere", _panelled_sphere)):
+        obj = builder()
+        bm = _bmesh_of(obj)
+        try:
+            uv_layer = bm.loops.layers.uv.active
+            svg = fx.generate_svg(bm, uv_layer, _settings(), 1.0)
+            g = re.search(r'<g id="ruler".*?</g>', svg, re.S)
+            body = g.group(0) if g else ""
+            # The long bar is the widest horizontal line in the group.
+            spans = [abs(float(b) - float(a)) for a, b in re.findall(
+                r'<line x1="([-\d.]+)" y1="[-\d.]+" x2="([-\d.]+)"', body)]
+            rect = re.search(r'<rect [^>]*width="([\d.]+)"', body)
+            box = re.search(r"viewBox='0 0 ([\d.]+) ([\d.]+)'", svg)
+            rows[label] = {
+                "bar_mm": round(max(spans), 3) if spans else None,
+                "inch_square_mm": round(float(rect.group(1)), 3) if rect else None,
+                "sheet_height_mm": round(float(box.group(2)), 1) if box else None,
+                "tick_count": len(spans),
+            }
+        finally:
+            bm.free()
+
+    cube, sphere = rows["seamed_cube"], rows["panelled_sphere"]
+    out = dict(rows)
+    out["checks"] = {
+        "bar_is_100mm_on_both":
+            cube["bar_mm"] == 100.0 and sphere["bar_mm"] == 100.0,
+        # 25.4 mm exactly, or it is not an inch.
+        "inch_square_is_25_4_on_both":
+            cube["inch_square_mm"] == 25.4 and sphere["inch_square_mm"] == 25.4,
+        # Both bounds: the two sheets really are different sizes, so the
+        # equality above means the ruler is independent rather than that the
+        # two cases happen to match.
+        "the_two_sheets_differ_in_size":
+            cube["sheet_height_mm"] != sphere["sheet_height_mm"],
+    }
+    return out
+
+
 TESTS = (
     test_the_cube_fixture_is_what_we_think,
     test_the_sheet_reproduces_the_uv_layout,
     test_every_run_gets_an_angle_label,
     test_the_angle_threshold_is_not_what_hides_the_labels,
     test_the_labels_are_large_enough_to_read_on_the_sheet,
+    test_every_piece_number_lands_inside_its_piece,
+    test_a_crescent_piece_gets_its_number_inside,
+    test_island_fill_colours_are_distinct_and_toggleable,
+    test_the_scale_ruler_is_in_real_millimetres,
 )
 
 result = {}
