@@ -28,12 +28,17 @@ from . import foam_angle_core as core
 # Real-world sizes for pattern elements that only make sense printed at 1:1 --
 # distinct from the overlay's screen-space settings (font_size, tick_length_px,
 # overlay_scale), which scale with UV editor zoom rather than paper size.
-TICK_LENGTH_MM = 3.0
-ANGLE_FONT_MM = 4.0
-NUMBER_FONT_MM = 8.0
+# Darts are physical cuts, so their size is in millimetres of real foam and
+# comes from the stock thickness, not from how the pattern is drawn.
 DART_SLIT_WIDTH_MM = 0.6
 MARGIN_MM = 10.0
-MAX_ROW_WIDTH_MM = 1500.0  # wraps islands onto a new row rather than one long strip
+
+# Annotation sizes are *not* physical. They are parts per thousand of the UV
+# sheet, exactly as the overlay draws them (foam_overlay.py:480-482 computes
+# `permille / 1000 * px_per_uv * overlay_scale`; here the same expression runs
+# against millimetres per UV unit instead of pixels). Printing the same
+# numbers the user is looking at is the whole point -- the SVG is a render of
+# the overlay, not a second opinion about how big a label should be.
 
 
 def _face_uv_area(face, uv_layer):
@@ -80,20 +85,17 @@ class _Island:
     the output sheet. Built once per island so every SVG group below can share
     the same coordinate transform."""
 
-    def __init__(self, index, faces, uv_layer, scale_length):
+    def __init__(self, index, faces, uv_layer, sheet):
         self.index = index
         self.faces = faces
         self.piece_id = index + 1  # overwritten below if the attribute exists
         self.cycles = core.island_boundary_cycles(faces, uv_layer)
+        self.sheet = sheet
 
-        area_3d = sum(f.calc_area() for f in faces)
-        area_uv = sum(_face_uv_area(f, uv_layer) for f in faces)
-        # Real-world scale comes from this island's own area ratio, not a
-        # global assumption -- distortion differs island to island, so each
-        # piece must be sized from its own faces to print true.
-        scale_m_per_uv = (area_3d / area_uv) ** 0.5 if area_uv > 1e-12 else 1.0
-        self.scale = scale_m_per_uv * scale_length * 1000.0  # mm per UV unit
-
+        # The island's own UV bounds. Used for its centroid, which decides
+        # which way a dart points -- a local question. Nothing about where the
+        # island lands on the sheet is decided here any more; that is the
+        # sheet's single transform, shared by every island.
         all_uvs = [l[uv_layer].uv for cyc in self.cycles for l in cyc]
         if not all_uvs:
             all_uvs = [l[uv_layer].uv for f in faces for l in f.loops]
@@ -101,44 +103,77 @@ class _Island:
         self.max_u = max(p.x for p in all_uvs)
         self.min_v = min(p.y for p in all_uvs)
         self.max_v = max(p.y for p in all_uvs)
-        self.width = (self.max_u - self.min_u) * self.scale
-        self.height = (self.max_v - self.min_v) * self.scale
-        self.offset_x = 0.0
-        self.offset_y = 0.0
 
     def to_sheet(self, uv):
-        """UV point -> millimetre point on the packed sheet.
+        return self.sheet.to_sheet(uv)
 
-        SVG y grows downward, UV y grows upward, so v is measured from the
-        island's own max_v (top of its bounding box) rather than from v=0.
+
+class _Sheet:
+    """The one transform from UV space to millimetres on the page.
+
+    There used to be a packer here, which re-arranged the islands into rows
+    and scaled each one independently by its own area distortion. Both are
+    gone, and deliberately: **the UV layout is the arrangement.** The maker
+    positions pieces in the UV editor to suit their stock, and an exporter
+    that quietly re-lays them discards that work and produces a sheet that
+    cannot be checked against what is on screen.
+
+    CLAUDE.md records this exact mistake once already, against the flat layout
+    preview -- a bespoke shelf packer invented for a problem whose answer was
+    u->x, v->y scaled to the mesh. This was the same bug in a second place.
+
+    So: any rearranging belongs in Blender's own UV tools, where it is visible
+    and undoable. This renders what is there.
+
+    The consequence worth stating is that one uniform scale cannot also make
+    each island individually true to size. Where UV distortion differs between
+    islands, a piece is as true as its unwrap is -- which is a property of the
+    unwrap, shown honestly, rather than a correction applied invisibly at
+    export time. Minimum Stretch exists for exactly that, and the craftability
+    check already reports pieces that distort too far.
+    """
+
+    def __init__(self, islands_faces, uv_layer, scale_length):
+        area_3d = sum(f.calc_area() for fs in islands_faces for f in fs)
+        area_uv = sum(_face_uv_area(f, uv_layer)
+                      for fs in islands_faces for f in fs)
+        # One ratio for the whole mesh, so every piece shares a scale and the
+        # sheet is a true picture of the UV layout.
+        m_per_uv = (area_3d / area_uv) ** 0.5 if area_uv > 1e-12 else 1.0
+        self.scale = m_per_uv * scale_length * 1000.0  # mm per UV unit
+
+        uvs = [l[uv_layer].uv for fs in islands_faces for f in fs
+               for l in f.loops]
+        if uvs:
+            self.min_u = min(p.x for p in uvs)
+            self.max_u = max(p.x for p in uvs)
+            self.min_v = min(p.y for p in uvs)
+            self.max_v = max(p.y for p in uvs)
+        else:
+            self.min_u = self.max_u = self.min_v = self.max_v = 0.0
+
+        self.width = (self.max_u - self.min_u) * self.scale + 2 * MARGIN_MM
+        self.height = (self.max_v - self.min_v) * self.scale + 2 * MARGIN_MM
+
+    def to_sheet(self, uv):
+        """UV point -> millimetre point on the page.
+
+        SVG y grows downward and UV v grows upward, so v is measured from the
+        top of the whole sheet -- not, as it once was, from each island's own
+        bounding box, which is what let the islands drift apart.
         """
-        x = (uv.x - self.min_u) * self.scale + self.offset_x
-        y = (self.max_v - uv.y) * self.scale + self.offset_y
+        x = (uv.x - self.min_u) * self.scale + MARGIN_MM
+        y = (self.max_v - uv.y) * self.scale + MARGIN_MM
         return Vector((x, y))
 
+    def permille(self, parts, overlay_scale):
+        """A size given in thousandths of the UV sheet, in millimetres.
 
-def _pack_islands(islands):
-    """Simple left-to-right row packing so islands never overlap regardless of
-    how much their individual scales differ (a real risk here, since each
-    island is scaled independently by its own distortion -- see _Island). Not
-    a bin-packer; this only needs to guarantee no overlap, not minimal area."""
-    x = MARGIN_MM
-    y = MARGIN_MM
-    row_height = 0.0
-    max_x = 0.0
-    for isl in islands:
-        if x > MARGIN_MM and x + isl.width > MAX_ROW_WIDTH_MM:
-            x = MARGIN_MM
-            y += row_height + MARGIN_MM
-            row_height = 0.0
-        isl.offset_x = x
-        isl.offset_y = y
-        x += isl.width + MARGIN_MM
-        row_height = max(row_height, isl.height)
-        max_x = max(max_x, x)
-    total_width = max_x if islands else MARGIN_MM * 2
-    total_height = y + row_height + MARGIN_MM if islands else MARGIN_MM * 2
-    return total_width, total_height
+        Mirrors foam_overlay.py's `permille / 1000 * px_per_uv * scale`, with
+        millimetres per UV unit standing in for pixels, so a label prints at
+        the size it is drawn at.
+        """
+        return parts / 1000.0 * self.scale * overlay_scale
 
 
 def _run_polyline(run, uv_layer, isl):
@@ -188,7 +223,8 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
     """Build the full SVG pattern as a string. Pure function -- no file I/O,
     no bpy.context -- so it can be exercised directly in tests."""
     islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
-    islands = [_Island(i, faces, uv_layer, scale_length)
+    sheet = _Sheet(islands_faces, uv_layer, scale_length)
+    islands = [_Island(i, faces, uv_layer, sheet)
               for i, faces in enumerate(islands_faces)]
 
     id_layer = bm.faces.layers.int.get('foam_island_id')
@@ -198,10 +234,20 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
             if rep is not None:
                 isl.piece_id = rep[id_layer]
 
-    total_width, total_height = _pack_islands(islands)
+    total_width, total_height = sheet.width, sheet.height
 
     thickness_mm = settings.foam_thickness * scale_length * 1000.0
     dart_depth_mm = settings.notch_depth_ratio * thickness_mm
+
+    # Annotation sizes, in millimetres, from the same permille settings the
+    # overlay draws with -- so the printed sheet matches the screen.
+    overlay_scale = settings.overlay_scale
+    angle_font_mm = sheet.permille(settings.angle_text_size, overlay_scale)
+    number_font_mm = sheet.permille(settings.number_size, overlay_scale)
+    tick_length_mm = sheet.permille(settings.mark_size, overlay_scale)
+    # Hairlines scale with the sheet too, or a 2 m pattern gets invisible
+    # outlines and a 100 mm one gets a smeared blob.
+    stroke_mm = sheet.permille(2, overlay_scale)
 
     all_runs = list(core.iter_boundary_dart_segments(
         bm, uv_layer, settings.max_chord_deviation,
@@ -229,7 +275,7 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
             c = _polygon_centroid(pts)
             numbers.append(
                 f'<text x="{_fmt(c.x)}" y="{_fmt(c.y)}" '
-                f'font-size="{NUMBER_FONT_MM}">{isl.piece_id}</text>')
+                f'font-size="{_fmt(number_font_mm)}">{isl.piece_id}</text>')
 
         # --- angles + heatform: one entry per run.
         for run in runs_by_island[isl.index]:
@@ -246,7 +292,7 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
                     heatform.append(f'<polyline points="{pts_str}" fill="none"/>')
                     heatform.append(
                         f'<text x="{_fmt(mid.x)}" y="{_fmt(mid.y)}" '
-                        f'font-size="{ANGLE_FONT_MM}">{label} (heat-form)</text>')
+                        f'font-size="{_fmt(angle_font_mm)}">{label} (heat-form)</text>')
                 # Needs a heat-form joint, not a saw cut -- never also present
                 # it as an ordinary sawable bevel in the angles group.
                 continue
@@ -257,7 +303,7 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
                     css_class = "neutral"
                 angles.append(
                     f'<text class="{css_class}" x="{_fmt(mid.x)}" y="{_fmt(mid.y)}" '
-                    f'font-size="{ANGLE_FONT_MM}">{label}</text>')
+                    f'font-size="{_fmt(angle_font_mm)}">{label}</text>')
 
         # --- ticks + darts: one per run-to-run corner, grouped by boundary
         # cycle so the wraparound (last run's end == first run's start)
@@ -288,8 +334,8 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
                     pt_before = isl.to_sheet(prev_loop[uv_layer].uv)
                     tangent = _boundary_tangent(pt_before, boundary_pt)
                     normal = Vector((-tangent.y, tangent.x))
-                    tick_a = boundary_pt + normal * (TICK_LENGTH_MM / 2)
-                    tick_b = boundary_pt - normal * (TICK_LENGTH_MM / 2)
+                    tick_a = boundary_pt + normal * (tick_length_mm / 2)
+                    tick_b = boundary_pt - normal * (tick_length_mm / 2)
                     ticks.append(
                         f'<line x1="{_fmt(tick_a.x)}" y1="{_fmt(tick_a.y)}" '
                         f'x2="{_fmt(tick_b.x)}" y2="{_fmt(tick_b.y)}"/>')
@@ -333,9 +379,10 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
 
     style = (
         "<style>"
-        "#outlines polygon{fill:none;stroke:#000;stroke-width:0.3;}"
-        "#darts polygon{stroke:#000;stroke-width:0.2;}"
-        "#ticks line{stroke:#000;stroke-width:0.2;}"
+        f"#outlines polygon{{fill:none;stroke:#000;"
+        f"stroke-width:{_fmt(stroke_mm)};}}"
+        f"#darts polygon{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.7)};}}"
+        f"#ticks line{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.7)};}}"
         "#numbers text{text-anchor:middle;dominant-baseline:middle;fill:#000;}"
         f"#angles text{{text-anchor:middle;dominant-baseline:middle;}}"
         f"#angles text.convex{{fill:{convex_hex};}}"

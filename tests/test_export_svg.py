@@ -132,9 +132,9 @@ def test_the_sheet_reproduces_the_uv_layout():
     try:
         uv_layer = bm.loops.layers.uv.active
         islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
-        islands = [fx._Island(i, faces, uv_layer, 1.0)
+        sheet = fx._Sheet(islands_faces, uv_layer, 1.0)
+        islands = [fx._Island(i, faces, uv_layer, sheet)
                    for i, faces in enumerate(islands_faces)]
-        fx._pack_islands(islands)
 
         uv_centroids, sheet_centroids = [], []
         for isl in islands:
@@ -159,9 +159,8 @@ def test_the_sheet_reproduces_the_uv_layout():
             "mm_per_uv_min": round(min(ratios), 3) if ratios else None,
             "mm_per_uv_max": round(max(ratios), 3) if ratios else None,
             "spread_max_over_min": round(spread, 3),
-            "per_island_scale": [round(i.scale, 3) for i in islands],
-            "packer_offsets": [(round(i.offset_x, 2), round(i.offset_y, 2))
-                               for i in islands],
+            "shared_scale_mm_per_uv": round(sheet.scale, 3),
+            "sheet_mm": (round(sheet.width, 1), round(sheet.height, 1)),
             "checks": {
                 # One uniform mapping from UV to sheet: every pairwise
                 # distance scales by the same factor. 1% allows for float
@@ -370,13 +369,20 @@ def test_the_labels_are_large_enough_to_read_on_the_sheet():
             box = re.search(r"viewBox='0 0 ([\d.]+) ([\d.]+)'", svg)
             width = float(box.group(1)) if box else 0.0
             height = float(box.group(2)) if box else 0.0
-            px_at_1000 = (fx.ANGLE_FONT_MM / height * 1000.0) if height else 0.0
+            # Read the size off an actual label rather than a module constant:
+            # the font is computed per sheet now, so the constant is gone and
+            # what matters is what reached the file.
+            group = re.search(r'<g id="angles".*?</g>', svg, re.S)
+            fonts = [float(f) for f in re.findall(
+                r'font-size="([\d.]+)"', group.group(0) if group else "")]
+            font_mm = fonts[0] if fonts else 0.0
+            px_at_1000 = (font_mm / height * 1000.0) if height else 0.0
             rows[label] = {
                 "sheet_width_mm": round(width, 1),
                 "sheet_height_mm": round(height, 1),
-                "angle_font_mm": fx.ANGLE_FONT_MM,
+                "angle_font_mm": round(font_mm, 3),
                 "font_as_fraction_of_sheet_height":
-                    round(fx.ANGLE_FONT_MM / height, 6) if height else None,
+                    round(font_mm / height, 6) if height else None,
                 "label_px_when_fitted_to_1000px": round(px_at_1000, 2),
             }
         finally:
