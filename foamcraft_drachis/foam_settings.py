@@ -115,8 +115,13 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "fix is to re-map the island so no piece spans it",
         default=False)
     show_darts: bpy.props.BoolProperty(
-        name="Relief Darts", default=True,
-        description="Place relief darts along curved cut runs")
+        name="Relief Cuts", default=False,
+        description="Cut a wedge or slit out of the edge on a tight curve, so "
+                    "the foam can close without buckling. Off by default: it "
+                    "removes material, and most panel work does not need it "
+                    "-- a panel small enough to lie flat is the usual answer "
+                    "to a curve that will not. This is NOT the alignment mark; "
+                    "see Alignment Ticks, which adds no cut at all")
     dart_wedge_deg: bpy.props.FloatProperty(
         name="Widest Dart",
         description="The largest wedge one relief dart may take out. A piece's "
@@ -171,6 +176,47 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "matter of taste, which is why it is here. Zero switches "
                     "merging off and leaves every overlap as a junction",
         default=0.5, min=0.0, max=1.0, subtype='FACTOR')
+
+    # --- Alignment ticks
+    #
+    # Registration marks, not relief. Two pieces glued along a seam will
+    # creep out of line as the foam is worked, and a tick on each side of
+    # the seam is what the maker brings back together. They are drawn on
+    # the surface and cut nothing.
+    show_align_ticks: bpy.props.BoolProperty(
+        name="Alignment Ticks", default=True,
+        description="Mark each seam at intervals so two pieces can be "
+                    "registered against each other while gluing. Every tick "
+                    "is placed on the shared 3D edge and drawn on both "
+                    "pieces, so the pair really does meet at the same point "
+                    "on the foam")
+    tick_mode: bpy.props.EnumProperty(
+        name="Tick Spacing",
+        items=[
+            ('PER_RUN', "Per Cut Run",
+             "A fixed number along every run, however long it is"),
+            ('BY_DISTANCE', "By Distance",
+             "Every so many millimetres of real seam, whatever the runs do"),
+        ],
+        default='PER_RUN',
+        description="Per Cut Run keeps the count predictable and ties the "
+                    "marks to the passes you are already cutting. By Distance "
+                    "keeps their spacing on the foam even, which matters more "
+                    "when runs differ wildly in length")
+    ticks_per_run: bpy.props.IntProperty(
+        name="Ticks Per Run", default=2, min=1, max=20,
+        description="How many alignment marks on each cut run")
+    tick_spacing: bpy.props.FloatProperty(
+        name="Tick Spacing", default=0.025, min=0.002, max=0.5,
+        subtype='DISTANCE', unit='LENGTH', precision=4,
+        description="Distance along the seam between alignment marks, in real "
+                    "units, when spacing By Distance")
+    tick_numbers: bpy.props.BoolProperty(
+        name="Number The Ticks", default=False,
+        description="Print a small index beside each alignment mark, so the "
+                    "third tick on one piece is visibly the third on its "
+                    "neighbour. Useful on a long seam where the marks look "
+                    "alike; clutter on a short one")
 
     # --- Stock, for craftability checks
     sheet_width: bpy.props.FloatProperty(

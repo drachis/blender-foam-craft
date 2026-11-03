@@ -197,6 +197,27 @@ def _signature(pairs, s):
 
 
 def _island_uv_centroid(faces, uv_layer):
+    """Where to put this island's piece number, in UV space.
+
+    Not the centroid, despite the name kept for its callers. The centroid of
+    a ring lies in the hole and the centroid of a crescent lies outside the
+    shape, so the number was drawn on no piece at all -- plainly visible on a
+    panelled sphere, where every island is an annulus and all eight numbers
+    floated in their own holes.
+
+    The exporter already places numbers at the pole of inaccessibility, which
+    is inside by construction. The overlay has to agree with it: the sheet is
+    supposed to be a render of what the UV editor shows, and a number in a
+    different place on each is the most confusing kind of disagreement.
+    """
+    cycles = core.island_boundary_cycles(faces, uv_layer)
+    rings = [[(l[uv_layer].uv.x, l[uv_layer].uv.y) for l in cyc]
+             for cyc in sorted(cycles, key=len, reverse=True)]
+    if rings:
+        (px, py), _room = core.pole_of_inaccessibility(rings)
+        if px is not None:
+            return Vector((px, py))
+
     total = Vector((0.0, 0.0))
     count = 0
     for face in faces:

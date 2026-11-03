@@ -614,6 +614,181 @@ def test_the_scale_ruler_is_in_real_millimetres():
     return out
 
 
+
+def _tick_lines(svg):
+    g = re.search(r'<g id="align".*?</g>', svg, re.S)
+    body = g.group(0) if g else ""
+    return re.findall(
+        r'<line x1="([-\d.]+)" y1="([-\d.]+)" x2="([-\d.]+)" y2="([-\d.]+)"',
+        body)
+
+
+def test_alignment_ticks_are_paired_across_every_seam():
+    """Both pieces of a seam must be marked at the same point on the foam.
+
+    This is the property that makes them registration marks rather than
+    decoration: the maker brings two ticks together, so a tick on piece 4
+    with no partner on piece 7 is worse than no tick at all.
+
+    Guaranteed by construction -- positions are chosen on the shared 3D edge
+    and then mapped into each island's own UVs -- and checked here by
+    counting. Every seam edge carrying marks has two faces in two different
+    islands, so each chosen (edge, t) must produce exactly two drawn lines.
+
+    The seamed cube is the right fixture: all twelve edges are seams, every
+    one shared by exactly two of the six islands, so the arithmetic is known
+    before the test runs.
+    """
+    obj = _seamed_cube()
+    bm = _bmesh_of(obj)
+    try:
+        uv_layer = bm.loops.layers.uv.active
+        settings = _settings()
+        original = (settings.show_align_ticks, settings.tick_mode,
+                    settings.ticks_per_run)
+        try:
+            settings.show_align_ticks = True
+            settings.tick_mode = 'PER_RUN'
+            settings.ticks_per_run = 2
+            svg = fx.generate_svg(bm, uv_layer, settings, 1.0)
+        finally:
+            (settings.show_align_ticks, settings.tick_mode,
+             settings.ticks_per_run) = original
+
+        lines = _tick_lines(svg)
+
+        islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
+        sheet = fx._Sheet(islands_faces, uv_layer, 1.0)
+        islands = [fx._Island(i, faces, uv_layer, sheet)
+                   for i, faces in enumerate(islands_faces)]
+        runs = list(core.iter_boundary_dart_segments(
+            bm, uv_layer, settings.max_chord_deviation,
+            settings.max_angle_variation_deg, islands=islands_faces))
+        by_island = [[] for _ in islands]
+        for r in runs:
+            by_island[r.island_index].append(r)
+
+        wanted = {}
+        for island_runs in by_island:
+            for run in island_runs:
+                for edge, t in fx._run_tick_params(run, settings):
+                    wanted.setdefault(edge, set()).add(t)
+        marks = sum(len(v) for v in wanted.values())
+
+        # How many of those edges really are shared by two islands?
+        face_island = {}
+        for index, faces in enumerate(islands_faces):
+            for f in faces:
+                face_island[f] = index
+        shared = 0
+        for edge in wanted:
+            sides = {face_island.get(f) for f in edge.link_faces}
+            sides.discard(None)
+            if len(sides) == 2:
+                shared += 1
+
+        return {
+            "islands": len(islands),
+            "runs": len(runs),
+            "edges_with_marks": len(wanted),
+            "edges_shared_by_two_islands": shared,
+            "distinct_marks_on_the_mesh": marks,
+            "lines_drawn": len(lines),
+            "checks": {
+                # Every marked edge of a seamed cube joins two pieces.
+                "every_marked_edge_is_a_seam": shared == len(wanted),
+                # And each mark is therefore drawn twice, once per piece.
+                "each_mark_is_drawn_on_both_pieces":
+                    len(lines) == marks * 2,
+                # Both bounds: no marks at all would satisfy the equalities.
+                "marks_were_produced": marks > 0,
+            },
+        }
+    finally:
+        bm.free()
+
+
+def test_tick_spacing_responds_to_both_modes():
+    """Per Cut Run and By Distance each do what they say.
+
+    Per Cut Run is arithmetic: n ticks on each of r runs is n*r marks, so
+    doubling the count doubles them. By Distance is not tied to run count at
+    all -- halving the spacing should roughly double the marks, and the two
+    modes should disagree, or one of them is not wired up.
+    """
+    obj = _panelled_sphere()
+    bm = _bmesh_of(obj)
+    try:
+        uv_layer = bm.loops.layers.uv.active
+        settings = _settings()
+        saved = (settings.show_align_ticks, settings.tick_mode,
+                 settings.ticks_per_run, settings.tick_spacing)
+
+        def _count(mode, per_run=2, spacing=0.025):
+            settings.show_align_ticks = True
+            settings.tick_mode = mode
+            settings.ticks_per_run = per_run
+            settings.tick_spacing = spacing
+            return len(_tick_lines(fx.generate_svg(bm, uv_layer, settings, 1.0)))
+
+        try:
+            per_run_2 = _count('PER_RUN', per_run=2)
+            per_run_4 = _count('PER_RUN', per_run=4)
+            wide = _count('BY_DISTANCE', spacing=0.04)
+            narrow = _count('BY_DISTANCE', spacing=0.02)
+            settings.show_align_ticks = False
+            off = len(_tick_lines(fx.generate_svg(bm, uv_layer, settings, 1.0)))
+        finally:
+            (settings.show_align_ticks, settings.tick_mode,
+             settings.ticks_per_run, settings.tick_spacing) = saved
+
+        return {
+            "per_run_2": per_run_2,
+            "per_run_4": per_run_4,
+            "by_distance_40mm": wide,
+            "by_distance_20mm": narrow,
+            "when_switched_off": off,
+            "checks": {
+                "doubling_the_count_doubles_the_marks":
+                    per_run_4 == per_run_2 * 2,
+                "halving_the_spacing_adds_marks": narrow > wide,
+                # The two modes must not be the same code path.
+                "the_modes_differ": wide != per_run_2,
+                "the_toggle_removes_them": off == 0,
+                "marks_were_produced": per_run_2 > 0,
+            },
+        }
+    finally:
+        bm.free()
+
+
+def test_relief_cuts_are_off_by_default():
+    """Relief cuts remove material and most panel work does not want them.
+
+    They were on by default and described as the alignment feature, which was
+    two mistakes at once: a maker following the sheet would have cut wedges
+    out of edges that wanted an ink mark. The code is kept -- a tight compound
+    curve can genuinely need one -- but it is now opt-in and named so it
+    cannot be mistaken for Alignment Ticks.
+    """
+    settings = _settings()
+    prop = settings.bl_rna.properties.get("show_darts")
+    return {
+        "default": prop.default if prop else None,
+        "ui_name": prop.name if prop else None,
+        "description_mentions_alignment":
+            bool(prop) and "alignment" in prop.description.lower(),
+        "checks": {
+            "off_by_default": prop is not None and prop.default is False,
+            "renamed_away_from_dart": bool(prop) and "Relief" in prop.name,
+            # The description has to point at the real feature, or the next
+            # person makes the same mistake.
+            "points_at_the_alignment_feature":
+                bool(prop) and "alignment" in prop.description.lower(),
+        },
+    }
+
+
 TESTS = (
     test_the_cube_fixture_is_what_we_think,
     test_the_sheet_reproduces_the_uv_layout,
@@ -624,6 +799,9 @@ TESTS = (
     test_a_crescent_piece_gets_its_number_inside,
     test_island_fill_colours_are_distinct_and_toggleable,
     test_the_scale_ruler_is_in_real_millimetres,
+    test_alignment_ticks_are_paired_across_every_seam,
+    test_tick_spacing_responds_to_both_modes,
+    test_relief_cuts_are_off_by_default,
 )
 
 result = {}

@@ -229,6 +229,153 @@ def _boundary_angle_deg(run_a, run_b):
     return None
 
 
+def _edge_canonical_start(edge):
+    """The end of `edge` that both its faces agree to measure from.
+
+    `edge.verts[0]` is arbitrary and does not survive a rebuild (see
+    foam_gp_pattern._edge_ends and
+    RESEARCH_theta_seam_edge_nondeterminism.md), and here it matters for a
+    second reason: a tick has to land at the *same* point when measured from
+    either of the two faces sharing the seam, or the two pieces carry marks
+    that do not line up -- which is the one thing an alignment mark must not
+    do. Ordering by coordinate gives both sides the same answer.
+    """
+    a, b = edge.verts[0], edge.verts[1]
+    ac, bc = a.co, b.co
+    return a if (ac.x, ac.y, ac.z) <= (bc.x, bc.y, bc.z) else b
+
+
+def _run_tick_params(run, settings):
+    """Where this run wants its ticks, as (edge, t) on the 3D mesh.
+
+    `t` runs from the edge's canonical start, so the two faces sharing the
+    edge derive the same point from it.
+
+    Spacing is the maker's call, and the two sensible answers disagree: a
+    fixed count per run keeps the marks tied to the passes actually being
+    cut, while a fixed distance keeps them evenly spread on the foam when
+    runs differ wildly in length. Both are offered rather than guessed at.
+    """
+    edges = []
+    total = 0.0
+    for loop in run.loops:
+        edge = loop.edge
+        length = edge.calc_length()
+        if length <= 1e-9:
+            continue
+        edges.append((edge, loop, length, total))
+        total += length
+    if total <= 1e-9 or not edges:
+        return []
+
+    if settings.tick_mode == 'BY_DISTANCE':
+        step = max(float(settings.tick_spacing), 1e-4)
+        # Offset by half a step so a mark never lands exactly on a run end,
+        # where it would collide with the corner tick and with its neighbour
+        # run's first mark.
+        distances = []
+        d = step * 0.5
+        while d < total:
+            distances.append(d)
+            d += step
+        if not distances:
+            distances = [total * 0.5]
+    else:
+        count = max(1, int(settings.ticks_per_run))
+        distances = [total * (i + 1) / (count + 1) for i in range(count)]
+
+    out = []
+    for d in distances:
+        for edge, loop, length, start in edges:
+            if d <= start + length or edge is edges[-1][0]:
+                local = (d - start) / length
+                local = max(0.0, min(1.0, local))
+                # Express it from the edge's canonical end.
+                t = local if loop.vert is _edge_canonical_start(edge) \
+                    else 1.0 - local
+                out.append((edge, round(t, 6)))
+                break
+    return out
+
+
+def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
+                     tick_length_mm, font_mm):
+    """Tick marks on every seam, drawn on both pieces that share it.
+
+    Built in two passes, and the split is the whole point.
+
+    First the positions are decided on the *3D mesh* -- a set of (edge, t)
+    pairs -- so a tick belongs to the seam rather than to a piece. Then every
+    island that borders that edge draws it, mapping t into its own UVs. Two
+    pieces glued along a seam therefore carry marks at the same place on the
+    foam, which is what makes them registration marks rather than decoration.
+
+    Deciding per island instead would let the two sides disagree: their runs
+    are segmented from their own boundaries and need not break at the same
+    places.
+    """
+    wanted = {}
+    for runs in runs_by_island:
+        for run in runs:
+            for edge, t in _run_tick_params(run, settings):
+                wanted.setdefault(edge, set()).add(t)
+    if not wanted:
+        return [], []
+
+    # A stable index per seam, so "tick 3" means the same mark on both of
+    # its pieces when the numbers are switched on.
+    numbering = {}
+    for edge, params in wanted.items():
+        for order, t in enumerate(sorted(params)):
+            numbering[(edge, t)] = order + 1
+
+    lines, labels = [], []
+    for isl in islands:
+        for cycle in isl.cycles:
+            for loop in cycle:
+                edge = loop.edge
+                params = wanted.get(edge)
+                if not params:
+                    continue
+                uv_a = loop[uv_layer].uv
+                uv_b = loop.link_loop_next[uv_layer].uv
+                start_vert = _edge_canonical_start(edge)
+                # The face this loop belongs to is inside the island by
+                # definition, so its own centre is a locally correct "in".
+                # An island centroid is not: on a ring it sits in the hole.
+                face_uvs = [l[uv_layer].uv for l in loop.face.loops]
+                face_c = Vector((
+                    sum(p.x for p in face_uvs) / len(face_uvs),
+                    sum(p.y for p in face_uvs) / len(face_uvs)))
+                face_pt = isl.to_sheet(face_c)
+
+                for t in sorted(params):
+                    local = t if loop.vert is start_vert else 1.0 - t
+                    uv = uv_a + (uv_b - uv_a) * local
+                    point = isl.to_sheet(uv)
+                    tangent = _boundary_tangent(isl.to_sheet(uv_a), point)
+                    if tangent.length < 1e-9:
+                        continue
+                    inward = _inward_normal(tangent, point, face_pt)
+                    # Mostly inward. The outward half of a mark drawn across
+                    # the line is cut away with the waste, so it would be ink
+                    # spent on nothing; a short tail is kept so the mark is
+                    # visibly a crossing and not a scratch.
+                    tip = point + inward * tick_length_mm
+                    tail = point - inward * (tick_length_mm * 0.25)
+                    lines.append(
+                        f'<line x1="{_fmt(tail.x)}" y1="{_fmt(tail.y)}" '
+                        f'x2="{_fmt(tip.x)}" y2="{_fmt(tip.y)}"/>')
+                    if settings.tick_numbers:
+                        at = point + inward * (tick_length_mm * 1.45)
+                        labels.append(
+                            f'<text x="{_fmt(at.x)}" y="{_fmt(at.y)}" '
+                            f'font-size="{_fmt(font_mm)}">'
+                            f'{numbering[(edge, t)]}</text>')
+    return lines, labels
+
+
+
 def _rgb_to_hex(r, g, b):
     return "#%02x%02x%02x" % (int(max(0.0, min(1.0, r)) * 255),
                               int(max(0.0, min(1.0, g)) * 255),
@@ -327,6 +474,7 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
 
     outlines, darts, ticks, angles, numbers, heatform = [], [], [], [], [], []
     fills = []
+    align, align_labels = [], []
 
     for isl in islands:
         # --- outlines: one polygon per boundary cycle (an island with a hole
@@ -464,6 +612,11 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
                     pts_str = " ".join(f"{_fmt(p.x)},{_fmt(p.y)}" for p in (p1, p2, p3, p4))
                     darts.append(f'<polygon points="{pts_str}"/>')
 
+    if settings.show_align_ticks:
+        align, align_labels = _alignment_ticks(
+            islands, uv_layer, runs_by_island, settings,
+            tick_length_mm * 1.1, angle_font_mm * 0.7)
+
     def group(gid, css_class, elements):
         body = "\n".join(elements)
         return f'<g id="{gid}" class="{css_class}">\n{body}\n</g>'
@@ -478,6 +631,9 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
         f"stroke-width:{_fmt(stroke_mm)};}}"
         f"#darts polygon{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.7)};}}"
         f"#ticks line{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.7)};}}"
+        f"#align line{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.9)};}}"
+        "#alignlabels text{font-family:sans-serif;text-anchor:middle;"
+        "dominant-baseline:middle;fill:#000;}"
         "#numbers text{text-anchor:middle;dominant-baseline:middle;fill:#000;}"
         "#fills path{stroke:none;}"
         f"#ruler line{{stroke:#000;stroke-width:0.3;}}"
@@ -502,6 +658,8 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
         group("outlines", "outlines", outlines),
         group("darts", "darts", darts),
         group("ticks", "ticks", ticks),
+        group("align", "align", align),
+        group("alignlabels", "alignlabels", align_labels),
         group("angles", "angles", angles),
         group("numbers", "numbers", numbers),
         group("heatform", "heatform", heatform),
