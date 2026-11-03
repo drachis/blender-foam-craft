@@ -1,9 +1,0 @@
-[submodule "blender_mcp"]
-	path = blender_mcp
-	url = https://projects.blender.org/lab/blender_mcp.git
-[submodule "blender"]
-	path = blender
-	url = https://projects.blender.org/blender/blender.git
-[submodule "blender_python_reference_5_2"]
-	path = blender_python_reference_5_2
-	url = .\\blender_python_reference_5_2\\

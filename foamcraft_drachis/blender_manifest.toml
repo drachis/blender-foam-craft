@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "foamcraft_drachis"
-version = "0.1.0"
+version = "0.2.0"
 name = "FoamCraft"
 tagline = "Bevel angles, darts and cut patterns for foam panels"
 maintainer = "Toli <drachis@gmail.com>"
