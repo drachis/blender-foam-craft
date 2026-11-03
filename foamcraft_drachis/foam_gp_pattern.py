@@ -167,6 +167,43 @@ def _shared_vert(face_a, face_b):
     return None
 
 
+def _edge_ends(edge):
+    """The edge's two vertices in an order that depends only on where they are.
+
+    `edge.verts[0]` is not a landmark. Blender promises nothing about which
+    end comes first, and a rebuild of the same mesh moves it: building one UV
+    sphere three times gives identical vertex coordinates and an identical set
+    of edges, with 670 to 678 of its 9120 edges having their two vertices
+    swapped (the primitive ends in a remove_doubles weld, and a weld does not
+    order its output).
+
+    Anything measured from `verts[0]` therefore measures from an arbitrary
+    end. A cut factor comes back as `1 - f` on the flipped edges, and the
+    position interpolated back from it differs in the last bits, because
+    `a + t * (b - a)` and `b + (1 - t) * (a - b)` are not bit-identical. That
+    is enough to tip the `<= weld` test that decides whether two nearly
+    coincident cut points become one graph vertex -- so the same mesh cut
+    twice produced a different number of seam edges. See
+    RESEARCH_theta_seam_edge_nondeterminism.md.
+
+    Ordered by coordinate rather than by vertex index, deliberately. The
+    stronger property is the one worth having: two meshes that are
+    *geometrically* identical cut identically, whatever their vertex
+    numbering. Ordering by index would only give the same cut for the same
+    numbering, which is weaker and still lets a re-import change someone's
+    pattern.
+
+    Comparison is exact, on float values that are already fixed, so it is
+    deterministic. Two vertices at the same coordinate would tie, but that is
+    a zero-length edge, which the callers already reject on length.
+    """
+    a, b = edge.verts[0], edge.verts[1]
+    ac, bc = a.co, b.co
+    if (ac.x, ac.y, ac.z) <= (bc.x, bc.y, bc.z):
+        return a, b
+    return b, a
+
+
 def _crossing_on_edge(edge, p_from, p_to):
     """Where the stroke segment crosses this edge, as a factor along it.
 
@@ -176,7 +213,8 @@ def _crossing_on_edge(edge, p_from, p_to):
     taken from the point on the edge and clamped, because a crossing outside the
     edge's own span is not on this edge at all.
     """
-    a, b = edge.verts[0].co, edge.verts[1].co
+    end_a, end_b = _edge_ends(edge)
+    a, b = end_a.co, end_b.co
     hit = intersect_line_line(p_from, p_to, a, b)
     if hit is None:
         # Exactly parallel. Fall back to the midpoint of the stroke segment
@@ -275,7 +313,8 @@ def _classify(bm, bvh, points):
             hit["kind"], hit["elem"] = VERT, near_vert
         else:
             for edge in face.edges:
-                a, b = edge.verts[0].co, edge.verts[1].co
+                end_a, end_b = _edge_ends(edge)
+                a, b = end_a.co, end_b.co
                 span = b - a
                 denom = span.length_squared
                 if denom < 1e-18:
@@ -410,7 +449,8 @@ def _crossings_along(face_from, face_to, p_from, p_to, weld, bm, bvh):
         for edge in face.edges:
             if edge in found:
                 continue
-            a, b = edge.verts[0].co, edge.verts[1].co
+            end_a, end_b = _edge_ends(edge)
+            a, b = end_a.co, end_b.co
             meeting = intersect_line_line(p_from, p_to, a, b)
             if meeting is None:
                 continue
@@ -434,13 +474,35 @@ def _crossings_along(face_from, face_to, p_from, p_to, weld, bm, bvh):
     if not found:
         return None
 
-    ordered = sorted((along, fac, edge) for edge, (along, fac) in found.items())
+    # Sorted on a key that is entirely geometric, never on the edge object.
+    #
+    # This read `sorted((along, fac, edge) ...)`, which works only while no
+    # two entries agree on both numbers: Python then falls through to
+    # comparing the third element, and BMEdge has no `<`, so it raises
+    # TypeError. That was always reachable and simply rare -- two edges
+    # crossed at the same point along the stroke and at the same factor. It
+    # started happening once the factor was canonicalised, because two
+    # crossings that previously differed in their last bits now agree
+    # exactly.
+    #
+    # The tie-break is the canonical endpoints' coordinates, so it is a total
+    # order, it never touches the edge's identity, and two geometrically
+    # identical meshes break the tie the same way.
+    def _order_key(item):
+        edge, (along, fac) = item
+        end_a, end_b = _edge_ends(edge)
+        return (along, fac,
+                end_a.co.x, end_a.co.y, end_a.co.z,
+                end_b.co.x, end_b.co.y, end_b.co.z)
+
+    ordered = [(along, fac, edge)
+               for edge, (along, fac) in sorted(found.items(), key=_order_key)]
 
     # A crossing that lands on an edge's own end is really a vertex hit, and
     # saying so keeps the cut off a zero-length sliver beside the corner.
     out, used_verts = [], set()
     for along, fac, edge in ordered:
-        a, b = edge.verts[0], edge.verts[1]
+        a, b = _edge_ends(edge)
         length = (b.co - a.co).length
         vert = None
         if fac * length <= weld:
@@ -519,7 +581,8 @@ def _bridge(hits, stats, bm, bvh):
         if edge is not None:
             tally("shared_edge")
             fac = _crossing_on_edge(edge, previous["loc"], hit["loc"])
-            a, b = edge.verts[0].co, edge.verts[1].co
+            end_a, end_b = _edge_ends(edge)
+            a, b = end_a.co, end_b.co
             out.append({"kind": EDGE, "elem": edge, "fac": fac,
                         "loc": a + (b - a) * fac,
                         "face": previous["face"]})
@@ -592,7 +655,7 @@ def _realise_on_edge(edge, targets, weld):
     """
     found = {}
     segment = edge
-    base, far = edge.verts[0], edge.verts[1]
+    base, far = _edge_ends(edge)
     total = (far.co - base.co).length
     done = 0.0                      # where `base` now sits along the original
     for index, fac in targets:
