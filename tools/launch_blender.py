@@ -17,6 +17,7 @@ import argparse
 import os
 import shutil
 import socket
+import tempfile
 import subprocess
 import sys
 import time
@@ -78,10 +79,99 @@ def blender_executable():
     raise SystemExit("Could not find blender. Put it on PATH.")
 
 
+# Kept in step with tools/sandbox_guard.ENV_MARKER by this import rather than
+# by a second literal, so the two can never drift apart and silently disarm
+# the guard.
+try:
+    from sandbox_guard import ENV_MARKER as SANDBOX_ENV
+except ImportError:  # running from another directory
+    SANDBOX_ENV = "FOAMCRAFT_TEST_INSTANCE"
+
+
+def _pidfile(port):
+    """Where the PID of the instance on `port` is recorded.
+
+    In the system temp directory rather than the repo, because it is runtime
+    state and must not be committed or shipped.
+    """
+    return os.path.join(tempfile.gettempdir(), "foamcraft_port_%d.pid" % port)
+
+
+def _record_pid(port, pid):
+    try:
+        with open(_pidfile(port), "w", encoding="utf-8") as f:
+            f.write(str(pid))
+    except OSError:
+        pass  # netstat fallback still applies
+
+
+def _recorded_pid(port):
+    """The PID this launcher recorded for `port`, if it is still a blender."""
+    try:
+        with open(_pidfile(port), encoding="utf-8") as f:
+            pid = f.read().strip()
+    except OSError:
+        return None
+    if not pid.isdigit():
+        return None
+    return pid if _is_blender(pid) else None
+
+
+def _is_blender(pid):
+    """True when `pid` is a live blender.exe.
+
+    Checked before anything is killed, so a recycled PID now belonging to
+    something else is never terminated.
+    """
+    try:
+        listing = subprocess.run(
+            ["tasklist", "/FI", "PID eq %s" % pid, "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "blender.exe" in listing.lower()
+
+
+def _forget_pid(port):
+    try:
+        os.remove(_pidfile(port))
+    except OSError:
+        pass
+
+
 def port_open(port, host="localhost"):
     with socket.socket() as probe:
         probe.settimeout(0.4)
         return probe.connect_ex((host, port)) == 0
+
+
+def _marker_on_port(port):
+    """The FOAMCRAFT_TEST_INSTANCE value of the Blender on `port`, or None.
+
+    Asks over the MCP bridge, because that is the only channel that reaches
+    *inside* the process -- and it is the process's own environment that says
+    who started it. Anything that fails (no bridge, a different protocol on
+    the port, a timeout) returns None and is therefore treated as somebody
+    else's, which is the safe direction.
+    """
+    try:
+        from blender_bridge import execute
+    except Exception:
+        return None
+    code = ("import os\n"
+            "result = {'marker': os.environ.get('FOAMCRAFT_TEST_INSTANCE')}\n")
+    try:
+        # Unguarded on purpose: this *is* the ownership handshake, and
+        # reading an environment variable cannot change anything.
+        out = execute(code, port=port, timeout=10, require_sandbox=False)
+    except Exception:
+        return None
+    # The bridge returns the whole envelope: {"status", "result", "stdout",
+    # "stderr"}. Anything other than a clean ok counts as "cannot prove it",
+    # which is the safe answer.
+    if isinstance(out, dict) and out.get("status") == "ok":
+        return (out.get("result") or {}).get("marker")
+    return None
 
 
 def wait_for_port(port, timeout=90):
@@ -94,26 +184,82 @@ def wait_for_port(port, timeout=90):
 
 
 def _pid_on_port(port):
-    """PID listening on `port`, or None. Used because a background Blender sits
-    in a blocking serve loop and ignores wm.quit_blender()."""
+    """PID owning `port`, or None.
+
+    Needed because a background Blender sits in a blocking serve loop and
+    ignores wm.quit_blender(), so the process has to be terminated.
+
+    The LISTENING row is not a reliable place to read the PID. Measured
+    2026-11-03 on a live instance:
+
+        TCP  127.0.0.1:9920  0.0.0.0:0        CLOSED       35088
+        TCP  127.0.0.1:9920  127.0.0.1:0      LISTENING    0
+
+    The listener reported PID 0 while the real owner appeared on a CLOSED
+    row. Taking the LISTENING row therefore returned "0", `taskkill /PID 0`
+    failed quietly, and stop() reported "still listening" and gave up -- which
+    is why a full run left 25 Blender windows open.
+
+    So: gather every PID mentioned for this local port, discard 0, and prefer
+    one that is actually a blender.exe. Checking the image name is what makes
+    this safe to hand to taskkill.
+    """
     try:
         out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
                              text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return None
+
+    candidates = []
+    recorded = _recorded_pid(port)
+    if recorded:
+        candidates.append(recorded)
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) >= 5 and parts[3].upper() == "LISTENING" \
-                and parts[1].endswith(f":{port}"):
-            return parts[4]
+        if len(parts) >= 5 and parts[1].endswith(f":{port}"):
+            pid = parts[-1]
+            if pid.isdigit() and pid != "0" and pid not in candidates:
+                candidates.append(pid)
+    if not candidates:
+        return None
+
+    # Prefer a blender.exe, so a recycled PID belonging to something else is
+    # never handed to taskkill.
+    try:
+        listing = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq blender.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        listing = ""
+    blender_pids = set()
+    for row in listing.splitlines():
+        cells = [c.strip('" ') for c in row.split('","')]
+        if len(cells) >= 2 and cells[1].isdigit():
+            blender_pids.add(cells[1])
+
+    for pid in candidates:
+        if pid in blender_pids:
+            return pid
     return None
 
 
 def stop(port):
-    """Shut down the instance on `port`, window and process included."""
+    """Shut down the instance on `port`, window and process included.
+
+    Only ours. This function quits Blender and then force-kills the process,
+    so pointed at the wrong port it closes somebody's session and discards
+    whatever was unsaved in it. run_tests.py calls it on every port it is
+    about to use, which is how a shared port turns into lost work.
+    """
     if not port_open(port):
         print(f"nothing listening on {port}")
         return 0
+
+    if _marker_on_port(port) is None:
+        print(f"REFUSING to stop port {port}: the instance there was not "
+              f"started by this launcher, so quitting it could discard "
+              f"somebody's unsaved work.", file=sys.stderr)
+        return 2
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from blender_bridge import execute
@@ -133,9 +279,19 @@ def stop(port):
                            capture_output=True, timeout=20)
             time.sleep(1.0)
 
-    print(f"stopped instance on {port}" if not port_open(port)
-          else f"instance on {port} still listening")
-    return 0
+    # The port can linger in TIME_WAIT after the process is gone, so judge by
+    # the process, not the socket -- otherwise a clean stop reports failure
+    # and a failed one can hide behind a draining socket.
+    pid_now = _recorded_pid(port) or _pid_on_port(port)
+    if pid_now is None:
+        _forget_pid(port)
+        print(f"stopped instance on {port}")
+        return 0
+
+    print(f"FAILED to stop instance on {port}: process {pid_now} is still "
+          f"running. It will keep a Blender window open; close it by hand or "
+          f"run: taskkill /PID {pid_now} /F", file=sys.stderr)
+    return 1
 
 
 def main():
@@ -151,7 +307,28 @@ def main():
         return stop(args.port)
 
     if port_open(args.port):
-        print(f"port {args.port} already serving; reusing it")
+        # Something is listening. port_open is a bare TCP connect and cannot
+        # tell this suite's Blender from anyone else's, so ask the instance to
+        # prove it was started by us before handing tests to it.
+        #
+        # On 2026-11-03 this branch printed "reusing it" for a user's own
+        # Blender, which had the MCP add-on on the same port. The tests then
+        # cleared their scene -- see tools/sandbox_guard.py for the full
+        # account. Adopting an unknown process was never safe; it only looked
+        # safe because the ports usually happened to be ours.
+        owner = _marker_on_port(args.port)
+        if owner is None:
+            print(
+                f"REFUSING to use port {args.port}: something is listening "
+                f"there, but it was not started by this launcher.\n"
+                f"  It is most likely a Blender someone is working in. The "
+                f"tests clear the scene, so using it could destroy their "
+                f"work.\n"
+                f"  Pick a free port, or close that instance first:\n"
+                f"      python tools/launch_blender.py --port {args.port + 1}",
+                file=sys.stderr)
+            return 2
+        print(f"port {args.port} already serving this suite; reusing it")
         return 0
 
     exe = blender_executable()
@@ -176,8 +353,20 @@ def main():
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 4          # SW_SHOWNOACTIVATE
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     startupinfo=startupinfo)
+    # The child's own environment is what proves it is disposable. An
+    # environment variable rather than a scene property or a driver-namespace
+    # entry because it belongs to the process: it survives read_homefile, file
+    # loads and add-on reloads, and a user's Blender cannot pick it up by
+    # accident. tools/sandbox_guard.py reads it before anything destructive.
+    env = dict(os.environ)
+    env[SANDBOX_ENV] = str(args.port)
+    child = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             startupinfo=startupinfo, env=env)
+    # Written down rather than rediscovered later: netstat's LISTENING row
+    # intermittently reports PID 0, and a stop that cannot find the process
+    # leaves a window open.
+    _record_pid(args.port, child.pid)
     if wait_for_port(args.port):
         print(f"blender serving on port {args.port} ({'gui' if args.gui else 'headless'})")
         return 0

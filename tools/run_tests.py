@@ -64,6 +64,9 @@ import blender_bridge  # noqa: E402
 # it -- so check this tuple whenever tests/ gains a file.
 TEST_FILES = (
     # First, because it is the one that says whether the rest can be believed.
+    # First of all, because it is what stops this suite destroying
+    # someone's work. If the guard is broken, nothing else should run.
+    "tests/test_sandbox_guard.py",
     "tests/test_determinism.py",
     # Second, because everything else is built on this primitive.
     "tests/test_edgenet_cut.py",
@@ -95,6 +98,33 @@ def _unlisted_test_files():
 LAUNCHER = ROOT / "tools" / "launch_blender.py"
 
 
+def _port_free(port):
+    """True when nothing at all is listening on `port`."""
+    import socket
+    with socket.socket() as probe:
+        probe.settimeout(0.3)
+        return probe.connect_ex(("localhost", port)) != 0
+
+
+def free_ports(start, count):
+    """`count` ports nobody is listening on, searching upward from `start`.
+
+    The suite used to take start, start+1, start+2 ... unconditionally. When
+    one of those happened to be a Blender somebody was working in, the runner
+    stopped it and started its own there -- which on 2026-11-03 discarded a
+    user's unsaved sculpt. Ports in use belong to someone; step over them.
+    """
+    found, port, ceiling = [], start, start + 400
+    while len(found) < count and port < ceiling:
+        if _port_free(port):
+            found.append(port)
+        port += 1
+    if len(found) < count:
+        raise SystemExit(
+            "could not find %d free ports from %d upward" % (count, start))
+    return found
+
+
 def serving(port):
     try:
         blender_bridge.execute("result = {'ok': True}", port=port)
@@ -112,9 +142,23 @@ def start(port, gui):
 
 
 def stop(port):
-    subprocess.run([sys.executable, str(LAUNCHER), "--port", str(port),
-                    "--stop"], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Stop the instance on `port`, and say so when it did not work.
+
+    stderr used to go to DEVNULL. A run that failed to stop all 13 of its
+    instances therefore looked exactly like a clean one, and the windows piled
+    up until someone noticed the taskbar.
+    """
+    proc = subprocess.run([sys.executable, str(LAUNCHER), "--port", str(port),
+                           "--stop"], check=False,
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr or
+                         "failed to stop instance on %d\n" % port)
+        _LEAKED.append(port)
+    return proc.returncode
+
+
+_LEAKED = []
 
 
 def run_file(path, port):
@@ -191,10 +235,12 @@ def main():
         if started and not args.keep:
             stop(args.port)
     else:
+        # Chosen up front, skipping anything already listening, so the suite
+        # never stops or starts on a port that belongs to someone else.
+        ports = free_ports(args.port, len(files))
         for index, path in enumerate(files):
-            port = args.port + index
+            port = ports[index]
             print("\n=== %s   (fresh blender on %d)" % (path, port))
-            stop(port)                 # in case one was left behind
             start(port, args.gui)
             try:
                 counted, failed = report_on(path, run_file(path, port))
@@ -205,6 +251,12 @@ def main():
 
     print("\n%d test(s), %d failure(s) in %.0fs"
           % (total, failures, time.time() - started_at))
+
+    if _LEAKED:
+        print("\nWARNING: %d Blender instance(s) could not be stopped and are "
+              "still running: %s" % (_LEAKED.__len__(),
+                                     ", ".join(str(p) for p in _LEAKED)),
+              file=sys.stderr)
 
     # Say so loudly rather than quietly running a subset. A suite that reports
     # green while three of its files were never listed is worse than a red one.

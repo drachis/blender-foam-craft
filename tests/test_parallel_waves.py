@@ -40,6 +40,8 @@ from mathutils import Vector
 
 sys.path.insert(0, r"O:\Work\BlenderPlugin\FoamCraft\tools")
 
+import sandbox_guard  # noqa: E402  (guards every _clear below)
+
 _MOD = "bl_ext.user_default.foamcraft_drachis"
 for _name in [n for n in list(sys.modules) if n.startswith(_MOD)]:
     del sys.modules[_name]
@@ -73,10 +75,14 @@ _SAMPLES = 241
 
 
 def _clear():
-    if bpy.context.object and bpy.context.object.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-    bpy.ops.object.select_all(action='SELECT')
-    bpy.ops.object.delete(use_global=False)
+    """Empty the scene -- but only in a Blender this suite started.
+
+    Delegates to tools/sandbox_guard, which refuses when the session cannot
+    prove it is disposable. On 2026-11-03 this function, called directly,
+    deleted a user's unsaved sculpt after the launcher adopted their Blender
+    off a shared port. The guard is the thing that stops that repeating.
+    """
+    sandbox_guard.clear_scene()
 
 
 def _plane(cuts=23):

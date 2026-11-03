@@ -64,19 +64,24 @@ def _shot(label, show_seams_on=None):
     return capture_cut(show_seams_on, "test_%s" % label)
 
 
-def _clear():
-    """Empty the scene *and* the orphaned data behind it.
+# Scene clearing goes through the guard, which refuses in a Blender this
+# suite did not start. Imported here, self-contained, because these files set
+# sys.path several different ways and the protection must not depend on which.
+_GUARD_TOOLS = r"O:\Work\BlenderPlugin\FoamCraft\tools"
+if _GUARD_TOOLS not in sys.path:
+    sys.path.insert(0, _GUARD_TOOLS)
+import sandbox_guard  # noqa: E402
 
-    Deleting objects is not enough. Their meshes and Grease Pencil data linger
-    with no users, so the next `Sculpt` becomes `Sculpt.001` and the bake's
-    lookup for `Sculpt_Pattern` finds a copy left by an earlier test. That made
-    these tests pass alone and fail when run after the others -- inherited state
-    has produced wrong numbers in this project more than once.
+
+def _clear():
+    """Empty the scene -- but only in a Blender this suite started.
+
+    Delegates to tools/sandbox_guard, which refuses when the session cannot
+    prove it is disposable. On 2026-11-03 this function, called directly,
+    deleted a user's unsaved sculpt after the launcher adopted their own
+    Blender off a shared port. The guard is what stops that repeating.
     """
-    if bpy.context.object and bpy.context.object.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-    bpy.ops.object.select_all(action='SELECT')
-    bpy.ops.object.delete(use_global=False)
+    sandbox_guard.clear_scene()
     settings = getattr(bpy.context.scene, "foamcraft_drachis", None)
     if settings is not None:
         settings.gp_object = None
