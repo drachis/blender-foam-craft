@@ -864,6 +864,248 @@ def test_an_annulus_is_not_mistaken_for_its_own_hole():
     }
 
 
+
+def _gore_sphere(gores=6, segments=24, rings=16, radius=0.15):
+    """A sphere peeled into pole-to-pole gores.
+
+    The shape the reference prop is built from, and the right fixture for
+    alignment marks: a gore's two long seams are what gets registered against
+    its neighbours. Latitude bands are not -- their seams are closed rings,
+    and a ring never runs out of seam to space marks along.
+    """
+    import math as _m
+    _clear()
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, segments=segments,
+                                         ring_count=rings)
+    obj = bpy.context.object
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    step = 2.0 * _m.pi / gores
+
+    def _phi(v):
+        if abs(v.co.x) < 1e-9 and abs(v.co.y) < 1e-9:
+            return None
+        return _m.atan2(v.co.y, v.co.x) % (2.0 * _m.pi)
+
+    for e in bm.edges:
+        a, b = e.verts
+        if abs(a.co.z - b.co.z) < 1e-9:
+            continue
+        pa, pb = _phi(a), _phi(b)
+        phi = pa if pa is not None else pb
+        if phi is None:
+            continue
+        if pa is not None and pb is not None:
+            if min(abs(pa - pb), 2 * _m.pi - abs(pa - pb)) > 1e-6:
+                continue
+        if abs(phi - round(phi / step) * step) < 1e-6:
+            e.seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.04)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return obj
+
+
+def test_by_distance_puts_a_mark_every_n_units_of_seam():
+    """The setting says every N units of seam, so it must mean the seam.
+
+    It did not. Spacing was measured per cut run and restarted at every run
+    boundary, so a run shorter than one step still got a mark at its middle
+    and the gaps came out wherever the bevel angle happened to change. Asking
+    for 30 mm and getting 12, 30, 9, 30 is not what the control says.
+
+    Now the marks are walked along the seam -- the chain of shared 3D edges
+    that two pieces are taped along -- which is the thing whose length the
+    maker cares about. Checked by reconstructing each mark's distance along
+    its chain and taking the gaps: on a 6-gore sphere every chain is a
+    470.5 mm meridian, and at 30 mm every single gap must be 30 mm.
+    """
+    obj = _gore_sphere()
+    bm = _bmesh_of(obj)
+    try:
+        uv_layer = bm.loops.layers.uv.active
+        settings = _settings()
+        saved = (settings.tick_mode, settings.tick_spacing)
+        spacing = 0.030
+        try:
+            settings.tick_mode = 'BY_DISTANCE'
+            settings.tick_spacing = spacing
+            islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
+            sheet = fx._Sheet(islands_faces, uv_layer, 1.0)
+            islands = [fx._Island(i, f, uv_layer, sheet)
+                       for i, f in enumerate(islands_faces)]
+            chains = fx._seam_chains(islands)
+            params = fx._seam_tick_params(islands, settings)
+        finally:
+            settings.tick_mode, settings.tick_spacing = saved
+
+        gaps = []
+        for chain in chains:
+            lengths = [e.calc_length() for e in chain]
+            starts, walked = {}, 0.0
+            for idx, e in enumerate(chain):
+                starts[e.index] = (walked, idx)
+                walked += lengths[idx]
+            positions = []
+            for edge, t in params:
+                if edge.index not in starts:
+                    continue
+                start_at, idx = starts[edge.index]
+                entry = fx.chain_direction_start(chain, idx)
+                canon = fx._edge_canonical_start(edge)
+                local = t if entry is canon else 1.0 - t
+                positions.append(start_at + local * lengths[idx])
+            positions.sort()
+            gaps.extend(positions[i + 1] - positions[i]
+                        for i in range(len(positions) - 1))
+
+        chain_mm = sorted({round(sum(e.calc_length() for e in c) * 1000, 1)
+                           for c in chains})
+        gaps_mm = [round(g * 1000, 2) for g in gaps]
+        return {
+            "seam_chains": len(chains),
+            "chain_lengths_mm": chain_mm,
+            "gaps": len(gaps_mm),
+            "gap_min_mm": min(gaps_mm) if gaps_mm else None,
+            "gap_max_mm": max(gaps_mm) if gaps_mm else None,
+            "checks": {
+                # One chain per gore boundary.
+                "six_seam_chains": len(chains) == 6,
+                # Every gap is the requested step, to a hundredth of a mm.
+                "every_gap_is_the_requested_spacing":
+                    bool(gaps_mm)
+                    and abs(min(gaps_mm) - 30.0) < 0.01
+                    and abs(max(gaps_mm) - 30.0) < 0.01,
+                # Both bounds: a single mark per chain would leave no gaps at
+                # all and pass the above vacuously.
+                "there_are_gaps_to_measure": len(gaps_mm) >= 60,
+            },
+        }
+    finally:
+        bm.free()
+
+
+def test_a_dash_is_never_drawn_twice_in_one_place():
+    """One mark on the foam is one dash on the sheet.
+
+    Two runs can reach the same point on a shared edge by slightly different
+    arithmetic and record it as 0.666666 and 0.666667. Keyed on the parameter
+    those are two marks; on a 30 mm edge they are 30 nanometres apart, which
+    is one mark written down twice, and it printed as two dashes on top of
+    each other. Measured on a 6-gore sphere before the fix: 12 such pairs.
+
+    Positions are now merged by distance on the mesh rather than by parameter
+    value. Checked in both modes, because the duplicate appeared in only one
+    of them and a fix that quietly handled just that one would be half a fix.
+    """
+    import collections
+    obj = _gore_sphere()
+    bm = _bmesh_of(obj)
+    try:
+        uv_layer = bm.loops.layers.uv.active
+        settings = _settings()
+        saved = (settings.tick_mode, settings.tick_spacing,
+                 settings.ticks_per_run)
+        rows = {}
+        try:
+            for label, mode in (("by_distance", 'BY_DISTANCE'),
+                                ("per_run", 'PER_RUN')):
+                settings.tick_mode = mode
+                settings.tick_spacing = 0.030
+                settings.ticks_per_run = 2
+                svg = fx.generate_svg(bm, uv_layer, settings, 1.0)
+                g = re.search(r'<g id="align".*?</g>', svg, re.S)
+                lines = re.findall(
+                    r'<line x1="([-\d.]+)" y1="([-\d.]+)" '
+                    r'x2="([-\d.]+)" y2="([-\d.]+)"',
+                    g.group(0) if g else "")
+                counts = collections.Counter(lines)
+                rows[label] = {
+                    "lines": len(lines),
+                    "duplicates": sum(v - 1 for v in counts.values() if v > 1),
+                }
+        finally:
+            (settings.tick_mode, settings.tick_spacing,
+             settings.ticks_per_run) = saved
+
+        out = dict(rows)
+        out["checks"] = {
+            "no_duplicates_by_distance": rows["by_distance"]["duplicates"] == 0,
+            "no_duplicates_per_run": rows["per_run"]["duplicates"] == 0,
+            # Both bounds: zero marks would have zero duplicates.
+            "marks_were_drawn": rows["by_distance"]["lines"] > 0
+            and rows["per_run"]["lines"] > 0,
+        }
+        return out
+    finally:
+        bm.free()
+
+
+
+def test_alignment_ticks_are_a_real_length_not_a_fraction_of_the_sheet():
+    """A pen mark is the same size whatever the pattern it is drawn on.
+
+    Tick length was taken as a permille of the sheet, like the angle text,
+    and that is wrong for this mark in a way that showed up on the foam: it
+    gave a 13 mm tick on an 838 mm sheet, while the gore it was drawn on is
+    only 30 mm wide near its ends. The marks from the piece's two seams then
+    reached across and crossed -- 12 colliding pairs, measured -- and read as
+    doubled ticks.
+
+    Angle text scales because it is a label on a drawing and has to stay
+    readable at any pattern size. A registration mark does not: it is a thing
+    the maker draws on the material with a pen.
+
+    Checked across two sheets of very different size, exactly as the ruler
+    is, because that is the property being claimed.
+    """
+    rows = {}
+    settings = _settings()
+    saved = settings.tick_length
+    try:
+        settings.tick_length = 0.006
+        for label, builder in (("gore_sphere", _gore_sphere),
+                               ("seamed_cube", _seamed_cube)):
+            obj = builder()
+            bm = _bmesh_of(obj)
+            try:
+                uv_layer = bm.loops.layers.uv.active
+                svg = fx.generate_svg(bm, uv_layer, settings, 1.0)
+                g = re.search(r'<g id="align".*?</g>', svg, re.S)
+                body = g.group(0) if g else ""
+                lines = [tuple(map(float, m)) for m in re.findall(
+                    r'<line x1="([-\d.]+)" y1="([-\d.]+)" '
+                    r'x2="([-\d.]+)" y2="([-\d.]+)"', body)]
+                box = re.search(r"viewBox='0 0 ([\d.]+) ([\d.]+)'", svg)
+                lengths = [((c - a) ** 2 + (d - b) ** 2) ** 0.5
+                           for a, b, c, d in lines]
+                rows[label] = {
+                    "sheet_mm": round(float(box.group(1)), 1),
+                    "longest_tick_mm": round(max(lengths), 2) if lengths else 0,
+                    "ticks": len(lines),
+                }
+            finally:
+                bm.free()
+    finally:
+        settings.tick_length = saved
+
+    a, b = rows["gore_sphere"], rows["seamed_cube"]
+    out = dict(rows)
+    out["checks"] = {
+        # 6 mm plus a quarter-length tail on the far side = 7.5 mm.
+        "gore_tick_is_the_requested_length":
+            abs(a["longest_tick_mm"] - 7.5) < 0.1,
+        "cube_tick_is_the_same_length":
+            abs(b["longest_tick_mm"] - 7.5) < 0.1,
+        # Both bounds: the two sheets really are different sizes, so the
+        # equality above means the length is independent of the sheet.
+        "the_sheets_differ_in_size": a["sheet_mm"] != b["sheet_mm"],
+        "ticks_were_drawn": a["ticks"] > 0 and b["ticks"] > 0,
+    }
+    return out
+
+
 TESTS = (
     test_the_cube_fixture_is_what_we_think,
     test_the_sheet_reproduces_the_uv_layout,
@@ -877,6 +1119,9 @@ TESTS = (
     test_the_scale_ruler_is_in_real_millimetres,
     test_alignment_ticks_are_paired_across_every_seam,
     test_tick_spacing_responds_to_both_modes,
+    test_by_distance_puts_a_mark_every_n_units_of_seam,
+    test_a_dash_is_never_drawn_twice_in_one_place,
+    test_alignment_ticks_are_a_real_length_not_a_fraction_of_the_sheet,
     test_relief_cuts_are_off_by_default,
 )
 

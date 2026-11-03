@@ -248,13 +248,14 @@ def _edge_canonical_start(edge):
 def _run_tick_params(run, settings):
     """Where this run wants its ticks, as (edge, t) on the 3D mesh.
 
-    `t` runs from the edge's canonical start, so the two faces sharing the
-    edge derive the same point from it.
+    Per Cut Run only. `t` runs from the edge's canonical start, so the two
+    faces sharing the edge derive the same point from it.
 
-    Spacing is the maker's call, and the two sensible answers disagree: a
-    fixed count per run keeps the marks tied to the passes actually being
-    cut, while a fixed distance keeps them evenly spread on the foam when
-    runs differ wildly in length. Both are offered rather than guessed at.
+    By Distance is not done here, and cannot be: a run is one blade-tilt
+    pass, and restarting the measurement at each run makes the gaps depend on
+    where the bevel happens to change rather than on the foam. Asking for a
+    mark every 30 mm and getting them every 12, 30, 9, 30, 30 is not what the
+    setting says. It walks the seam instead -- see `_seam_tick_params`.
     """
     edges = []
     total = 0.0
@@ -268,21 +269,8 @@ def _run_tick_params(run, settings):
     if total <= 1e-9 or not edges:
         return []
 
-    if settings.tick_mode == 'BY_DISTANCE':
-        step = max(float(settings.tick_spacing), 1e-4)
-        # Offset by half a step so a mark never lands exactly on a run end,
-        # where it would collide with the corner tick and with its neighbour
-        # run's first mark.
-        distances = []
-        d = step * 0.5
-        while d < total:
-            distances.append(d)
-            d += step
-        if not distances:
-            distances = [total * 0.5]
-    else:
-        count = max(1, int(settings.ticks_per_run))
-        distances = [total * (i + 1) / (count + 1) for i in range(count)]
+    count = max(1, int(settings.ticks_per_run))
+    distances = [total * (i + 1) / (count + 1) for i in range(count)]
 
     out = []
     for d in distances:
@@ -296,6 +284,151 @@ def _run_tick_params(run, settings):
                 out.append((edge, round(t, 6)))
                 break
     return out
+
+
+# Two marks closer together than this along a seam are the same mark. A dash
+# is a few millimetres wide, so anything at this range is not a second one.
+TICK_MERGE_M = 0.0005
+
+
+def _remember_tick(wanted, edge, t):
+    """Record a mark at `t` on `edge`, unless one is already there.
+
+    The parameter is merged by *distance on the mesh*, not by its own value.
+    Rounding `t` to six places sounds precise and is not a physical test: on
+    a 30 mm edge it resolves to 30 nanometres, so two runs arriving at the
+    same point by slightly different arithmetic -- 0.666666 and 0.666667 --
+    were kept as two marks and drawn as two dashes on top of each other.
+    Measured on a six-gore sphere: twelve such pairs.
+    """
+    length = edge.calc_length()
+    if length <= 1e-12:
+        return
+    params = wanted.setdefault(edge, [])
+    for existing in params:
+        if abs(existing - t) * length <= TICK_MERGE_M:
+            return
+    params.append(t)
+
+
+def _seam_chains(islands):
+    """The seams, as chains of connected 3D edges.
+
+    A seam is what a maker tapes together, and it is a property of the mesh,
+    not of either piece: the same chain of edges bounds both islands that
+    meet along it. Marks spaced along *this* are evenly spaced on the foam;
+    marks spaced along one island's boundary runs are not, because the runs
+    break wherever the bevel angle changes.
+
+    Chains break at a vertex where more than two boundary edges meet. That is
+    a corner where three or more pieces come together, and carrying a
+    measurement straight through one would be arbitrary -- there is no single
+    "onwards" to continue along.
+    """
+    edges = []
+    seen = set()
+    for isl in islands:
+        for cycle in isl.cycles:
+            for loop in cycle:
+                e = loop.edge
+                if e.index not in seen:
+                    seen.add(e.index)
+                    edges.append(e)
+
+    by_vert = {}
+    for e in edges:
+        for v in e.verts:
+            by_vert.setdefault(v.index, []).append(e)
+
+    chains, used = [], set()
+    def _walk(start_edge, start_vert):
+        chain = [start_edge]
+        used.add(start_edge.index)
+        vert = start_edge.other_vert(start_vert)
+        while vert is not None:
+            nxt = [e for e in by_vert.get(vert.index, ())
+                   if e.index not in used]
+            # Only continue through a plain two-edge join.
+            if len(by_vert.get(vert.index, ())) != 2 or len(nxt) != 1:
+                break
+            edge = nxt[0]
+            chain.append(edge)
+            used.add(edge.index)
+            vert = edge.other_vert(vert)
+        return chain
+
+    # Open chains first, from their loose ends, so a chain that has ends is
+    # not entered in the middle and split into two.
+    for e in edges:
+        if e.index in used:
+            continue
+        for v in e.verts:
+            if len(by_vert.get(v.index, ())) != 2:
+                chains.append(_walk(e, v))
+                break
+    # Whatever is left is a closed loop; any edge will do as a start.
+    for e in edges:
+        if e.index not in used:
+            chains.append(_walk(e, e.verts[0]))
+    return chains
+
+
+def _seam_tick_params(islands, settings):
+    """Marks every `tick_spacing` of real seam, walked continuously.
+
+    Returned as (edge, t) from each edge's canonical start, so both pieces
+    sharing the seam derive the same point and carry the same dash.
+    """
+    step = max(float(settings.tick_spacing), 1e-4)
+    out = []
+    for chain in _seam_chains(islands):
+        lengths = [e.calc_length() for e in chain]
+        total = sum(lengths)
+        if total <= 1e-9:
+            continue
+        # Half a step in from the start, so a chain does not open with a mark
+        # sitting on its own corner.
+        d = step * 0.5
+        if d >= total:
+            # Shorter than one step. One mark in the middle still beats none:
+            # a short seam is exactly where a piece can slip unnoticed.
+            d = total * 0.5
+        walked = 0.0
+        index = 0
+        while d < total and index < len(chain):
+            while index < len(chain) and d > walked + lengths[index]:
+                walked += lengths[index]
+                index += 1
+            if index >= len(chain):
+                break
+            edge = chain[index]
+            local = (d - walked) / lengths[index]
+            start = _edge_canonical_start(edge)
+            # The chain is walked from one end; express the parameter from
+            # the edge's own canonical end so both faces agree on it.
+            if chain_direction_start(chain, index) is not start:
+                local = 1.0 - local
+            out.append((edge, round(max(0.0, min(1.0, local)), 6)))
+            d += step
+    return out
+
+
+def chain_direction_start(chain, index):
+    """Which vertex of `chain[index]` the walk entered it from."""
+    edge = chain[index]
+    if index == 0:
+        if len(chain) == 1:
+            return edge.verts[0]
+        nxt = chain[1]
+        shared = set(edge.verts) & set(nxt.verts)
+        if shared:
+            return edge.other_vert(next(iter(shared)))
+        return edge.verts[0]
+    prev = chain[index - 1]
+    shared = set(edge.verts) & set(prev.verts)
+    if shared:
+        return next(iter(shared))
+    return edge.verts[0]
 
 
 def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
@@ -315,10 +448,14 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
     places.
     """
     wanted = {}
-    for runs in runs_by_island:
-        for run in runs:
-            for edge, t in _run_tick_params(run, settings):
-                wanted.setdefault(edge, set()).add(t)
+    if settings.tick_mode == 'BY_DISTANCE':
+        for edge, t in _seam_tick_params(islands, settings):
+            _remember_tick(wanted, edge, t)
+    else:
+        for runs in runs_by_island:
+            for run in runs:
+                for edge, t in _run_tick_params(run, settings):
+                    _remember_tick(wanted, edge, t)
     if not wanted:
         return [], []
 
@@ -326,11 +463,24 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
     # its pieces when the numbers are switched on.
     numbering = {}
     for edge, params in wanted.items():
-        for order, t in enumerate(sorted(params)):
+        params.sort()
+        for order, t in enumerate(params):
             numbering[(edge, t)] = order + 1
 
     lines, labels = [], []
     for isl in islands:
+        # One dash per piece per mark. An island's boundary can in principle
+        # traverse the same 3D edge twice -- a seam running up to a point and
+        # back down the far side is met from both directions -- and the mark
+        # would then be drawn twice at identical coordinates. Physically it
+        # is one dash on one piece of foam.
+        #
+        # Note this was *not* the cause of the duplicates seen on a six-gore
+        # sphere, though it was the first explanation offered for them. Those
+        # came from two runs recording the same point as 0.666666 and
+        # 0.666667, which `_remember_tick` now merges. The guard is kept for
+        # the case it actually describes, which this fixture does not reach.
+        drawn = set()
         for cycle in isl.cycles:
             for loop in cycle:
                 edge = loop.edge
@@ -350,6 +500,9 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
                 face_pt = isl.to_sheet(face_c)
 
                 for t in sorted(params):
+                    if (edge.index, t) in drawn:
+                        continue
+                    drawn.add((edge.index, t))
                     local = t if loop.vert is start_vert else 1.0 - t
                     uv = uv_a + (uv_b - uv_a) * local
                     point = isl.to_sheet(uv)
@@ -357,17 +510,25 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
                     if tangent.length < 1e-9:
                         continue
                     inward = _inward_normal(tangent, point, face_pt)
+                    # Shorten where the piece cannot take the full mark. The
+                    # face this loop belongs to spans the piece locally, so
+                    # the distance to its centre is a cheap stand-in for how
+                    # much room there is; a gore's tip has very little, and
+                    # two full-length marks facing each other across it meet
+                    # in the middle.
+                    room = (face_pt - point).length
+                    reach = min(tick_length_mm, max(room * 0.6, 0.2))
                     # Mostly inward. The outward half of a mark drawn across
                     # the line is cut away with the waste, so it would be ink
                     # spent on nothing; a short tail is kept so the mark is
                     # visibly a crossing and not a scratch.
-                    tip = point + inward * tick_length_mm
-                    tail = point - inward * (tick_length_mm * 0.25)
+                    tip = point + inward * reach
+                    tail = point - inward * (reach * 0.25)
                     lines.append(
                         f'<line x1="{_fmt(tail.x)}" y1="{_fmt(tail.y)}" '
                         f'x2="{_fmt(tip.x)}" y2="{_fmt(tip.y)}"/>')
                     if settings.tick_numbers:
-                        at = point + inward * (tick_length_mm * 1.45)
+                        at = point + inward * (reach * 1.45)
                         labels.append(
                             f'<text x="{_fmt(at.x)}" y="{_fmt(at.y)}" '
                             f'font-size="{_fmt(font_mm)}">'
@@ -620,9 +781,16 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
                     darts.append(f'<polygon points="{pts_str}"/>')
 
     if settings.show_align_ticks:
+        # A real length, not a fraction of the sheet. The mark is made with a
+        # pen on foam and is the same size whatever the pattern; sizing it
+        # from the sheet gave a 13 mm tick on a 838 mm sheet, which on a gore
+        # only 30 mm wide at the ends meant the marks from its two seams
+        # reached across and crossed each other -- 12 colliding pairs,
+        # measured, and it read as doubled ticks.
         align, align_labels = _alignment_ticks(
             islands, uv_layer, runs_by_island, settings,
-            tick_length_mm * 1.1, angle_font_mm * 0.7)
+            settings.tick_length * scale_length * 1000.0,
+            angle_font_mm * 0.7)
 
     def group(gid, css_class, elements):
         body = "\n".join(elements)

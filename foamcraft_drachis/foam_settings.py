@@ -211,6 +211,16 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         subtype='DISTANCE', unit='LENGTH', precision=4,
         description="Distance along the seam between alignment marks, in real "
                     "units, when spacing By Distance")
+    tick_length: bpy.props.FloatProperty(
+        name="Tick Length", default=0.006, min=0.001, max=0.05,
+        subtype='DISTANCE', unit='LENGTH', precision=4,
+        description="How long each alignment mark is, in real units. A "
+                    "registration mark is drawn on the foam with a pen and "
+                    "is the same size whatever the pattern -- it does not "
+                    "scale with the sheet the way the angle text does. Six "
+                    "millimetres is about what a marker leaves. It is "
+                    "shortened automatically where a piece is too narrow to "
+                    "take it")
     tick_numbers: bpy.props.BoolProperty(
         name="Number The Ticks", default=False,
         description="Print a small index beside each alignment mark, so the "
