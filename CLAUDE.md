@@ -43,11 +43,34 @@ its own port instead, and leave it running for the session:
 
     python tools/launch_blender.py --port 9886 --gui
 
-It opens without taking focus (`SW_SHOWNOACTIVATE`), which is deliberate --
-the suite starts a Blender per test file and each one grabbing the keyboard
-made the machine unusable. Not minimised and not moved off-screen either:
-a window that is not composited does not draw, and then the screenshots
-come back blank.
+**Correction (2026-11-09): an off-screen Blender window draws perfectly.**
+This file used to say the opposite -- "not moved off-screen either: a window
+that is not composited does not draw, and then the screenshots come back
+blank" -- and that is wrong. It may have been true of *minimising*; it is not
+true of *positioning*.
+
+Measured: an instance launched at `--window-geometry 20000 20000 1280 900`
+ran `tests/test_overlay_gui.py` to a full pass. The overlay drew, the capture
+came back with the UV islands, the bracket marks and the piece numbers all
+rendered, and the test's own comparison found 70 changed pixels between
+overlay-on and overlay-off. The capture was looked at, not just counted. The
+godot-game skill records the same for Godot (`--position 20000,20000`), which
+is what prompted re-testing a claim this file had been repeating.
+
+So windowed instances now open off every monitor (`--offscreen`), where they
+can neither take the keyboard nor be clicked on. `SW_SHOWNOACTIVATE` is still
+set, but it was never sufficient on its own -- and the godot-game skill notes
+that asking Windows for a no-activate window through `STARTUPINFO` made focus
+stealing *worse* in that engine, so it is not something to rely on.
+
+**And the suite stops opening windows it does not need.** Only
+`tests/test_overlay_gui.py` requires one, because it compares a capture with
+the overlay on against one with it off; the runner's `GUI_FILES` names it and
+the other fourteen files run headless. That is fifteen interruptions reduced
+to none, and about a minute quicker besides. `--gui-all` forces windows
+everywhere when every screenshot is wanted; the other files each check
+`bpy.app.background` and skip their captures rather than failing, so they are
+still correct either way.
 
 Use it whenever the result is a judgement rather than a number -- overlay
 work, and any change to what a cut *looks like*. A screenshot per case,
@@ -415,6 +438,40 @@ Measured directly in a running session, not inferred from docs.
 - `mathutils.bvhtree.BVHTree.FromObject(obj, depsgraph).find_nearest(pt)` works
   for closest-point reprojection. Note it must break ties arbitrarily for a point
   landing on an edge, where two faces are exactly as near.
+- **What survives rebuilding a BMesh, and what does not** (2026-11-09).
+  Measured on one fixed mesh, read through five fresh `bmesh.new()` +
+  `from_mesh` -- the mesh itself never touched between reads, which is
+  exactly what exporting the same pattern twice does:
+
+  | | stable across five fresh BMeshes? |
+  |---|---|
+  | vertex table order | **yes** |
+  | face table order | **yes** |
+  | `edge.verts[0]` orientation | **yes** |
+  | `vert.link_edges` order | **yes** |
+  | iterating a `set` of verts / faces / loops | **no -- five different orders** |
+  | `set.pop()` sequence | **no -- five different sequences** |
+
+  So the rule is narrower and more useful than "BMesh order is arbitrary".
+  The *tables* are faithful: iterating `bm.faces`, `bm.verts`, `bm.edges` or
+  `v.link_edges` gives the same order every time, and so does reading
+  `edge.verts[0]`. What is arbitrary is **any `set` of BMesh elements**,
+  because Python hashes them by identity and the addresses differ per BMesh.
+
+  That distinction matters when deciding whether a sort is a fix or a
+  disguise. A guard added over a stable ordering is hiding something; a
+  guard over set iteration is load-bearing. Three bugs in this add-on came
+  from the latter, and are covered by `tests/test_reproducible_export.py`:
+  `island_boundary_cycles` seeded a boundary walk from a set (twice), and
+  `boundary_defect_load` seeded a multi-source breadth-first search from
+  one -- where seeding order decides ties, so the same curvature drained to
+  a different edge and relief darts moved.
+
+  Note the asymmetry with the entry below: orientation is stable for a
+  *fixed* mesh and not across a *rebuilt* one. A guard against the latter is
+  cheap and buys reproducibility across a re-import, but it is not what
+  makes two exports of one .blend agree -- say which you are fixing.
+
 - **BMEdge vertex order is not stable across rebuilds of the same mesh.**
   Building the same UV sphere three times gives identical vertex coordinates
   and an identical set of edges, with **670 to 678 of 9120 edges** having

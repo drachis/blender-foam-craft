@@ -371,12 +371,18 @@ def _seam_chains(islands):
                 break
     # Whatever is left is a closed loop. "Any edge will do as a start" is
     # true; any *end* of that edge is not. A closed chain walked from
-    # verts[0] runs one way round or the other depending on an orientation
-    # Blender does not promise, and By Distance measures from the start, so
-    # every mark on that seam moves. Measured: one sheet in a 1422-record
-    # golden run differing between otherwise identical exports, on the
-    # fixture whose seams are closed rings. Third time this project has been
-    # caught reading edge orientation; see _edge_ends in foam_gp_pattern.
+    # verts[0] runs one way round or the other, and By Distance measures
+    # from the start, so every mark on that seam moves with it.
+    #
+    # Scope, measured rather than assumed, because a guard that claims more
+    # than it fixes hides the next bug. Five fresh BMeshes of one *fixed*
+    # mesh give identical edge orientation -- so this is NOT what makes two
+    # exports of one .blend disagree. It is what makes an export disagree
+    # with itself across a *rebuilt* mesh: regenerating the same primitive
+    # flips verts[0] on about 670 of 9120 edges, which is how it surfaced,
+    # as one differing sheet in a 1422-record golden run whose fixtures are
+    # rebuilt each time. Cheap, and it buys reproducibility across a
+    # re-import; it is not load-bearing for the common case.
     for e in edges:
         if e.index not in used:
             chains.append(_walk(e, _edge_canonical_start(e)))

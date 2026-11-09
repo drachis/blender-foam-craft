@@ -300,6 +300,9 @@ def main():
     parser.add_argument("--gui", action="store_true",
                         help="Show a window. Required for draw handlers and screenshots.")
     parser.add_argument("--stop", action="store_true")
+    parser.add_argument("--offscreen", action="store_true",
+                        help="place the window off every monitor, so it "
+                             "cannot take focus or be clicked")
     parser.add_argument("--blend", default=None, help="Optional .blend to open.")
     args = parser.parse_args()
 
@@ -336,6 +339,11 @@ def main():
         cmd = [exe]
         if args.blend:
             cmd.append(args.blend)
+        if args.offscreen:
+            # Put the window where no monitor reaches. The godot-game skill
+            # records that an off-screen window still draws, which is the
+            # opposite of what this project assumed; being tested here.
+            cmd += ["--window-geometry", "20000", "20000", "1280", "900"]
         cmd += ["--python-expr", _GUI_START.format(port=args.port)]
     else:
         cmd = [exe, "--background"]

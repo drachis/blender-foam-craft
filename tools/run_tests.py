@@ -68,6 +68,9 @@ TEST_FILES = (
     # someone's work. If the guard is broken, nothing else should run.
     "tests/test_sandbox_guard.py",
     "tests/test_determinism.py",
+    # The property every other result rests on: one mesh, one
+    # pattern, every time.
+    "tests/test_reproducible_export.py",
     # Second, because everything else is built on this primitive.
     "tests/test_edgenet_cut.py",
     "tests/test_gp_pattern.py",
@@ -84,6 +87,26 @@ TEST_FILES = (
     "tests/test_tile_svg.py",
     "tests/test_overlay_gui.py",
 )
+
+
+# Files that genuinely need a window, and why.
+#
+# A background Blender has no window, so draw handlers never run and
+# screenshots come back blank -- which is why the suite used to start a
+# windowed Blender for every file. But only these need one, and starting
+# fifteen windows to serve one is both slower and, far worse, fifteen
+# chances to steal the keyboard out from under whoever is working on the
+# machine. The rest report numbers and run headless, where they are also
+# quicker to start.
+#
+# Each of the others guards itself: they check `bpy.app.background` and skip
+# their captures rather than failing, so running the whole suite windowed
+# with --gui still works and still writes every screenshot.
+GUI_FILES = frozenset({
+    # Compares a capture of the UV editor with the overlay on against one
+    # with it off; there is nothing to compare without a window.
+    "tests/test_overlay_gui.py",
+})
 
 
 def _unlisted_test_files():
@@ -139,7 +162,11 @@ def serving(port):
 def start(port, gui):
     cmd = [sys.executable, str(LAUNCHER), "--port", str(port)]
     if gui:
-        cmd.append("--gui")
+        # Off every monitor. A window that takes the keyboard out from under
+        # whoever is at the machine is not an acceptable cost of running the
+        # suite, and an off-screen one draws identically -- measured, see
+        # launch_blender.py's --offscreen.
+        cmd += ["--gui", "--offscreen"]
     subprocess.run(cmd, check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -203,6 +230,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9885)
     parser.add_argument("--only", help="run just one file by substring")
+    parser.add_argument("--gui-all", dest="force_gui", action="store_true",
+                        help="open a window for every file, not just the ones "
+                             "that need one. Writes every screenshot, and "
+                             "takes the keyboard fifteen times")
     parser.add_argument("--headless", action="store_true",
                         help="start Blender without a window. Faster, but the "
                              "overlay and screenshot checks cannot run and will "
@@ -228,7 +259,8 @@ def main():
         started = False
         if not serving(args.port):
             print("starting blender on port %d ..." % args.port)
-            start(args.port, args.gui)
+            start(args.port, args.gui and (
+                args.force_gui or any(f in GUI_FILES for f in files)))
             started = True
         for path in files:
             print("\n=== %s" % path)
@@ -243,8 +275,12 @@ def main():
         ports = free_ports(args.port, len(files))
         for index, path in enumerate(files):
             port = ports[index]
-            print("\n=== %s   (fresh blender on %d)" % (path, port))
-            start(port, args.gui)
+            # Windowed only where the file needs it, unless --gui forces it
+            # for all of them.
+            want_gui = args.gui and (args.force_gui or path in GUI_FILES)
+            print("\n=== %s   (fresh blender on %d%s)"
+                  % (path, port, ", windowed" if want_gui else ""))
+            start(port, want_gui)
             try:
                 counted, failed = report_on(path, run_file(path, port))
             finally:
