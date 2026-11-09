@@ -542,6 +542,12 @@ what exists so far:
   order-dependent T-junction spurs are both fixed and covered by
   `tests/test_gp_junctions.py`; the near-miss (non-touching) junction case is
   still open.
+- [DESIGN_element_ordering.md](DESIGN_element_ordering.md) -- the direction
+  for the remaining 38 element-keyed collections: carry ordered sequences and
+  indices, the way Blender's own add-ons do (not one of them puts a BMesh
+  element in a set). Rooted in `uv_islands` returning a list of *sets* of
+  BMFace, which every consumer inherits. Not started; the golden harness and
+  tests/test_reproducible_export.py are the safety net for it.
 - [RESEARCH_theta_seam_edge_nondeterminism.md](RESEARCH_theta_seam_edge_nondeterminism.md)
   -- why `test_determinism.py`'s theta case marks 174 or 176 seam edges at
   random. **Root cause found (2026-11-03): the cut depends on BMEdge vertex
