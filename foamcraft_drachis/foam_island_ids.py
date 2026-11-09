@@ -156,7 +156,9 @@ def _walk_order(adjacency, centroids, origin):
     Distance ties are broken on the centroid's own coordinates (not on
     island index) so the result depends only on geometry. `islands` -- and
     therefore these `centroids` -- come from ``core.uv_islands``, which
-    builds its result from a Python set keyed by BMFace identity; on a
+    until 2026-11-09 built its result from a Python set keyed by BMFace
+    identity (it now returns ordered lists, but island index still moves
+    when Blender renumbers faces, so geometry stays the right key); on a
     symmetric mesh like a seamed cube, where every face is exactly as close
     to `origin` as several others, breaking ties on index let that
     incidental, run-to-run-varying iteration order flip which of several

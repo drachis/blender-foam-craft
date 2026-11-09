@@ -95,13 +95,50 @@ Do not start without reading `tools/golden_marks.py`.
 BMeshes from one mesh must agree — and both load-bearing guards are proven to
 fail it when reverted.
 
-## Open question for whoever picks this up
+## Settled (2026-11-09): lists of faces, in face-table order
 
-Whether `uv_islands` should return lists of faces or lists of face *indices*.
-Indices are what Blender's own code passes around and they make the
-element-keyed habit impossible, but they cost a lookup at every use and this
-package passes islands through a dozen call sites. Worth deciding before
-touching the 38 sites, not during.
+`uv_islands` returns a list of *lists* of BMFace, both levels in `bm.faces`
+order. Indices were considered and rejected:
+
+- **The hazard is the container, not the element.** A list walked out of
+  `bm.faces` is exactly as reproducible as `bm.faces`, which is the table
+  measured stable across fresh BMeshes. Indices buy nothing over that.
+- **Indices would move `bm` into every helper.** `island_boundary_cycles`,
+  `boundary_defect_load`, `find_tight_notches` and `island_angle_defect`
+  take bare faces; each would need the BMesh and a lookup table, and would
+  still build vertex sets inside.
+- **The survey found a class the scope table missed: float sums over a set.**
+  The sheet's area totals, island centroids, stretch means, defect totals,
+  and `next(iter(isl.faces))` choosing a piece id all iterated the island
+  set. An ordered list fixes every one with no edit at the site.
+
+Membership stays a set, built locally and never iterated:
+`island_boundary_cycles` builds one per island and hands it to
+`_next_boundary_loop`, so returning lists costs no linear scans.
+
+## Audit of the 38 sites
+
+Most were never hazards. A dict keyed on BMesh elements iterates in
+*insertion* order, so it is only as unordered as whatever filled it; a set
+used only for `in` never exposes its order. Classified:
+
+| kind | outcome |
+|---|---|
+| island sets iterated, summed, `next(iter())` (every `uv_islands` consumer) | fixed at the root: lists |
+| `island_angle_defect`, `boundary_defect_load`: `set(faces)` then iterated | iterate the list, local set for `in` |
+| `island_boundary_cycles` index sort over the island set | removed: input is ordered at source |
+| `foam_gp_pattern._hit_faces` returning a set, sorted by two callers | returns an index-ordered tuple; one per-site sort removed; the union in `connect` keeps its sort |
+| `foam_export.chain_direction_start`: `next(iter(set & set))` | walks `edge.verts` |
+| membership-only sets (`pool`, `unvisited`, `seen_*`, `used_verts`, `own`, `boundary`) | correct as they are |
+| dicts filled from ordered sources (`face_hits`, `face_edges`, `by_edge`, `wanted`, `ratios`, `owner`) | correct as they are |
+| sets of ints or name tuples (`adjacency`, `absorbed`, `flagged`, `heat_islands`) | not BMesh elements |
+| `remove_doubles` vertex order (`touched`, sorted by fresh index) | kept: same order as `bm.verts` |
+| coordinate sorts in `boundary_defect_load`, `_edge_ends`, `order_rings_outer_first`, `_walk_order` | kept: they guard renumbering, which table order does not |
+
+Verified: golden marks 1422 of 1422 unchanged after every step; making
+`uv_islands` return sets again fails both export cases of
+`tests/test_reproducible_export.py`, so the root is now what holds the
+property.
 
 ## Related work in flight
 
