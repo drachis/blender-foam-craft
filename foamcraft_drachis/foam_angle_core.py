@@ -467,13 +467,35 @@ def island_boundary_cycles(island_faces, uv_layer):
     Each returned cycle walks the island's outline in order; a loop's edge runs
     from `loop.vert` to `loop.link_loop_next.vert`. An island with holes yields
     more than one cycle.
+
+    Where each cycle *starts*, and the order the cycles come back in, are both
+    fixed by face index. That is not tidiness. `uv_islands` carries the same
+    warning a few functions up -- seeding a walk from `set.pop()` makes the
+    result depend on BMFace identity hashing, which differs between two
+    BMeshes built from the same mesh -- and this function was doing it twice:
+    once by iterating `island_faces`, which is a set, and once by popping
+    `unvisited`.
+
+    Measured 2026-11-09, on one unwrap with face and edge order verified
+    byte-identical: two fresh BMeshes of the same mesh produced SVGs
+    differing in 6 fill paths, 6 outlines and 24 alignment ticks. The outline
+    of a piece was the same shape started at a different corner, which is
+    harmless; the alignment ticks were not, because where they fall is walked
+    from the cycle. Two exports of one pattern could place a maker's
+    registration marks differently.
     """
-    boundary = [l for f in island_faces for l in f.loops
+    ordered_faces = sorted(island_faces, key=lambda f: f.index)
+    boundary = [l for f in ordered_faces for l in f.loops
                 if uv_boundary_edge(l.edge, uv_layer)]
     unvisited = set(boundary)
     cycles = []
-    while unvisited:
-        start = unvisited.pop()
+    # Seeded from `boundary`, which is in face order, rather than from the
+    # set. The set is kept for its membership test, which is all it is good
+    # for here.
+    for start in boundary:
+        if start not in unvisited:
+            continue
+        unvisited.discard(start)
         cycle = [start]
         current = start
         while True:
