@@ -28,6 +28,14 @@ So this file does not test any one of those fixes. It tests the property they
 all broke: build two BMeshes from one mesh, and everything downstream must
 agree exactly. A fourth instance of the same mistake fails here without
 anyone having to think of it.
+
+Since 2026-11-09 the root is fixed rather than each site: `uv_islands` returns
+ordered lists in face-table order, and `island_boundary_cycles` no longer
+needs its index sort. Proven load-bearing the same way the guards were --
+making `uv_islands` return `[set(i) for i in islands]` again fails both export
+cases here with `every_derived_value_agrees: false`. The curvature case still
+passes in that probe, because `boundary_defect_load` orders by coordinate,
+which it keeps for renumbering, not for set order.
 """
 
 import hashlib

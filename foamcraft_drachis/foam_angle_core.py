@@ -462,15 +462,17 @@ def island_sort_key(faces):
     return min(f.index for f in faces)
 
 
-def _next_boundary_loop(loop, uv_layer, island_faces):
+def _next_boundary_loop(loop, uv_layer, members):
     """Walk to the next boundary loop around the island, by rotating about the
-    shared vertex until another boundary edge is found."""
+    shared vertex until another boundary edge is found.
+
+    `members` is a set of the island's faces, for the membership test only."""
     current = loop.link_loop_next
     for _ in range(128):  # guard against non-manifold fans
         if uv_boundary_edge(current.edge, uv_layer):
             return current
         radial = current.link_loop_radial_next
-        if radial is current or radial.face not in island_faces:
+        if radial is current or radial.face not in members:
             return None
         current = radial.link_loop_next
     return None
@@ -499,14 +501,15 @@ def island_boundary_cycles(island_faces, uv_layer):
     from the cycle. Two exports of one pattern could place a maker's
     registration marks differently.
     """
-    ordered_faces = sorted(island_faces, key=lambda f: f.index)
-    boundary = [l for f in ordered_faces for l in f.loops
+    # `island_faces` arrives in face-table order from `uv_islands`, so
+    # walking it directly seeds in a fixed order -- the sort by index this
+    # used to need is gone with the set it was guarding against. Sets below
+    # are for membership tests only, which is all they are good for here.
+    members = set(island_faces)
+    boundary = [l for f in island_faces for l in f.loops
                 if uv_boundary_edge(l.edge, uv_layer)]
     unvisited = set(boundary)
     cycles = []
-    # Seeded from `boundary`, which is in face order, rather than from the
-    # set. The set is kept for its membership test, which is all it is good
-    # for here.
     for start in boundary:
         if start not in unvisited:
             continue
@@ -514,7 +517,7 @@ def island_boundary_cycles(island_faces, uv_layer):
         cycle = [start]
         current = start
         while True:
-            nxt = _next_boundary_loop(current, uv_layer, island_faces)
+            nxt = _next_boundary_loop(current, uv_layer, members)
             if nxt is None or nxt is start or nxt not in unvisited:
                 break
             unvisited.discard(nxt)
