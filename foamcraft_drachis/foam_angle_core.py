@@ -1393,19 +1393,21 @@ def island_angle_defect(faces):
     failing to lie flat, and counting it would double-charge a seam the bevel
     already handles.
     """
-    faces = set(faces)
+    # Iterate the caller's order; the set is for membership only. Summing
+    # over a set of BMFace adds in Blender-address order, which a fresh BMesh
+    # changes, and floating-point addition is not associative.
+    faces = list(faces)
+    members = set(faces)
     total = positive = negative = 0.0
     per_vertex = {}
-    seen = set()
     for face in faces:
         for vert in face.verts:
-            if vert in seen:
+            if vert in per_vertex:
                 continue
-            seen.add(vert)
-            linked = [f for f in vert.link_faces if f in faces]
+            linked = [f for f in vert.link_faces if f in members]
             interior = ((not vert.is_boundary)
                         and len(linked) == len(vert.link_faces))
-            defect = vertex_angle_defect(vert, faces)
+            defect = vertex_angle_defect(vert, members)
             per_vertex[vert] = defect
             if interior:
                 total += defect
@@ -1454,12 +1456,15 @@ def boundary_defect_load(faces):
     """
     from collections import deque
 
-    faces = set(faces)
+    faces = list(faces)
+    members = set(faces)            # membership only; never iterated
     _summary, per_vertex = island_angle_defect(faces)
-    island_verts = {v for f in faces for v in f.verts}
+    # Ordered, de-duplicated: a dict keeps first-insertion order.
+    island_verts = list(dict.fromkeys(v for f in faces for v in f.verts))
+    in_island = set(island_verts)   # membership only
 
     def on_boundary(vert):
-        linked = [f for f in vert.link_faces if f in faces]
+        linked = [f for f in vert.link_faces if f in members]
         return vert.is_boundary or len(linked) != len(vert.link_faces)
 
     def where(vert):
@@ -1482,10 +1487,10 @@ def boundary_defect_load(faces):
         # Blender does not promise.
         for edge in sorted(vert.link_edges,
                            key=lambda e: where(e.other_vert(vert))):
-            if not any(f in faces for f in edge.link_faces):
+            if not any(f in members for f in edge.link_faces):
                 continue
             other = edge.other_vert(vert)
-            if other in owner or other not in island_verts:
+            if other in owner or other not in in_island:
                 continue
             owner[other] = owner[vert]
             queue.append(other)
