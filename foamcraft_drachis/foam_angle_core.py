@@ -371,24 +371,36 @@ def uv_boundary_edge(edge, uv_layer):
 
 def uv_islands(bm, uv_layer, only_selected=False):
     """Partition faces into UV islands -- connected components of faces joined
-    across non-boundary edges. Returns a list of sets of BMFace.
+    across non-boundary edges. Returns a list of *lists* of BMFace.
 
-    Island order is deterministic: components come out ordered by their lowest
-    face index. This matters because the list index is an island's identity for
-    everything downstream -- piece numbers, overlay labels, export order. Seeding
-    from ``set.pop()`` instead made the order depend on BMFace identity hashing,
-    which varies between runs on identical geometry, so the same mesh could be
-    numbered differently each time it was processed.
+    Both levels are in face-table order: islands by their lowest face index,
+    and the faces inside each island in the order ``bm.faces`` holds them.
+    That is Blender's own idiom -- its bundled add-ons walk the mesh tables
+    and carry ordered sequences, and not one of them puts a BMesh element in
+    a set -- and it is what makes everything downstream reproducible.
+
+    It used to return sets, and every consumer inherited the set's order.
+    BMesh elements hash on their address in Blender's memory, so a set of
+    them iterates identically within one BMesh and differently once
+    ``bmesh.new()`` + ``from_mesh`` allocates fresh structs (CLAUDE.md, "What
+    survives rebuilding a BMesh"). Seeding walks from such a set shipped
+    three reproducibility bugs; summing areas or centroids over one moves
+    the last bits; ``next(iter(island))`` picks a different face. Returning
+    an ordered list removes the whole class at its source.
+
+    A consumer that needs fast membership should build a set *locally* for
+    the test, and keep iterating the list.
     """
     bm.faces.ensure_lookup_table()
     ordered = [f for f in bm.faces if not only_selected or f.select]
-    pool = set(ordered)
-    islands = []
+    pool = set(ordered)          # membership only; never iterated
+    island_of = {}               # BMFace -> island number, lookup only
+    count = 0
     for seed in ordered:
         if seed not in pool:
             continue
         pool.discard(seed)
-        component = {seed}
+        island_of[seed] = count
         stack = [seed]
         while stack:
             face = stack.pop()
@@ -398,9 +410,12 @@ def uv_islands(bm, uv_layer, only_selected=False):
                 for other in loop.edge.link_faces:
                     if other is not face and other in pool:
                         pool.discard(other)
-                        component.add(other)
+                        island_of[other] = count
                         stack.append(other)
-        islands.append(component)
+        count += 1
+    islands = [[] for _ in range(count)]
+    for face in ordered:
+        islands[island_of[face]].append(face)
     return islands
 
 

@@ -315,7 +315,50 @@ def test_curvature_drains_to_the_same_edges_every_time():
     }
 
 
+def test_islands_are_ordered_lists_in_face_table_order():
+    """The root of the whole class: what `uv_islands` hands every consumer.
+
+    It returned a list of *sets* of BMFace until 2026-11-09, and every
+    consumer iterated that set -- to seed walks, to sum areas and centroids,
+    to pick a representative face. Sets of BMesh elements iterate by
+    Blender-side address, which a fresh BMesh changes (CLAUDE.md, "What
+    survives rebuilding a BMesh"). Returning lists in face-table order is
+    Blender's own idiom: `bm.faces` order was measured identical across five
+    fresh BMeshes of one mesh.
+
+    Expected values: six gores give exactly six islands (`== 6`, both
+    bounds -- an all-seamed mesh would give one island per face, an
+    unseamed one a single island). Every face appears exactly once.
+    """
+    obj = _gore_sphere()
+    bm = _fresh(obj)
+    try:
+        uv = bm.loops.layers.uv.active
+        islands = core.uv_islands(bm, uv, only_selected=False)
+        table = list(bm.faces)
+        position = {f: i for i, f in enumerate(table)}
+        flat = [f for isl in islands for f in isl]
+        inner_ordered = all(
+            [position[f] for f in isl] == sorted(position[f] for f in isl)
+            for isl in islands)
+        firsts = [position[isl[0]] for isl in islands]
+        return {
+            "islands": len(islands),
+            "checks": {
+                "six_gores_make_six_islands": len(islands) == 6,
+                "islands_are_lists": all(type(isl) is list for isl in islands),
+                "every_face_exactly_once":
+                    len(flat) == len(table) and len(set(flat)) == len(table),
+                "faces_in_table_order_within_an_island": inner_ordered,
+                "islands_in_order_of_their_first_face": firsts == sorted(firsts),
+            },
+        }
+    finally:
+        bm.free()
+
+
 TESTS = (
+    test_islands_are_ordered_lists_in_face_table_order,
     test_a_gore_sphere_exports_identically_every_time,
     test_closed_ring_seams_export_identically_every_time,
     test_curvature_drains_to_the_same_edges_every_time,
