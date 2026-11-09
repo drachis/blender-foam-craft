@@ -455,8 +455,34 @@ Measured directly in a running session, not inferred from docs.
   So the rule is narrower and more useful than "BMesh order is arbitrary".
   The *tables* are faithful: iterating `bm.faces`, `bm.verts`, `bm.edges` or
   `v.link_edges` gives the same order every time, and so does reading
-  `edge.verts[0]`. What is arbitrary is **any `set` of BMesh elements**,
-  because Python hashes them by identity and the addresses differ per BMesh.
+  `edge.verts[0]`. What moves is **any `set` of BMesh elements**.
+
+  And "arbitrary" is the wrong word for it, which is worth being exact about
+  because it changes what the fix has to be. Measured:
+
+  - `BMVert.__hash__` is its own slot wrapper, **not** `object.__hash__`, and
+    `hash(v) != id(v) // 16` -- so this is not CPython's default id-hash.
+  - The hash tracks the element's address in *Blender's* memory, not the
+    Python wrapper's. Sampling four vertices showed four different hashes
+    while `id()` returned the same address three times over, the wrapper
+    being a temporary that was freed and reallocated between accesses.
+  - Set order is then just CPython's open-addressing table order. Sorting 42
+    vertices by `(hash % 128, hash)` reproduced the observed iteration order
+    exactly -- 128 being the table size CPython had grown to for that many
+    elements.
+
+  So it is **deterministic and unpredictable**: perfectly repeatable within
+  one BMesh, because the C element addresses are fixed for its lifetime --
+  two sets built from the same BMesh iterate identically, measured three
+  times -- and different the moment Blender allocates fresh element structs,
+  which `bmesh.new()` + `from_mesh` does every time.
+
+  That is the reason the fix is a **geometric** sort rather than a cheaper
+  one. Sorting by `hash`, by `id`, or by anything the allocator touches is
+  just as unstable as not sorting. Sorting by index works only while nothing
+  renumbers. Coordinates are the one key that survives reallocation *and*
+  renumbering, which is why `_edge_ends`, `order_rings_outer_first` and
+  `boundary_defect_load` all use them.
 
   That distinction matters when deciding whether a sort is a fix or a
   disguise. A guard added over a stable ordering is hiding something; a
