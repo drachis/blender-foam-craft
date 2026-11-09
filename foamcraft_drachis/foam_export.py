@@ -435,16 +435,24 @@ def chain_direction_start(chain, index):
     if index == 0:
         if len(chain) == 1:
             return edge.verts[0]
-        nxt = chain[1]
-        shared = set(edge.verts) & set(nxt.verts)
-        if shared:
-            return edge.other_vert(next(iter(shared)))
+        shared = _shared_vert(edge, chain[1])
+        if shared is not None:
+            return edge.other_vert(shared)
         return edge.verts[0]
-    prev = chain[index - 1]
-    shared = set(edge.verts) & set(prev.verts)
-    if shared:
-        return next(iter(shared))
+    shared = _shared_vert(edge, chain[index - 1])
+    if shared is not None:
+        return shared
     return edge.verts[0]
+
+
+def _shared_vert(edge, other):
+    """The first of `edge`'s vertices that `other` also uses, or None.
+
+    Walked in `edge.verts` order rather than read out of a set intersection:
+    `next(iter(set))` over BMesh elements picks by Blender-side address.
+    Two distinct edges share at most one vertex, so this only fixes the
+    pathological case -- but it means the question never needs asking."""
+    return next((v for v in edge.verts if v in other.verts), None)
 
 
 def _alignment_ticks(islands, uv_layer, runs_by_island, settings,

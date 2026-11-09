@@ -328,10 +328,19 @@ def _classify(bm, bvh, points):
 
 
 def _hit_faces(hit):
-    """Every face the hit could be said to lie in."""
+    """Every face the hit could be said to lie in, as a tuple in index order.
+
+    Ordered at the source, not a set. A set of BMFace iterates by Blender-side
+    address, which differs between two BMeshes of one mesh, and callers here
+    take the *first* match -- the existing point reused, the home face of an
+    edge -- so the order decides the cut. Callers used to sort this set
+    themselves, one guard per site; now there is nothing to guard. Index order
+    is what those guards used, so behaviour is unchanged. The graph is built
+    before anything touches bmesh, so indices do not move under it.
+    """
     if hit["kind"] == FACE:
-        return {hit["elem"]}
-    return set(hit["elem"].link_faces)
+        return (hit["elem"],)
+    return tuple(sorted(hit["elem"].link_faces, key=lambda f: f.index))
 
 
 def _locally_trivial(hit_a, hit_b):
@@ -378,7 +387,7 @@ def _locally_trivial(hit_a, hit_b):
         hit_b if hit_b["kind"] == VERT else None
     if vert_hit is not None:
         other = hit_b if vert_hit is hit_a else hit_a
-        if _hit_faces(other) <= set(vert_hit["elem"].link_faces):
+        if set(_hit_faces(other)) <= set(vert_hit["elem"].link_faces):
             return "vert_fan"
     return None
 
@@ -566,7 +575,7 @@ def _bridge(hits, stats, bm, bvh):
 
     out, missed = [hits[0]], 0
     for previous, hit in zip(hits, hits[1:]):
-        if _hit_faces(previous) & _hit_faces(hit):
+        if not set(_hit_faces(previous)).isdisjoint(_hit_faces(hit)):
             tally("same_face")
             out.append(hit)
             continue
@@ -780,14 +789,10 @@ class _CutGraph:
         key = self._key(hit)
         if key is not None and key in self._by_key:
             return self._by_key[key]
-        # Sorted, not iterated as the set `_hit_faces` returns: BMesh
-        # elements hash by identity, so a set of them comes out in a
-        # different order on every run, and when more than one existing
-        # point is within `weld` the *first found* is the one reused --
-        # letting that vary by run number renumbers the same mesh
-        # differently each time (this project's own recurring lesson, see
-        # CLAUDE.md's "Rebuild scene state for every measurement").
-        for face in sorted(_hit_faces(hit), key=lambda f: f.index):
+        # In `_hit_faces` order, which is fixed: when more than one existing
+        # point is within `weld` the *first found* is the one reused, so the
+        # order decides the mesh (see `_hit_faces`).
+        for face in _hit_faces(hit):
             for index in self.face_hits.get(face, ()):
                 if (self.hits[index]["loc"] - hit["loc"]).length <= weld:
                     if key is not None:
@@ -828,9 +833,9 @@ class _CutGraph:
             if current == j:      # handful of times per face, not endlessly
                 return
             found = None
-            # Sorted for the same reason as in `add`: `scan_faces` is a set
-            # of BMesh elements, and which candidate crossing is found
-            # *first* among several must not depend on identity-hash order.
+            # Sorted because `scan_faces` is the union of two ordered
+            # sources, and which candidate crossing is found *first* among
+            # several must not depend on identity-hash order.
             for f in sorted(scan_faces, key=lambda face: face.index):
                 for edge_index in self.face_edges.get(f, ()):
                     a, b = self.edges[edge_index]
@@ -898,10 +903,11 @@ def _add_stroke_to_graph(bm, bvh, graph, points, cyclic, snap_distance,
         a, b = indices[p], indices[q]
         if a == b:
             continue
-        shared = _hit_faces(hits[p]) & _hit_faces(hits[q])
+        q_faces = set(_hit_faces(hits[q]))            # membership only
+        shared = [f for f in _hit_faces(hits[p]) if f in q_faces]
         if not shared:
             continue
-        home_face = min(shared, key=lambda f: f.index)
+        home_face = shared[0]          # lowest index: `_hit_faces` is ordered
 
         # See `_locally_trivial`: both ends already anchored to real
         # topology, and neither reaches beyond what the other already owns,
@@ -922,7 +928,7 @@ def _add_stroke_to_graph(bm, bvh, graph, points, cyclic, snap_distance,
             graph.cover(hits[p]["elem"], hits[p]["fac"], hits[q]["fac"])
             continue
 
-        scan_faces = _hit_faces(hits[p]) | _hit_faces(hits[q])
+        scan_faces = set(_hit_faces(hits[p])) | set(_hit_faces(hits[q]))
         graph.connect(a, b, home_face, scan_faces, weld_for(hits[p]))
     return indices
 
