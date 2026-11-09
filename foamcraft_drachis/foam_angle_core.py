@@ -1418,6 +1418,24 @@ def boundary_defect_load(faces):
     vertex is claimed by the boundary vertex whose relief cut would actually
     reach it. Straight-line distance would happily route a defect to a boundary
     on the far side of a fold.
+
+    The search is seeded in coordinate order, and that is not tidiness. A
+    multi-source breadth-first search decides ties by *seeding* order: where
+    two boundary vertices are the same number of edges from an interior one,
+    whichever entered the queue first claims it and takes its curvature. The
+    seed was a set of BMVert, which iterates by identity hashing, so two
+    BMeshes built from the same mesh routed the same defect to different
+    edges. Same number of darts, placed differently -- measured on a six-gore
+    sphere as 18 darts every time, at drifting positions, which moved the
+    relief cuts a maker would saw.
+
+    The accumulation is sorted for a second, smaller reason: floating-point
+    addition is not associative, so summing one boundary vertex's share in a
+    different order differs in the last bits.
+
+    Ordered by coordinate rather than by index, for the reason `_edge_ends`
+    and `order_rings_outer_first` are: an index moves when Blender renumbers,
+    and a position does not.
     """
     from collections import deque
 
@@ -1429,17 +1447,26 @@ def boundary_defect_load(faces):
         linked = [f for f in vert.link_faces if f in faces]
         return vert.is_boundary or len(linked) != len(vert.link_faces)
 
-    boundary = {v for v in island_verts if on_boundary(v)}
+    def where(vert):
+        co = vert.co
+        return (co.x, co.y, co.z)
+
+    boundary = sorted((v for v in island_verts if on_boundary(v)), key=where)
     if not boundary:
         # A closed piece has nowhere to drain to. It cannot be cut from one
         # sheet at all, which is the advisor's problem, not the dart code's.
         return {}
 
+    boundary_set = set(boundary)
     owner = {v: v for v in boundary}
     queue = deque(boundary)
     while queue:
         vert = queue.popleft()
-        for edge in vert.link_edges:
+        # Neighbours in coordinate order too: the frontier is extended in
+        # whatever order the edges come back, and that order is another thing
+        # Blender does not promise.
+        for edge in sorted(vert.link_edges,
+                           key=lambda e: where(e.other_vert(vert))):
             if not any(f in faces for f in edge.link_faces):
                 continue
             other = edge.other_vert(vert)
@@ -1449,8 +1476,8 @@ def boundary_defect_load(faces):
             queue.append(other)
 
     load = {v: 0.0 for v in boundary}
-    for vert, defect in per_vertex.items():
-        if vert in boundary:
+    for vert, defect in sorted(per_vertex.items(), key=lambda kv: where(kv[0])):
+        if vert in boundary_set:
             continue
         home = owner.get(vert)
         if home is not None:

@@ -358,18 +358,28 @@ def _seam_chains(islands):
         return chain
 
     # Open chains first, from their loose ends, so a chain that has ends is
-    # not entered in the middle and split into two.
+    # not entered in the middle and split into two. The ends are considered
+    # in canonical order, not edge order.
     for e in edges:
         if e.index in used:
             continue
-        for v in e.verts:
+        start, far = _edge_canonical_start(e), None
+        far = e.other_vert(start)
+        for v in (start, far):
             if len(by_vert.get(v.index, ())) != 2:
                 chains.append(_walk(e, v))
                 break
-    # Whatever is left is a closed loop; any edge will do as a start.
+    # Whatever is left is a closed loop. "Any edge will do as a start" is
+    # true; any *end* of that edge is not. A closed chain walked from
+    # verts[0] runs one way round or the other depending on an orientation
+    # Blender does not promise, and By Distance measures from the start, so
+    # every mark on that seam moves. Measured: one sheet in a 1422-record
+    # golden run differing between otherwise identical exports, on the
+    # fixture whose seams are closed rings. Third time this project has been
+    # caught reading edge orientation; see _edge_ends in foam_gp_pattern.
     for e in edges:
         if e.index not in used:
-            chains.append(_walk(e, e.verts[0]))
+            chains.append(_walk(e, _edge_canonical_start(e)))
     return chains
 
 
