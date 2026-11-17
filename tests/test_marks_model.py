@@ -197,7 +197,103 @@ def test_marks_hold_no_bmesh_and_no_vectors():
     }
 
 
+def _label_box(label):
+    """A label's box, from the same upper bound the model places it with."""
+    half_w = len(label.text) * label.size_mm * fm.GLYPH_ADVANCE_EM / 2
+    half_h = label.size_mm / 2
+    return (label.x - half_w, label.y - half_h,
+            label.x + half_w, label.y + half_h)
+
+
+def _boxes_overlap(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def test_every_angle_is_written_inside_its_own_piece():
+    """A bevel angle belongs to one piece and must stay on it when cut out.
+
+    The labels used to be centred on the cut line. On a cube unwrapped with
+    its faces side by side, two pieces wrote "90" on the same spot across the
+    seam and the sheet read "9090" -- seen in the first raster export, which
+    is why this is asserted on boxes rather than on anchor points.
+
+    Known answer: a cube with every edge seamed has 6 square pieces and 24
+    runs, so 24 labels, 4 per piece, each inside exactly one outline.
+    """
+    marks, _ = _marks_of(_seamed_cube())
+    outlines = [s for s in marks.strokes if s.kind == 'outline']
+    angles = [l for l in marks.labels if l.kind == 'angle']
+    owners = [[i for i, o in enumerate(outlines)
+               if _inside((l.x, l.y), o.points)] for l in angles]
+    per_piece = [sum(1 for own in owners if own == [i])
+                 for i in range(len(outlines))]
+    boxes = [_label_box(l) for l in angles]
+    overlaps = sum(1 for i in range(len(boxes))
+                   for j in range(i + 1, len(boxes))
+                   if _boxes_overlap(boxes[i], boxes[j]))
+    # Whole box inside the piece: all four corners, not just the anchor.
+    corners_inside = sum(
+        1 for box, own in zip(boxes, owners) if len(own) == 1 and all(
+            _inside(c, outlines[own[0]].points)
+            for c in ((box[0], box[1]), (box[2], box[1]),
+                      (box[2], box[3]), (box[0], box[3]))))
+    return {
+        "angle_labels": len(angles),
+        "per_piece": per_piece,
+        "overlapping_pairs": overlaps,
+        "boxes_wholly_inside": corners_inside,
+        "checks": {
+            "there_are_24_labels": len(angles) == 24,
+            "each_piece_has_exactly_4": per_piece == [4] * 6,
+            "no_two_labels_overlap": overlaps == 0,
+            "every_box_is_wholly_inside_its_piece": corners_inside == 24,
+        },
+    }
+
+
+def test_the_ruler_strip_stays_clear_of_the_pattern_and_of_itself():
+    """The one-inch square is exactly an inch, below every piece, and
+    nothing is written through it.
+
+    It used to stand 10 mm above its strip, touching the lowest cut line,
+    with its caption centred over it.
+    """
+    marks, _ = _marks_of(_seamed_cube(), show_scale_ruler=True)
+    lowest_piece = max(y for s in marks.strokes if s.kind == 'outline'
+                       for _, y in s.points)
+    squares = [s for s in marks.strokes if s.kind == 'ruler' and s.closed]
+    sq = squares[0].points if squares else ((0, 0),) * 4
+    xs, ys = [p[0] for p in sq], [p[1] for p in sq]
+    box = (min(xs), min(ys), max(xs), max(ys))
+    captions = [l for l in marks.labels if l.kind == 'ruler']
+    through = [l.text for l in captions
+               if _boxes_overlap(_label_box(l), box)]
+    off_sheet = [l.text for l in captions
+                 if _label_box(l)[2] > marks.width_mm
+                 or _label_box(l)[0] < 0 or l.y > marks.height_mm]
+    return {
+        "square": [round(v, 3) for v in box],
+        "lowest_piece_y": round(lowest_piece, 3),
+        "captions": len(captions),
+        "captions_through_square": through,
+        "captions_off_sheet": off_sheet,
+        "checks": {
+            "there_is_exactly_one_square": len(squares) == 1,
+            "it_is_one_inch_wide": abs(box[2] - box[0] - 25.4) < 1e-6,
+            "it_is_one_inch_tall": abs(box[3] - box[1] - 25.4) < 1e-6,
+            "it_starts_below_every_piece": box[1] > lowest_piece + 1.0,
+            "it_ends_on_the_sheet": box[3] < marks.height_mm,
+            # Both bounds: no captions at all would also "not overlap".
+            "the_captions_are_there": len(captions) >= 4,
+            "no_caption_runs_through_the_square": not through,
+            "no_caption_leaves_the_sheet": not off_sheet,
+        },
+    }
+
+
 TESTS = (
+    test_every_angle_is_written_inside_its_own_piece,
+    test_the_ruler_strip_stays_clear_of_the_pattern_and_of_itself,
     test_cube_marks_have_the_known_counts,
     test_marks_hold_no_bmesh_and_no_vectors,
 )

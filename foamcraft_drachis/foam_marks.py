@@ -118,7 +118,7 @@ MARGIN_MM = 10.0
 # that way: the ruler's whole job is to be measurable against a real ruler
 # held to the paper, so it is the one thing on the sheet that must NOT scale
 # with the pattern.
-RULER_STRIP_MM = 34.0
+RULER_STRIP_MM = 44.0
 RULER_LENGTH_MM = 100.0
 RULER_TICK_MM = 4.0
 RULER_FONT_MM = 4.0
@@ -271,6 +271,45 @@ def _run_polyline(run, uv_layer, isl):
     pts = [isl.to_sheet(l[uv_layer].uv) for l in run.loops]
     pts.append(isl.to_sheet(run.uv_end))
     return pts
+
+
+def _polyline_midpoint(pts):
+    """The point half way along `pts` by length, not the chord's middle."""
+    lengths = [(pts[i + 1] - pts[i]).length for i in range(len(pts) - 1)]
+    half = sum(lengths) / 2
+    for i, seg in enumerate(lengths):
+        if seg >= half and seg > 1e-12:
+            return pts[i].lerp(pts[i + 1], half / seg)
+        half -= seg
+    return pts[len(pts) // 2].copy()
+
+
+def _angle_label_anchor(run, uv_layer, isl, text, font_mm):
+    """Where a run's angle is written: inside its own piece.
+
+    It used to be centred on the cut line itself, at the middle of the
+    run's chord. Two pieces packed side by side then wrote their labels
+    on top of each other across the seam -- a cube read "9090" -- and
+    half of every label was cut off with the offcut.
+
+    So it is pushed inward until its own box clears the line, the same
+    projection of half-extents onto the normal the overlay uses, and it
+    starts from the middle of the run as drawn, which on a curved run is
+    nowhere near the middle of its chord.
+
+    Inward comes from the boundary's winding, computed in core, flipped
+    in v because the sheet's y grows downward.
+    """
+    mid = _polyline_midpoint(_run_polyline(run, uv_layer, isl))
+    out = run.uv_outward
+    if out is None or out.length < 1e-9:
+        return mid
+    inward = Vector((-out.x, out.y)).normalized()
+    width = len(text) * font_mm * GLYPH_ADVANCE_EM
+    height = font_mm
+    clear = (abs(inward.x) * width / 2 + abs(inward.y) * height / 2
+             + font_mm * 0.3)
+    return mid + inward * clear
 
 
 def _boundary_tangent(pt_before, pt_at):
@@ -651,6 +690,23 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
     return strokes, labels
 
 
+RULER_GAP_MM = 5.0
+RULER_CAPTION = ("measure before cutting:",
+                 "if not exact, the print was scaled")
+# A label is centred on its x, and no backend can be asked how wide a
+# string is from here, so captions are placed from an upper bound on the
+# advance of a sans-serif glyph. Too generous only moves a caption right.
+GLYPH_ADVANCE_EM = 0.6
+
+
+def _ruler_strip_width():
+    """The narrowest sheet the whole ruler strip fits on."""
+    longest = max(len(c) for c in RULER_CAPTION)
+    caption = longest * RULER_FONT_MM * GLYPH_ADVANCE_EM
+    return (MARGIN_MM + RULER_LENGTH_MM + 18.0 + INCH_MM + RULER_GAP_MM
+            + caption + MARGIN_MM)
+
+
 def _scale_strip(sheet_width, top_y):
     """A ruler and a one-inch square, in absolute millimetres.
 
@@ -677,7 +733,11 @@ def _scale_strip(sheet_width, top_y):
                             'baseline'))
 
     x0 = MARGIN_MM
-    y = top_y + RULER_STRIP_MM * 0.45
+    # The baseline sits a full inch below the strip's top, plus a gap, so
+    # the one-inch square stands wholly inside the strip. It used to start
+    # from 45% of the strip, which put the square's top 10 mm above the
+    # strip -- touching the lowest piece's cut line.
+    y = top_y + RULER_GAP_MM + INCH_MM
 
     # 100 mm bar with a tick every 10 mm, taller every 50.
     line(x0, y, x0 + RULER_LENGTH_MM, y)
@@ -699,8 +759,13 @@ def _scale_strip(sheet_width, top_y):
                           True, width, BLACK))
     text(sq_x + INCH_MM / 2, y + RULER_FONT_MM * 1.6, "1 inch")
 
-    text(sq_x + INCH_MM + 14.0, y,
-         "measure this: if it is not exact, the print was scaled")
+    # Two short lines to the right of the square, clear of it. One long
+    # line centred 14 mm past the square ran back through the square.
+    left = sq_x + INCH_MM + RULER_GAP_MM
+    for row, caption in enumerate(RULER_CAPTION):
+        half = len(caption) * RULER_FONT_MM * GLYPH_ADVANCE_EM / 2
+        text(left + half, y - INCH_MM / 2 + row * RULER_FONT_MM * 1.5,
+             caption)
     return strokes, labels
 
 
@@ -730,7 +795,7 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
         # Added below the pattern, so the pattern's own coordinates --
         # and therefore its fidelity to the UV layout -- are unchanged.
         total_height += RULER_STRIP_MM
-        total_width = max(total_width, MARGIN_MM * 2 + 210.0)
+        total_width = max(total_width, _ruler_strip_width())
 
     thickness_mm = settings.foam_thickness * scale_length * 1000.0
     dart_depth_mm = settings.notch_depth_ratio * thickness_mm
@@ -843,7 +908,9 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
                         tone, colour = "concave", concave_rgb
                 else:
                     tone, colour = "neutral", BLACK
-                angle_labels.append(Label('angle', mid.x, mid.y,
+                at = _angle_label_anchor(run, uv_layer, isl, label,
+                                         angle_font_mm)
+                angle_labels.append(Label('angle', at.x, at.y,
                                           angle_font_mm, label, colour,
                                           'middle', tone))
 
