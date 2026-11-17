@@ -114,8 +114,71 @@ re-running keeps existing ids valid unless you ask for a full renumber.
 ### 7. Export
 
 **File ▸ Export ▸ Foam Panel Pattern (.svg)** writes the flat cut patterns:
-outlines, relief darts, piece numbers and bevel-angle labels. Print at scale,
-transfer to foam, cut.
+outlines, relief darts, piece numbers and bevel-angle labels. The image export
+is the recommended route to paper; the SVG is the alternative. See
+[Printing the pattern](#printing-the-pattern).
+
+## Printing the pattern
+
+The recommended route is the **image export**. The image is sized from the
+pattern's real dimensions, so printing it at the stated DPI gives a true-size
+sheet.
+
+Find it in the UV Editor sidebar (<kbd>N</kbd>) under **FoamCraft ▸ Foam Cut
+Plan ▸ Print / Export**, and press **Export Image**. The same operator is also
+at **File ▸ Export ▸ Foam Pattern Image (.png/.jpg)**. The panel's **Export
+SVG** button is the SVG route, described below.
+
+> **Tip:** apply the object's scale before exporting. Select the sculpt, press
+> <kbd>Ctrl</kbd>+<kbd>A</kbd> and choose **Scale**, so the mesh's real size and
+> the object's transform agree.
+
+**Format.** PNG is lossless and keeps lines and numbers sharpest. Use JPEG only
+when a print service asks for it.
+
+**Resolution.** Two modes:
+
+- **DPI** (the default, 300 DPI). The image is sized from the pattern's real
+  size, so printing at this DPI is true to scale. In the print dialog, turn
+  scaling off: choose *Actual size* or 100%, and disable any *fit to page*.
+- **Pixels.** Sets the longest edge of the image (default 4096 px). The DPI is
+  whatever that works out to, and the report line shows it. If the request is
+  too large for the pattern, the image is clamped and the report names the DPI
+  to print at.
+
+**Print / Export options**, all in the same panel:
+
+- **Alignment Marks** (on by default). These are registration marks, not relief
+  cuts. Each seam is marked at the same point on the shared edge and drawn on
+  both pieces, so when two glued edges are lined up, the marks line up too.
+  Marks are spread along each stretch of edge from one corner to the next:
+  either a fixed number, evenly spaced (default 2), or one every set
+  distance (default 25 mm), centred so none lands on a corner. Each mark is 6 mm long by default, and the numbering
+  toggle is off. Turn the marks off if you do not want them.
+- **Colour Pieces** (on by default). Each piece is filled with its own colour,
+  so it can be matched to the model. Turn it off before printing on plain
+  paper: outlines and numbers are what you want there.
+- **Scale Ruler** (on by default). Prints a ruler and a one-inch square in a
+  strip below the pattern. Measure the square after printing. If it is not
+  exactly one inch, the print was scaled, and every piece on the sheet is the
+  wrong size. Reprint with scaling off rather than cutting from it.
+
+**SVG and tiled pages.** The SVG export still exists. It is vector, so it
+scales cleanly in a drawing program. A sheet is often bigger than a home
+printer's paper, and `tools/tile_svg.py` slices an SVG into pages:
+
+```
+python tools/tile_svg.py pattern.svg
+python tools/tile_svg.py pattern.svg --page a4 --out pages/ --overlap 12
+python tools/tile_svg.py pattern.svg --scale 0.5    # half-size test print
+```
+
+Pages are Letter by default and printed at 1:1, because the sheet is in real
+millimetres and tiling must not change that. `--scale` is only for a deliberate
+reduced proof print. Each page carries crop marks, its row and column, and a
+shaded overlap band to align against its neighbour. Options are `--page`
+(`letter`, `legal`, `a4`, `a3`), `--landscape`, `--margin`, and `--overlap`
+(in mm, default 10). Measure the ruler on page 1 before trusting the rest.
 
 ## Panels
 
@@ -125,6 +188,8 @@ All in the UV Editor sidebar (<kbd>N</kbd>):
 - **FoamCraft ▸ Foam Cut Plan** — material, saw, darts, numbering
 - **FoamCraft ▸ Foam Cut Plan ▸ Display** — what the overlay draws
 - **FoamCraft ▸ Foam Cut Plan ▸ Craftability** — findings from the last check
+- **FoamCraft ▸ Foam Cut Plan ▸ Print / Export** — image and SVG export, with
+  alignment marks, piece colour and the scale ruler
 - **Fold Angles** — the standalone live fold-angle overlay
 
 ## Paper model companion (optional)
@@ -176,6 +241,12 @@ Honest list of what is unresolved as of 0.1:
   themselves are stable -- same count, same sizes, same geometry every time --
   so this has not been seen to change a cut pattern, but it is a known open
   defect rather than a settled one.
+- **Overlay and printed sheet label angles differently.** The UV-editor
+  overlay shows the bevel per side of a seam on screen, while the printed sheet
+  shows the full fold angle. Being resolved.
+- **Image export is lightly tested by hand.** Image export has been exercised
+  by automated tests; the file dialog has had little hands-on use. Check the
+  printed scale before cutting.
 - **Bevel angles are computed, not proven.** The geometry is checked against
   shapes with arithmetically known answers (a sphere's curvature totals 4π, a
   cylinder's is zero, a cube's edges are all exactly 90°). That is a strong

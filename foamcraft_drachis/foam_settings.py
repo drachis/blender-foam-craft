@@ -194,18 +194,21 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         name="Tick Spacing",
         items=[
             ('PER_RUN', "Per Cut Run",
-             "A fixed number along every run, however long it is"),
+             "A fixed number along every corner-to-corner segment of seam, "
+             "evenly spread and never at a corner"),
             ('BY_DISTANCE', "By Distance",
-             "Every so many millimetres of real seam, whatever the runs do"),
+             "Every so many millimetres along each corner-to-corner segment, "
+             "centred so neither corner gets a mark"),
         ],
         default='PER_RUN',
-        description="Per Cut Run keeps the count predictable and ties the "
-                    "marks to the passes you are already cutting. By Distance "
+        description="Per Cut Run puts a fixed count on each segment of seam "
+                    "between two corners, so it stays predictable. By Distance "
                     "keeps their spacing on the foam even, which matters more "
                     "when runs differ wildly in length")
     ticks_per_run: bpy.props.IntProperty(
         name="Ticks Per Run", default=2, min=1, max=20,
-        description="How many alignment marks on each cut run")
+        description="How many alignment marks on each corner-to-corner "
+                    "segment of seam")
     tick_spacing: bpy.props.FloatProperty(
         name="Tick Spacing", default=0.025, min=0.002, max=0.5,
         subtype='DISTANCE', unit='LENGTH', precision=4,

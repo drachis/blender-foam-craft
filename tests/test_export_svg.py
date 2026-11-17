@@ -460,8 +460,11 @@ def test_every_piece_number_lands_inside_its_piece():
 
         group = re.search(r'<g id="numbers".*?</g>', svg, re.S)
         placed = re.findall(
-            r'<text x="([-\d.]+)" y="([-\d.]+)" font-size="([\d.]+)">'
-            r'([^<]*)</text>',
+            # Updated 2026-11-16: <text> now also carries font-family, fill
+            # and text-anchor attributes (no CSS), so the tag no longer ends
+            # at font-size.
+            r'<text x="([-\d.]+)" y="([-\d.]+)" font-size="([\d.]+)"'
+            r'[^>]*>([^<]*)</text>',
             group.group(0) if group else "")
 
         # Island index by piece id, so each number is tested against its OWN
@@ -471,7 +474,10 @@ def test_every_piece_number_lands_inside_its_piece():
 
         own_piece, sizes = 0, []
         for x, y, size, label in placed:
-            px, py, size = float(x), float(y), float(size)
+            size = float(size)
+            # The writer moves a 'middle' label's baseline down by 0.35 size
+            # (no dominant-baseline); undo it to get the label's centre.
+            px, py = float(x), float(y) - fx.MIDDLE_BASELINE_SHIFT * size
             sizes.append(size)
             rings = by_piece.get(label)
             if rings and core._point_in_rings(px, py, rings):
@@ -615,7 +621,10 @@ def test_the_scale_ruler_is_in_real_millimetres():
             # The long bar is the widest horizontal line in the group.
             spans = [abs(float(b) - float(a)) for a, b in re.findall(
                 r'<line x1="([-\d.]+)" y1="[-\d.]+" x2="([-\d.]+)"', body)]
-            rect = re.search(r'<rect [^>]*width="([\d.]+)"', body)
+            # Anchored on x/y so it cannot match stroke-width, which the rect
+            # now carries as an attribute (no CSS).
+            rect = re.search(r'<rect x="[-\d.]+" y="[-\d.]+" '
+                             r'width="([\d.]+)"', body)
             box = re.search(r"viewBox='0 0 ([\d.]+) ([\d.]+)'", svg)
             rows[label] = {
                 "bar_mm": round(max(spans), 3) if spans else None,
@@ -693,15 +702,22 @@ def test_alignment_ticks_are_paired_across_every_seam():
         runs = list(core.iter_boundary_dart_segments(
             bm, uv_layer, settings.max_chord_deviation,
             settings.max_angle_variation_deg, islands=islands_faces))
-        by_island = [[] for _ in islands]
-        for r in runs:
-            by_island[r.island_index].append(r)
 
+        # Changed 2026-11-16: marks are placed per corner-to-corner segment
+        # of seam (foam_marks._segment_tick_params), no longer per cut run
+        # (_run_tick_params), so this asks the function build_marks now uses.
+        # On this cube the answer is the same either way -- every run is one
+        # edge is one segment -- which is why the counts below did not move.
+        import bl_ext.user_default.foamcraft_drachis.foam_marks as fm
+        saved_ticks = settings.ticks_per_run
+        settings.ticks_per_run = 2
+        try:
+            placed = fm._segment_tick_params(islands, settings)
+        finally:
+            settings.ticks_per_run = saved_ticks
         wanted = {}
-        for island_runs in by_island:
-            for run in island_runs:
-                for edge, t in fx._run_tick_params(run, settings):
-                    wanted.setdefault(edge, set()).add(t)
+        for edge, t in placed:
+            wanted.setdefault(edge, set()).add(t)
         marks = sum(len(v) for v in wanted.values())
 
         # How many of those edges really are shared by two islands?
@@ -729,8 +745,8 @@ def test_alignment_ticks_are_paired_across_every_seam():
                 # And each mark is therefore drawn twice, once per piece.
                 "each_mark_is_drawn_on_both_pieces":
                     len(lines) == marks * 2,
-                # Both bounds: no marks at all would satisfy the equalities.
-                "marks_were_produced": marks > 0,
+                # Both bounds, and the known answer: 12 edges, 2 marks each.
+                "twenty_four_marks": marks == 24,
             },
         }
     finally:
@@ -799,16 +815,45 @@ def test_relief_cuts_are_off_by_default():
     out of edges that wanted an ink mark. The code is kept -- a tight compound
     curve can genuinely need one -- but it is now opt-in and named so it
     cannot be mistaken for Alignment Ticks.
+
+    Fixed 2026-11-16. This used to read only the property's metadata, so it
+    passed while the export drew relief wedges whatever the toggle said --
+    nothing here ever looked at a sheet. It now draws one: the seamed cube,
+    whose 6 square pieces have 4 runs each and so 4 run-to-run corners, all
+    at 90 degrees -- 24 relief wedges with the toggle on (V wedge, the
+    default shape), and 0 with it off, at its default.
     """
     settings = _settings()
     prop = settings.bl_rna.properties.get("show_darts")
+
+    obj = _seamed_cube()
+    counts = {}
+    saved = _set(notch_shape='V_WEDGE')
+    try:
+        for label, on in (("default", prop.default if prop else True),
+                          ("on", True)):
+            _set(show_darts=on)
+            bm = _bmesh_of(obj)
+            try:
+                marks = fx.build_marks(bm, bm.loops.layers.uv.active,
+                                       settings, 1.0, obj.matrix_world)
+            finally:
+                bm.free()
+            counts[label] = sum(1 for m in marks.strokes + marks.fills
+                                if m.kind == 'relief')
+    finally:
+        _set(**saved)
+        _set(show_darts=prop.default if prop else False)
     return {
         "default": prop.default if prop else None,
         "ui_name": prop.name if prop else None,
+        "relief_marks": counts,
         "description_mentions_alignment":
             bool(prop) and "alignment" in prop.description.lower(),
         "checks": {
             "off_by_default": prop is not None and prop.default is False,
+            "no_relief_drawn_at_the_default": counts.get("default") == 0,
+            "twenty_four_wedges_when_on": counts.get("on") == 24,
             "renamed_away_from_dart": bool(prop) and "Relief" in prop.name,
             # The description has to point at the real feature, or the next
             # person makes the same mistake.
@@ -1300,6 +1345,146 @@ def test_unapplied_scale_gives_the_sheet_the_screens_run_angles():
     }
 
 
+def _svg_and_marks_for_cube():
+    """The seamed cube's SVG text and the Marks it was written from."""
+    obj = _seamed_cube()
+    bm = _bmesh_of(obj)
+    try:
+        uv_layer = bm.loops.layers.uv.active
+        marks = fx.build_marks(bm, uv_layer, _settings(), 1.0)
+        return fx.svg_from_marks(marks), marks
+    finally:
+        bm.free()
+
+
+_SVG_NS = "{http://www.w3.org/2000/svg}"
+
+
+def test_the_svg_has_no_css_to_misread():
+    """Illustrator ignored the <style> block (CSS id selectors) and
+    dominant-baseline, so strokes had no width or colour. Neither may appear.
+
+    Both bounds: absent, AND the file is not empty (an empty file also has
+    no <style>), so the outlines group must hold exactly six elements --
+    one per island of the seamed cube.
+    """
+    import xml.etree.ElementTree as ET
+    svg, marks = _svg_and_marks_for_cube()
+    root = ET.fromstring(svg)   # also proves the file is well-formed XML
+    # Keep a copy to open in other programs (screenshots/ is gitignored).
+    import os
+    out_dir = r"O:\Work\BlenderPlugin\FoamCraft\screenshots"
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "export_svg_attributes.svg"), "w",
+              encoding="utf-8") as fh:
+        fh.write(svg)
+    outlines = [g for g in root.iter(_SVG_NS + "g") if g.get("id") == "outlines"]
+    n_outline = len(list(outlines[0])) if outlines else 0
+    return {
+        "outline_elements": n_outline,
+        "checks": {
+            "no_style_element": "<style" not in svg,
+            "no_dominant_baseline": "dominant-baseline" not in svg,
+            "no_css_class_hooks": "class=" not in svg,
+            "six_outlines": n_outline == 6,
+        },
+    }
+
+
+def test_every_drawn_element_states_its_own_paint():
+    """Each shape must carry stroke/fill itself; a stroked one needs a width.
+
+    Parsed with ElementTree, not regex, so attribute order cannot matter.
+    The count is asserted > 0 so a parse that finds nothing cannot pass, and
+    both stroked and unstroked (piece fills, stroke="none") are asserted
+    present so neither branch goes unchecked.
+    """
+    import xml.etree.ElementTree as ET
+    svg, marks = _svg_and_marks_for_cube()
+    root = ET.fromstring(svg)
+    shapes = [e for t in ("line", "polygon", "polyline", "path", "rect")
+              for e in root.iter(_SVG_NS + t)]
+    no_paint = [e.tag for e in shapes
+                if e.get("stroke") is None and e.get("fill") is None]
+    stroked = [e for e in shapes if e.get("stroke") not in (None, "none")]
+    bad_width = [e.tag for e in stroked
+                 if not (float(e.get("stroke-width", "0")) > 0)]
+    unstroked = len(shapes) - len(stroked)
+    return {
+        "shapes": len(shapes), "stroked": len(stroked),
+        "unstroked_fills": unstroked,
+        "checks": {
+            "shapes_were_found": len(shapes) > 0,
+            "every_shape_has_stroke_or_fill": not no_paint,
+            "stroked_shapes_exist": len(stroked) > 0,
+            "every_stroke_has_a_positive_width": not bad_width,
+            "fills_were_checked": unstroked > 0,
+        },
+    }
+
+
+def test_every_text_states_its_own_font():
+    """font-size > 0, fill, font-family and text-anchor on every <text>."""
+    import xml.etree.ElementTree as ET
+    svg, marks = _svg_and_marks_for_cube()
+    root = ET.fromstring(svg)
+    texts = list(root.iter(_SVG_NS + "text"))
+    missing = [t.text for t in texts
+               if not all(t.get(a) for a in
+                          ("fill", "font-family", "text-anchor"))]
+    small = [t.text for t in texts if not float(t.get("font-size", "0")) > 0]
+    return {
+        "texts": len(texts),
+        "checks": {
+            "texts_were_found": len(texts) > 0,
+            # Every label in the Marks reached the file: none dropped.
+            "one_text_per_label": len(texts) == len(marks.labels),
+            "every_text_has_fill_family_anchor": not missing,
+            "every_font_size_is_positive": not small,
+            "all_anchored_middle": all(t.get("text-anchor") == "middle"
+                                       for t in texts),
+        },
+    }
+
+
+def test_a_middle_label_baseline_is_shifted_numerically():
+    """Without dominant-baseline, a 'middle' label's y is its centre plus
+    0.35 * size (cap height ~0.7 * size, so half of it). The file's y must
+    equal the Marks label's y + 0.35 * size, within 1e-3 (the writer rounds
+    to 3 places). A 'baseline' label's y is unchanged; the ruler's captions
+    are such, so both branches are measured.
+    """
+    import xml.etree.ElementTree as ET
+    svg, marks = _svg_and_marks_for_cube()
+    root = ET.fromstring(svg)
+    group = next(g for g in root.iter(_SVG_NS + "g") if g.get("id") == "numbers")
+    ys = sorted(float(t.get("y")) for t in group)
+    numbers = [l for l in marks.labels if l.kind == 'number']
+    want = sorted(l.y + 0.35 * l.size_mm for l in numbers)
+    err = max((abs(a - b) for a, b in zip(ys, want)), default=1e9)
+
+    ruler = next(g for g in root.iter(_SVG_NS + "g") if g.get("id") == "ruler")
+    base = sorted(float(t.get("y")) for t in ruler.iter(_SVG_NS + "text"))
+    want_base = sorted(l.y for l in marks.labels
+                       if l.kind == 'ruler' and l.valign == 'baseline')
+    base_err = max((abs(a - b) for a, b in zip(base, want_base)),
+                   default=1e9)
+    return {
+        "numbers": len(numbers), "max_error": err,
+        "ruler_captions": len(want_base), "ruler_error": base_err,
+        "checks": {
+            "six_numbers": len(numbers) == 6 and len(ys) == 6,
+            "middle_shift_applied": err < 1e-3,
+            # Both bounds: the shift is really non-zero here, so an
+            # unshifted writer cannot satisfy the equality above.
+            "shift_is_nonzero": all(0.35 * l.size_mm > 1e-3 for l in numbers),
+            "baseline_labels_unshifted":
+                len(want_base) > 0 and len(base) == len(want_base)
+                and base_err < 1e-3,
+        },
+    }
+
+
 TESTS = (
     test_the_cube_fixture_is_what_we_think,
     test_the_sheet_reproduces_the_uv_layout,
@@ -1319,6 +1504,10 @@ TESTS = (
     test_relief_cuts_are_off_by_default,
     test_the_sheet_and_the_screen_break_runs_at_the_same_corners,
     test_unapplied_scale_gives_the_sheet_the_screens_run_angles,
+    test_the_svg_has_no_css_to_misread,
+    test_every_drawn_element_states_its_own_paint,
+    test_every_text_states_its_own_font,
+    test_a_middle_label_baseline_is_shifted_numerically,
 )
 
 result = {}

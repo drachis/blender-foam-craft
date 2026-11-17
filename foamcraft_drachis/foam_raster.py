@@ -399,6 +399,9 @@ def render_marks(marks, filepath, size=2048, file_format='PNG', dpi=None):
         "fills": len(marks.fills),
         "strokes": len(marks.strokes),
         "labels": len(marks.labels),
+        # Carried out to the operator, which is the only place that can
+        # tell the maker; a warning left in the Marks is a warning unread.
+        "warnings": list(marks.warnings),
     }
     _log.info(foam_log.summary("raster_export", **{
         k: v for k, v in info.items() if k != "path"}))
@@ -500,6 +503,8 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
         if info["clamped"]:
             note = (" (too large for the requested resolution; "
                     "print at the DPI shown)")
+        for note in info.get("warnings", ()):
+            self.report({'WARNING'}, note)
         self.report({'INFO'}, "Wrote foam pattern image to %s: %d x %d px, "
                     "%.0f DPI%s" % (path, info["pixels"][0],
                                     info["pixels"][1], info["dpi"], note))

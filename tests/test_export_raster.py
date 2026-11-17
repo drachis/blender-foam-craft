@@ -879,7 +879,81 @@ def _circle(n):
             for i in range(n)]
 
 
+def test_a_stretched_object_is_reported_and_a_gore_sphere_is_drawn():
+    """Two things only a real mesh shows.
+
+    A warning the model raises has to reach the person: `render` carries
+    `Marks.warnings` out in its info, which is what the operator reports.
+    Both bounds -- an object at identity scale warns about nothing, the same
+    object stretched 2.5x on one axis warns once.
+
+    And the alignment marks are worth looking at on something that is not a
+    cube, so a gore sphere is written out through `shot` for a person to
+    open. Its marks are asserted in tests/test_marks_model.py; here it only
+    has to be non-blank.
+    """
+    import math
+    settings = bpy.context.scene.foamcraft_drachis
+    out, checks = {}, {}
+    for label, scale in (("identity", (1, 1, 1)), ("stretched", (1, 1, 2.5))):
+        obj = _seamed_cube()
+        obj.scale = scale
+        bpy.context.view_layer.update()
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        try:
+            info = fr.render(bm, bm.loops.layers.uv.active, settings,
+                             _path("warn_%s.png" % label), dpi=72,
+                             matrix=obj.matrix_world.copy())
+        finally:
+            bm.free()
+        out[label] = info["warnings"]
+    checks["identity_scale_warns_about_nothing"] = out["identity"] == []
+    checks["a_stretched_object_warns_once"] = len(out["stretched"]) == 1
+
+    sandbox_guard.clear_scene()
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.15, segments=24,
+                                         ring_count=16)
+    obj = bpy.context.object
+    bpy.ops.object.mode_set(mode='EDIT')
+    em = bmesh.from_edit_mesh(obj.data)
+    for e in em.edges:
+        a, b = e.verts
+        if abs(a.co.z - b.co.z) < 1e-9:
+            continue
+        on = [v for v in (a, b) if abs(v.co.x) > 1e-9 or abs(v.co.y) > 1e-9]
+        if on and all(abs(math.atan2(v.co.y, v.co.x) % (math.pi / 3)) < 1e-6
+                      or abs(math.atan2(v.co.y, v.co.x) % (math.pi / 3)
+                             - math.pi / 3) < 1e-6 for v in on):
+            e.seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.04)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    saved = {k: getattr(settings, k)
+             for k in ("show_align_ticks", "tick_mode", "ticks_per_run")}
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    try:
+        settings.show_align_ticks = True
+        settings.tick_mode = 'PER_RUN'
+        settings.ticks_per_run = 3
+        path = shot.next_path("raster_gore_sphere")
+        info = fr.render(bm, bm.loops.layers.uv.active, settings, path,
+                         dpi=150, matrix=obj.matrix_world.copy())
+    finally:
+        for k, v in saved.items():
+            setattr(settings, k, v)
+        bm.free()
+    out["gore_sphere"] = {k: v for k, v in info.items() if k != "path"}
+    out["example"] = path
+    checks["the_gore_sphere_has_six_pieces"] = info["fills"] == 6
+    checks["and_it_has_marks_on_it"] = info["strokes"] > 6
+    return dict(out, checks=checks)
+
+
 TESTS = (
+    test_a_stretched_object_is_reported_and_a_gore_sphere_is_drawn,
     test_gpu_context_probe,
     test_pixel_size_is_arithmetic,
     test_sheet_at_254_dpi_is_1000_by_500,

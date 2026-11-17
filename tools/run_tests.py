@@ -89,6 +89,8 @@ TEST_FILES = (
     #     python tests/test_tile_svg.py
     "tests/test_tile_svg.py",
     "tests/test_export_raster.py",
+    # The screen shows the registration ticks the sheet prints.
+    "tests/test_overlay_ticks.py",
     "tests/test_overlay_gui.py",
 )
 

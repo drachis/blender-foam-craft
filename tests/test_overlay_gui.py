@@ -115,7 +115,7 @@ def _capture(area, region, label):
     return path
 
 
-def _changed_pixels(path_a, path_b):
+def _changed_pixels(path_a, path_b, sample=_SAMPLE):
     """How many sampled pixels differ between two captures."""
     img_a = bpy.data.images.load(path_a)
     img_b = bpy.data.images.load(path_b)
@@ -126,7 +126,7 @@ def _changed_pixels(path_a, path_b):
             return None
         changed = 0
         total = 0
-        for i in range(0, len(a), 4 * _SAMPLE):
+        for i in range(0, len(a), 4 * sample):
             total += 1
             if abs(a[i] - b[i]) > 0.02 or abs(a[i + 1] - b[i + 1]) > 0.02 \
                     or abs(a[i + 2] - b[i + 2]) > 0.02:
@@ -213,7 +213,153 @@ def test_overlay_draws_into_the_uv_editor():
     }
 
 
-TESTS = (test_overlay_draws_into_the_uv_editor,)
+def _gore_sphere(gores=6):
+    """A 0.3 m sphere peeled into six gores, left in edit mode.
+
+    The fixture tests/test_overlay_ticks.py checks the tick *positions* on;
+    here it is only something realistic to look at. Real-world scale
+    matters: a tick is 6 mm of foam, so on a 2 m test shape it would be a
+    speck, and on this one it is a visible fraction of a gore.
+    """
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.15, segments=24,
+                                         ring_count=16)
+    obj = bpy.context.object
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    step = 2.0 * math.pi / gores
+
+    def phi(v):
+        if abs(v.co.x) < 1e-9 and abs(v.co.y) < 1e-9:
+            return None
+        return math.atan2(v.co.y, v.co.x) % (2.0 * math.pi)
+
+    for e in bm.edges:
+        a, b = e.verts
+        if abs(a.co.z - b.co.z) < 1e-9:
+            continue
+        pa, pb = phi(a), phi(b)
+        p = pa if pa is not None else pb
+        if p is None:
+            continue
+        if pa is not None and pb is not None:
+            if min(abs(pa - pb), 2 * math.pi - abs(pa - pb)) > 1e-6:
+                continue
+        if abs(p - round(p / step) * step) < 1e-6:
+            e.seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.04)
+    return obj
+
+
+def _force_rebuild(area, region):
+    """Make the overlay's cache current now, as the timer would later.
+
+    A timer never fires part-way through a script, and the overlay refuses
+    to draw while dirty -- so without this a capture is legitimately blank.
+    """
+    overlay.mark_dirty()
+    with bpy.context.temp_override(area=area, region=region):
+        bpy.ops.foamcraft_drachis.refresh_overlay()
+    overlay._timer_tick()
+
+
+def test_alignment_ticks_draw_into_the_uv_editor():
+    """The registration ticks must reach the screen, and only they change.
+
+    The overlay stays on for both captures; only Alignment Ticks is
+    toggled. So whatever differs between the two frames is the ticks -- the
+    brackets, angles and piece numbers are identical in both.
+
+    Taken twice: once with the whole layout in view, and once zoomed in
+    (view ratio 4.0, which measured about 1.4x the fitted view), because
+    a tick is 6 mm of a pattern roughly a metre across and at
+    whole-layout framing it is a handful of pixels -- real, countable, and
+    not something an eye can judge. The zoomed pair is the one to look at.
+    """
+    if bpy.app.background:
+        return {"skipped": "needs a window; run with --gui",
+                "checks": {"ran_with_a_window": False}}
+
+    _clear()
+    _gore_sphere()
+
+    area, region = _uv_area()
+    if area is None or region is None:
+        return {"skipped": "no usable area", "checks": {"found_uv_area": False}}
+
+    s = bpy.context.scene.foamcraft_drachis
+    names = ("show_overlay", "show_align_ticks", "tick_mode", "ticks_per_run",
+             "tick_numbers", "only_selected")
+    saved = {k: getattr(s, k) for k in names}
+    # Every 5th pixel rather than every 37th: a tick is a few pixels long,
+    # and the coarse sampling the whole-overlay test uses could step over
+    # most of them.
+    sample = 5
+    try:
+        s.show_overlay = True
+        s.only_selected = False
+        s.tick_mode = 'PER_RUN'
+        s.ticks_per_run = 2
+        s.tick_numbers = False
+
+        with bpy.context.temp_override(area=area, region=region):
+            bpy.ops.image.view_all(fit_view=True)
+
+        s.show_align_ticks = False
+        _force_rebuild(area, region)
+        ticks_off = len(overlay._cache.align_ticks)
+        off = _capture(area, region, "ticks_off")
+
+        s.show_align_ticks = True
+        _force_rebuild(area, region)
+        ticks_on = len(overlay._cache.align_ticks)
+        on = _capture(area, region, "ticks_on")
+
+        with bpy.context.temp_override(area=area, region=region):
+            bpy.ops.image.view_zoom_ratio(ratio=4.0)
+        on_zoom = _capture(area, region, "ticks_on_zoom")
+
+        s.show_align_ticks = False
+        _force_rebuild(area, region)
+        off_zoom = _capture(area, region, "ticks_off_zoom")
+    finally:
+        for k, v in saved.items():
+            setattr(s, k, v)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    whole = _changed_pixels(off, on, sample)
+    zoomed = _changed_pixels(off_zoom, on_zoom, sample)
+    if whole is None or zoomed is None:
+        return {"error": "captures differ in size",
+                "checks": {"comparable": False}}
+    changed, total = whole
+    zchanged, ztotal = zoomed
+
+    return {
+        "off": off, "on": on, "off_zoom": off_zoom, "on_zoom": on_zoom,
+        "sampled_pixels": total,
+        "changed_pixels": changed,
+        "zoomed_sampled_pixels": ztotal,
+        "zoomed_changed_pixels": zchanged,
+        "cached_ticks_on": ticks_on,
+        "cached_ticks_off": ticks_off,
+        "checks": {
+            "draw_handler_registered": overlay._draw_handle is not None,
+            # The data: there when on, gone when off.
+            "ticks_cached_when_on": ticks_on > 0,
+            "none_cached_when_off": ticks_off == 0,
+            # The picture: something changed, and it is thin marks -- not
+            # the whole overlay repainting, which would mean the toggle had
+            # disturbed something other than the ticks.
+            "ticks_changed_the_frame": 0 < changed < total * 0.05,
+            "ticks_changed_the_zoomed_frame": 0 < zchanged < ztotal * 0.05,
+        },
+    }
+
+
+TESTS = (test_overlay_draws_into_the_uv_editor,
+         test_alignment_ticks_draw_into_the_uv_editor)
 
 result = {}
 _all_pass = True

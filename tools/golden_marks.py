@@ -21,6 +21,14 @@ the baseline has to pin what each currently produces:
   * `svg`      -- the element count of each group in the exported sheet, and
                   a checksum of the whole file. Counts say *what* changed;
                   the checksum catches a change the counts cannot see.
+  * `marks`    -- the model itself, `foam_marks.build_marks`: how many of
+                  each (type, kind) it returns, and one checksum over every
+                  number in it (rounded as below) and every label's text, in
+                  sequence order. The SVG and raster only draw this, so a
+                  change here is a change to every backend at once.
+
+The world matrix is passed to both, as the export operator passes it, so
+the sweep exercises the path the user's export takes.
 
 DETERMINISM
 
@@ -67,6 +75,7 @@ for _n in [n for n in list(sys.modules) if n.startswith(_MOD)]:
     del sys.modules[_n]
 import bl_ext.user_default.foamcraft_drachis.foam_angle_core as core
 import bl_ext.user_default.foamcraft_drachis.foam_export as fx
+import bl_ext.user_default.foamcraft_drachis.foam_marks as fm
 import bl_ext.user_default.foamcraft_drachis.foam_overlay as ov
 
 
@@ -206,6 +215,16 @@ SWEEPS = (
     ("nofill", {{"island_fill": False}}),
     ("darts", {{"show_darts": True}}),
     ("noticks", {{"show_align_ticks": False}}),
+    # Heat-form marks only exist where a seam needs more blade tilt than
+    # allowed; at 20 degrees the cube (45 per side) and the gores do.
+    ("heatform", {{"show_heat_form": True, "max_tilt_deg": 20.0}}),
+    ("ticknumbers", {{"tick_numbers": True}}),
+    # Slit darts are only drawn with Relief Cuts on.
+    ("slit", {{"show_darts": True, "notch_shape": 'SLIT'}}),
+    ("alloff", {{"show_align_ticks": False, "island_fill": False,
+                 "show_island_ids": False, "show_brackets": False,
+                 "show_scale_ruler": False, "show_darts": False,
+                 "show_heat_form": False}}),
 )
 
 DEFAULTS = {{
@@ -220,6 +239,9 @@ DEFAULTS = {{
     "show_scale_ruler": True,
     "only_selected": False,
     "tick_numbers": False,
+    "show_heat_form": True,
+    "max_tilt_deg": 45.0,
+    "notch_shape": 'V_WEDGE',
 }}
 
 records = []
@@ -298,10 +320,50 @@ for name, build in FIXTURES:
         bm.edges.index_update()
         uv = bm.loops.layers.uv.active
         try:
-            svg = fx.generate_svg(bm, uv, s, 1.0)
+            svg = fx.generate_svg(bm, uv, s, 1.0, obj.matrix_world)
         except Exception as exc:
             svg = "ERROR %s" % exc
+        try:
+            model = fm.build_marks(bm, uv, s, 1.0, obj.matrix_world)
+        except Exception as exc:
+            model = None
+            records.append("%s|marks|ERROR|%s" % (tag, exc))
         bm.free()
+
+        if model is not None:
+            counts = {{}}
+            for family, items in (("fill", model.fills),
+                                  ("stroke", model.strokes),
+                                  ("label", model.labels)):
+                for item in items:
+                    key = (family, item.kind)
+                    counts[key] = counts.get(key, 0) + 1
+            for (family, kind) in sorted(counts):
+                records.append("%s|marks_count|%s|%s|n=%d"
+                               % (tag, family, kind, counts[(family, kind)]))
+
+            def _flatten(value, out):
+                if isinstance(value, bool):
+                    out.append(str(int(value)))
+                elif isinstance(value, (int, float)):
+                    out.append(_r(value))
+                elif isinstance(value, str):
+                    out.append(repr(value))
+                elif value is None:
+                    out.append("None")
+                else:
+                    for v in value:
+                        _flatten(v, out)
+                    out.append(";")
+                return out
+
+            records.append("%s|marks_sheet|%s|%s|warnings=%d" % (
+                tag, _r(model.width_mm), _r(model.height_mm),
+                len(model.warnings)))
+            records.append("%s|marks_sha|%s" % (
+                tag, hashlib.sha256(
+                    "|".join(_flatten(model, [])).encode("utf-8")
+                ).hexdigest()[:16]))
 
         import re as _re
         for gid in ("fills", "outlines", "darts", "ticks", "align",

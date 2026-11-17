@@ -40,7 +40,7 @@ re-deriving anything:
                  'ruler'    scale bar captions
 """
 
-from math import radians, tan
+from math import acos, ceil, degrees, radians, tan
 from typing import NamedTuple, Optional, Tuple
 
 from mathutils import Vector
@@ -104,6 +104,11 @@ class Marks(NamedTuple):
     convex_color: Color = (0.0, 0.0, 0.0)
     concave_color: Color = (0.0, 0.0, 0.0)
     heat_color: Color = (0.0, 0.0, 0.0)
+    # Added after the original contract, defaulted. Plain-language notes for
+    # the maker about a sheet that is drawn but cannot be fully trusted --
+    # currently only unapplied non-uniform scale (see `scale_warnings`). A
+    # backend may show or log them; it must not alter the marks for them.
+    warnings: Tuple[str, ...] = ()
 
 
 # Real-world sizes for pattern elements that only make sense printed at 1:1 --
@@ -147,6 +152,47 @@ def _face_uv_area(face, uv_layer):
     return area
 
 
+def _face_world_area(face, matrix):
+    """A face's area after `matrix`, by Newell's method -- the same
+    `area_poly_v3` construction `BMFace.calc_area` uses, applied to the
+    transformed corners, in Python doubles."""
+    pts = [tuple(matrix @ v.co) for v in face.verts]
+    nx = ny = nz = 0.0
+    n = len(pts)
+    for i in range(n):
+        x0, y0, z0 = pts[i]
+        x1, y1, z1 = pts[(i + 1) % n]
+        nx += (y0 - y1) * (z0 + z1)
+        ny += (z0 - z1) * (x0 + x1)
+        nz += (x0 - x1) * (y0 + y1)
+    return 0.5 * (nx * nx + ny * ny + nz * nz) ** 0.5
+
+
+# Scale axes further apart than this (relative) are reported. 0.1%: well
+# above float noise in a world matrix, and below anything a maker could see
+# on a printed piece (1 mm in a metre).
+NON_UNIFORM_SCALE_TOL = 1e-3
+
+
+def scale_warnings(matrix):
+    """Plain-language notes about a world matrix the sheet cannot honour.
+
+    One UV->mm factor serves the whole sheet, so a scale that differs per
+    axis makes every piece wrong in a different direction. The fix is the
+    maker's, in Blender, and is said as such rather than corrected here.
+    """
+    if matrix is None:
+        return ()
+    axes = [abs(c) for c in matrix.to_scale()]
+    if min(axes) <= 0.0:
+        return ("object has zero scale on an axis; the pattern cannot be "
+                "sized",)
+    if max(axes) / min(axes) - 1.0 > NON_UNIFORM_SCALE_TOL:
+        return ("object has non-uniform scale; apply scale (Ctrl+A) for a "
+                "true-size pattern",)
+    return ()
+
+
 def _polygon_centroid(pts):
     """Area-weighted centroid of a closed polygon; falls back to the simple
     mean for degenerate (near-zero-area) polygons such as a two-point sliver."""
@@ -181,6 +227,7 @@ class _Island:
         self.faces = faces
         self.piece_id = index + 1  # overwritten below if the attribute exists
         self.cycles = core.island_boundary_cycles(faces, uv_layer)
+        self.uv_layer = uv_layer
         self.sheet = sheet
 
         # The island's own UV bounds. Used for its centroid, which decides
@@ -224,8 +271,17 @@ class _Sheet:
     check already reports pieces that distort too far.
     """
 
-    def __init__(self, islands_faces, uv_layer, scale_length):
-        area_3d = sum(f.calc_area() for fs in islands_faces for f in fs)
+    def __init__(self, islands_faces, uv_layer, scale_length, matrix=None):
+        # Areas through the world matrix when one is given: an object with
+        # unapplied scale is that size in the scene, and the pattern is for
+        # the thing being built, not for its mesh data. A uniform scale s then
+        # gives a sheet exactly s times larger each way. A non-uniform one
+        # cannot be honoured by one UV->mm factor -- see `scale_warnings`.
+        if matrix is None:
+            area_3d = sum(f.calc_area() for fs in islands_faces for f in fs)
+        else:
+            area_3d = sum(_face_world_area(f, matrix)
+                          for fs in islands_faces for f in fs)
         area_uv = sum(_face_uv_area(f, uv_layer)
                       for fs in islands_faces for f in fs)
         # One ratio for the whole mesh, so every piece shares a scale and the
@@ -362,16 +418,19 @@ def _edge_canonical_start(edge):
 
 
 def _run_tick_params(run, settings):
-    """Where this run wants its ticks, as (edge, t) on the 3D mesh.
+    """The OLD Per Cut Run placement: ticks spread along one saw run.
 
-    Per Cut Run only. `t` runs from the edge's canonical start, so the two
-    faces sharing the edge derive the same point from it.
+    No longer used to place marks (see `_segment_tick_params`). Kept because
+    foam_export re-exports the name and the before/after measurement in
+    tests/test_marks_model.py asks it what the old placement was.
 
-    By Distance is not done here, and cannot be: a run is one blade-tilt
-    pass, and restarting the measurement at each run makes the gaps depend on
-    where the bevel happens to change rather than on the foam. Asking for a
-    mark every 30 mm and getting them every 12, 30, 9, 30, 30 is not what the
-    setting says. It walks the seam instead -- see `_seam_tick_params`.
+    Why it was replaced: a run ends wherever the bevel angle drifts past
+    `max_angle_variation_deg`, not only at corners, so distributing per run
+    restarted the marks at every such break. Measured on a 6-gore sphere:
+    36 runs over 6 corner-to-corner seams, 72 placements where the maker
+    asked for 12, crowded towards run ends, and the two sides of a seam
+    breaking their runs in different places. The maker asked for marks
+    spread from corner to corner of an edge.
     """
     edges = []
     total = 0.0
@@ -505,44 +564,163 @@ def _seam_chains(islands):
     return chains
 
 
-def _seam_tick_params(islands, settings):
-    """Marks every `tick_spacing` of real seam, walked continuously.
+def _co_key(vert):
+    c = vert.co
+    return (c.x, c.y, c.z)
 
-    Returned as (edge, t) from each edge's canonical start, so both pieces
-    sharing the seam derive the same point and carry the same dash.
+
+def _outline_corner_verts(islands, corner_angle_deg):
+    """Indices of the vertices where some piece's outline has a corner.
+
+    The same test `core.segment_boundary_cycle` breaks runs with: the turn
+    between the UV directions arriving at and leaving a boundary vertex,
+    `acos` of their dot product, compared `>= corner_angle_deg`. It is
+    evaluated on every island's own outline, and a vertex is a corner if
+    *either* piece turns there -- the two sides of a seam are unwrapped
+    separately and need not turn by the same amount, and a mark must be
+    decided once for both, so the stricter reading wins.
+
+    Not taken from the runs: a run also ends where the bevel angle drifts
+    (`max_angle_variation_deg`) or the chord bows (`max_chord_deviation`),
+    and those are saw-pass limits, not corners of the piece. Restarting the
+    tick distribution at them is what crowded marks onto run ends.
     """
-    step = max(float(settings.tick_spacing), 1e-4)
-    out = []
+    corners = set()
+    for isl in islands:
+        uv_layer = isl.uv_layer
+        for cycle in isl.cycles:
+            n = len(cycle)
+            if n < 3:
+                continue
+            for k in range(n):
+                prev, loop = cycle[k - 1], cycle[k]
+                a = loop[uv_layer].uv - prev[uv_layer].uv
+                b = loop.link_loop_next[uv_layer].uv - loop[uv_layer].uv
+                if a.length < 1e-12 or b.length < 1e-12:
+                    continue
+                cosine = max(-1.0, min(1.0, a.normalized().dot(b.normalized())))
+                if degrees(acos(cosine)) >= corner_angle_deg:
+                    corners.add(loop.vert.index)
+    return corners
+
+
+def _tick_segments(islands, corner_angle_deg, matrix=None):
+    """The seams, cut into corner-to-corner segments, oriented geometrically.
+
+    A segment is what alignment marks are distributed along: a maximal
+    stretch of seam between the same two pieces, ended by a junction (a
+    third piece, or an open rim, meets it -- `_seam_chains` already breaks
+    there) or by a corner of either piece's outline.
+
+    Each segment is a list of (edge, entry_vert, length), walked from one
+    end. Which end is chosen by coordinate, never by element order: the
+    lower-coordinate end of an open segment; for a closed ring, its
+    lowest-coordinate corner (or vertex, when it has none), walked towards
+    the lower of its two neighbours. The distributions below are symmetric
+    under reversal anyway, so this only fixes the last bits of arithmetic,
+    which is what a reproducible export across a rebuilt mesh needs.
+
+    Lengths are measured through `matrix` when given, so a spacing in real
+    units means real units on a scaled object.
+    """
+    corners = _outline_corner_verts(islands, corner_angle_deg)
+
+    def length(edge):
+        a, b = edge.verts[0].co, edge.verts[1].co
+        if matrix is not None:
+            a, b = matrix @ a, matrix @ b
+        return (b - a).length
+
+    segments = []
     for chain in _seam_chains(islands):
-        lengths = [e.calc_length() for e in chain]
-        total = sum(lengths)
-        if total <= 1e-9:
+        verts = [chain_direction_start(chain, 0)]
+        for e in chain:
+            verts.append(e.other_vert(verts[-1]))
+        closed = len(chain) > 1 and verts[-1] is verts[0]
+        if closed:
+            ring = verts[:-1]
+            # Edges: chain[k] joins ring[k] and ring[k + 1].
+            cut = [k for k, v in enumerate(ring) if v.index in corners]
+            pool = cut if cut else range(len(ring))
+            s = min(pool, key=lambda k: _co_key(ring[k]))
+            forward = _co_key(ring[(s + 1) % len(ring)]) <= \
+                _co_key(ring[s - 1])
+            if forward:
+                order = [(chain[(s + k) % len(chain)], ring[(s + k) % len(ring)])
+                         for k in range(len(chain))]
+            else:
+                order = [(chain[(s - 1 - k) % len(chain)],
+                          ring[(s - k) % len(ring)])
+                         for k in range(len(chain))]
+        else:
+            order = list(zip(chain, verts[:-1]))
+            if _co_key(verts[-1]) < _co_key(verts[0]):
+                order = [(e, e.other_vert(v)) for e, v in reversed(order)]
+
+        current = []
+        for k, (edge, entry) in enumerate(order):
+            if k > 0 and entry.index in corners:
+                segments.append(current)
+                current = []
+            current.append((edge, entry, length(edge)))
+        if current:
+            segments.append(current)
+    return segments
+
+
+def _segment_distances(total, settings, mode=None):
+    """Where along a segment of length `total` its marks go.
+
+    PER_RUN: N marks at i/(N+1) of the length -- never at either end.
+    BY_DISTANCE: every `tick_spacing`, the leftover split equally between
+    the two ends; a segment no longer than one spacing gets one mark in its
+    middle. Both are symmetric under reversing the segment.
+    """
+    mode = mode or settings.tick_mode
+    if mode == 'BY_DISTANCE':
+        step = max(float(settings.tick_spacing), 1e-4)
+        # Gaps strictly inside the segment, so no mark lands on an end. The
+        # epsilon keeps a segment of exactly k steps (0.2 m at 0.05) from
+        # flipping between k-1 and k gaps on its last bit of arithmetic.
+        gaps = max(0, ceil(total / step - 1e-6) - 1)
+        first = (total - gaps * step) / 2.0
+        return [first + i * step for i in range(gaps + 1)]
+    count = max(1, int(settings.ticks_per_run))
+    return [total * i / (count + 1) for i in range(1, count + 1)]
+
+
+def _segment_tick_params(islands, settings, matrix=None, mode=None):
+    """Every alignment mark, as (edge, t) from the edge's canonical start.
+
+    Decided once per geometric segment, so both pieces sharing the seam
+    derive the same point and carry the same dash.
+    """
+    out = []
+    for segment in _tick_segments(islands, settings.corner_angle_deg,
+                                  matrix):
+        total = sum(seg_len for _e, _v, seg_len in segment)
+        if total <= 1e-12:
             continue
-        # Half a step in from the start, so a chain does not open with a mark
-        # sitting on its own corner.
-        d = step * 0.5
-        if d >= total:
-            # Shorter than one step. One mark in the middle still beats none:
-            # a short seam is exactly where a piece can slip unnoticed.
-            d = total * 0.5
-        walked = 0.0
-        index = 0
-        while d < total and index < len(chain):
-            while index < len(chain) and d > walked + lengths[index]:
-                walked += lengths[index]
+        index, walked = 0, 0.0
+        for d in _segment_distances(total, settings, mode):
+            while index < len(segment) - 1 and \
+                    d > walked + segment[index][2]:
+                walked += segment[index][2]
                 index += 1
-            if index >= len(chain):
-                break
-            edge = chain[index]
-            local = (d - walked) / lengths[index]
-            start = _edge_canonical_start(edge)
-            # The chain is walked from one end; express the parameter from
-            # the edge's own canonical end so both faces agree on it.
-            if chain_direction_start(chain, index) is not start:
+            edge, entry, seg_len = segment[index]
+            if seg_len <= 1e-12:
+                continue
+            local = max(0.0, min(1.0, (d - walked) / seg_len))
+            if entry is not _edge_canonical_start(edge):
                 local = 1.0 - local
-            out.append((edge, round(max(0.0, min(1.0, local)), 6)))
-            d += step
+            out.append((edge, round(local, 6)))
     return out
+
+
+def _seam_tick_params(islands, settings, matrix=None):
+    """By Distance placement, under its old name (re-exported by
+    foam_export). See `_segment_tick_params`."""
+    return _segment_tick_params(islands, settings, matrix, 'BY_DISTANCE')
 
 
 def chain_direction_start(chain, index):
@@ -585,7 +763,7 @@ def _pt(v):
 
 
 def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
-                     tick_length_mm, font_mm, width_mm):
+                     tick_length_mm, font_mm, width_mm, matrix=None):
     """Tick marks on every seam, drawn on both pieces that share it.
 
     Returns (strokes, labels): one 'align' Stroke per dash, and one 'align'
@@ -602,16 +780,16 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
     Deciding per island instead would let the two sides disagree: their runs
     are segmented from their own boundaries and need not break at the same
     places.
+
+    Both modes distribute along corner-to-corner segments of the seam
+    (`_tick_segments`), not along cut runs. `runs_by_island` is no longer
+    read; it stays in the signature for the overlay, which calls this.
+    `matrix` (the object's world matrix) makes By Distance spacing a real
+    length on a scaled object; None measures in object space.
     """
     wanted = {}
-    if settings.tick_mode == 'BY_DISTANCE':
-        for edge, t in _seam_tick_params(islands, settings):
-            _remember_tick(wanted, edge, t)
-    else:
-        for runs in runs_by_island:
-            for run in runs:
-                for edge, t in _run_tick_params(run, settings):
-                    _remember_tick(wanted, edge, t)
+    for edge, t in _segment_tick_params(islands, settings, matrix):
+        _remember_tick(wanted, edge, t)
     if not wanted:
         return [], []
 
@@ -779,7 +957,7 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
     else on the export path; a backend draws what it is given.
     """
     islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
-    sheet = _Sheet(islands_faces, uv_layer, scale_length)
+    sheet = _Sheet(islands_faces, uv_layer, scale_length, matrix)
     islands = [_Island(i, faces, uv_layer, sheet)
                for i, faces in enumerate(islands_faces)]
 
@@ -948,6 +1126,12 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
                     brackets.append(Stroke('bracket', (_pt(tick_a), _pt(tick_b)),
                                            False, stroke_mm * 0.7, BLACK))
 
+                # Relief cuts remove material, so they are opt-in: the same
+                # "Relief Cuts" toggle (show_darts) the overlay obeys. They
+                # used to be emitted regardless, so every exported sheet
+                # carried wedges the screen did not show.
+                if not settings.show_darts:
+                    continue
                 boundary_angle = _boundary_angle_deg(run_a, run_b)
                 if boundary_angle is None or n < 2:
                     continue
@@ -991,7 +1175,7 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
         align, align_labels = _alignment_ticks(
             islands, uv_layer, runs_by_island, settings,
             settings.tick_length * scale_length * 1000.0,
-            angle_font_mm * 0.7, stroke_mm * 0.9)
+            angle_font_mm * 0.7, stroke_mm * 0.9, matrix)
 
     ruler, ruler_labels = [], []
     if settings.show_scale_ruler:
@@ -1010,4 +1194,5 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
         convex_color=convex_rgb,
         concave_color=concave_rgb,
         heat_color=heat_rgb,
+        warnings=scale_warnings(matrix),
     )

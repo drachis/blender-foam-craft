@@ -21,7 +21,7 @@ import bpy
 import bmesh
 
 from . import foam_angle_core as core  # noqa: F401  (kept for importers)
-from .foam_marks import build_marks
+from .foam_marks import build_marks, scale_warnings
 
 # What to draw is decided in foam_marks.build_marks; this module only writes
 # it out. The helpers that used to live here moved with that decision, and
@@ -51,24 +51,62 @@ def _points_attr(points):
     return " ".join(f"{_fmt(x)},{_fmt(y)}" for x, y in points)
 
 
-def _line(points):
-    (x1, y1), (x2, y2) = points[0], points[-1]
+# Every element below carries its own presentation attributes and nothing
+# depends on a <style> block. Illustrator's SVG import applies CSS id
+# selectors and `dominant-baseline` poorly (strokes lost their width and
+# colour, marks went missing), whereas presentation attributes are read by
+# every importer, browser and Inkscape alike.
+
+FONT_FAMILY = "Arial, Helvetica, sans-serif"
+
+# `dominant-baseline="middle"` is not used. To centre a label vertically
+# without it, the baseline is moved down from the centre by this fraction of
+# the font size. A digit or capital is about 0.7 of the font size tall
+# (Label's own comment says the same), so its middle sits 0.35 above the
+# baseline; the baseline is therefore 0.35 * size below the centre.
+MIDDLE_BASELINE_SHIFT = 0.35
+
+
+def _stroke_attrs(stroke):
+    """stroke colour, width and dash as attributes; fill is the caller's."""
+    attrs = (f'stroke="{_rgb_to_hex(*stroke.color)}" '
+             f'stroke-width="{_fmt(stroke.width_mm)}"')
+    if stroke.dash:
+        attrs += (f' stroke-dasharray="{_fmt(stroke.dash[0])},'
+                  f'{_fmt(stroke.dash[1])}"')
+    return attrs
+
+
+def _line(stroke):
+    (x1, y1), (x2, y2) = stroke.points[0], stroke.points[-1]
     return (f'<line x1="{_fmt(x1)}" y1="{_fmt(y1)}" '
-            f'x2="{_fmt(x2)}" y2="{_fmt(y2)}"/>')
+            f'x2="{_fmt(x2)}" y2="{_fmt(y2)}" '
+            f'fill="none" {_stroke_attrs(stroke)}/>')
 
 
-def _text(label, extra=""):
-    return (f'<text{extra} x="{_fmt(label.x)}" y="{_fmt(label.y)}" '
-            f'font-size="{_fmt(label.size_mm)}">{label.text}</text>')
+def _polygon(stroke):
+    return (f'<polygon points="{_points_attr(stroke.points)}" '
+            f'fill="none" {_stroke_attrs(stroke)}/>')
 
 
-def _rect(points):
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
+def _text(label):
+    y = label.y
+    if label.valign == 'middle':
+        y += MIDDLE_BASELINE_SHIFT * label.size_mm
+    return (f'<text x="{_fmt(label.x)}" y="{_fmt(y)}" '
+            f'font-size="{_fmt(label.size_mm)}" '
+            f'font-family="{FONT_FAMILY}" '
+            f'fill="{_rgb_to_hex(*label.color)}" '
+            f'text-anchor="middle">{label.text}</text>')
+
+
+def _rect(stroke):
+    xs = [p[0] for p in stroke.points]
+    ys = [p[1] for p in stroke.points]
     x, y = min(xs), min(ys)
     return (f'<rect x="{_fmt(x)}" y="{_fmt(y)}" '
             f'width="{_fmt(max(xs) - x)}" height="{_fmt(max(ys) - y)}" '
-            f'fill="none"/>')
+            f'fill="none" {_stroke_attrs(stroke)}/>')
 
 
 def svg_from_marks(marks):
@@ -76,9 +114,8 @@ def svg_from_marks(marks):
 
     Writes only. Every decision about whether a mark exists was made in
     `build_marks`; here a mark's `kind` picks its group and element, and
-    nothing else is consulted. Styling is by group in a <style> block, as it
-    always was, so the text of the file is what generate_svg produced before
-    the split -- byte for byte, which tools/golden_marks.py checks.
+    nothing else is consulted. Styling is per element, as attributes, so no
+    importer has to understand CSS.
     """
     fills = [m for m in marks.fills if m.kind == 'piece']
     relief_fills = [m for m in marks.fills if m.kind == 'relief']
@@ -94,24 +131,31 @@ def svg_from_marks(marks):
             subpaths.append(head + " Z")
         fill_els.append(
             f'<path d="{" ".join(subpaths)}" fill-rule="evenodd" '
-            f'fill="{_rgb_to_hex(*f.color)}"/>')
+            f'fill="{_rgb_to_hex(*f.color)}" stroke="none"/>')
 
-    outline_els = [f'<polygon points="{_points_attr(s.points)}"/>'
-                   for s in strokes_of('outline')]
+    outline_els = [_polygon(s) for s in strokes_of('outline')]
 
-    # A filled relief (a slit) is one polygon, filled by default and stroked
-    # by the group's style; its outline stroke is the same polygon and is not
-    # written twice. An unfilled relief (a wedge) is written fill="none".
-    dart_els = [f'<polygon points="{_points_attr(f.rings[0])}"/>'
-                for f in relief_fills]
+    # A filled relief (a slit) is one polygon, filled and stroked; its
+    # outline stroke is the same polygon and is not written twice, but
+    # supplies the stroke. An unfilled relief (a wedge) is written fill="none".
+    relief_strokes = strokes_of('relief')
+    dart_els = []
+    for f in relief_fills:
+        match = next((s for s in relief_strokes if s.points == f.rings[0]),
+                     None)
+        stroke_attrs = (_stroke_attrs(match) if match else
+                        f'stroke="#000000" '
+                        f'stroke-width="{_fmt(marks.hairline_mm * 0.7)}"')
+        dart_els.append(f'<polygon points="{_points_attr(f.rings[0])}" '
+                        f'fill="{_rgb_to_hex(*f.color)}" {stroke_attrs}/>')
     filled = {f.rings[0] for f in relief_fills}
-    dart_els += [f'<polygon points="{_points_attr(s.points)}" fill="none"/>'
-                 for s in strokes_of('relief') if s.points not in filled]
+    dart_els += [_polygon(s) for s in relief_strokes
+                 if s.points not in filled]
 
-    tick_els = [_line(s.points) for s in strokes_of('bracket')]
-    align_els = [_line(s.points) for s in strokes_of('align')]
+    tick_els = [_line(s) for s in strokes_of('bracket')]
+    align_els = [_line(s) for s in strokes_of('align')]
     align_label_els = [_text(l) for l in labels_of('align')]
-    angle_els = [_text(l, f' class="{l.tone}"') for l in labels_of('angle')]
+    angle_els = [_text(l) for l in labels_of('angle')]
     number_els = [_text(l) for l in labels_of('number')]
 
     # Each heat-form run is a polyline followed by its note.
@@ -119,74 +163,46 @@ def svg_from_marks(marks):
     heat_strokes, heat_labels = strokes_of('heat'), labels_of('heat')
     for i in range(max(len(heat_strokes), len(heat_labels))):
         if i < len(heat_strokes):
-            heat_els.append(f'<polyline points="'
-                            f'{_points_attr(heat_strokes[i].points)}" '
-                            f'fill="none"/>')
+            s = heat_strokes[i]
+            heat_els.append(f'<polyline points="{_points_attr(s.points)}" '
+                            f'fill="none" {_stroke_attrs(s)}/>')
         if i < len(heat_labels):
-            label = heat_labels[i]
-            heat_els.append(f'<text x="{_fmt(label.x)}" y="{_fmt(label.y)}" '
-                            f'font-size="{_fmt(label.size_mm)}">'
-                            f'{label.text}</text>')
+            heat_els.append(_text(heat_labels[i]))
 
     # The ruler's bar and ticks first, then its square and captions left to
     # right -- the order the sheet has always listed them in.
     ruler_strokes = strokes_of('ruler')
-    ruler_els = [_line(s.points) for s in ruler_strokes if not s.closed]
-    rest = [(min(p[0] for p in s.points), _rect(s.points))
+    ruler_els = [_line(s) for s in ruler_strokes if not s.closed]
+    rest = [(min(p[0] for p in s.points), _rect(s))
             for s in ruler_strokes if s.closed]
     rest += [(l.x, _text(l)) for l in labels_of('ruler')]
     rest.sort(key=lambda item: item[0])
     ruler_els += [el for _, el in rest]
 
-    def group(gid, css_class, elements):
+    def group(gid, elements):
         body = "\n".join(elements)
-        return f'<g id="{gid}" class="{css_class}">\n{body}\n</g>'
-
-    stroke_mm = marks.hairline_mm
-    convex_hex = _rgb_to_hex(*marks.convex_color)
-    concave_hex = _rgb_to_hex(*marks.concave_color)
-    heat_hex = _rgb_to_hex(*marks.heat_color)
-
-    style = (
-        "<style>"
-        f"#outlines polygon{{fill:none;stroke:#000;"
-        f"stroke-width:{_fmt(stroke_mm)};}}"
-        f"#darts polygon{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.7)};}}"
-        f"#ticks line{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.7)};}}"
-        f"#align line{{stroke:#000;stroke-width:{_fmt(stroke_mm * 0.9)};}}"
-        "#alignlabels text{font-family:sans-serif;text-anchor:middle;"
-        "dominant-baseline:middle;fill:#000;}"
-        "#numbers text{text-anchor:middle;dominant-baseline:middle;fill:#000;}"
-        "#fills path{stroke:none;}"
-        f"#ruler line{{stroke:#000;stroke-width:0.3;}}"
-        f"#ruler rect{{stroke:#000;stroke-width:0.3;}}"
-        "#ruler text{font-family:sans-serif;text-anchor:middle;fill:#000;}"
-        f"#angles text{{text-anchor:middle;dominant-baseline:middle;}}"
-        f"#angles text.convex{{fill:{convex_hex};}}"
-        f"#angles text.concave{{fill:{concave_hex};}}"
-        "#angles text.neutral{fill:#000;}"
-        f"#heatform{{stroke:{heat_hex};stroke-dasharray:2,1;}}"
-        f"#heatform text{{fill:{heat_hex};text-anchor:middle;}}"
-        "</style>"
-    )
+        return f'<g id="{gid}">\n{body}\n</g>'
 
     w, h = marks.width_mm, marks.height_mm
     lines = [
         "<?xml version='1.0' encoding='UTF-8' standalone='no'?>",
+        # width/height are in millimetres and the viewBox is 1 user unit per
+        # millimetre, so a point in the file is a point on the foam. This is
+        # the scheme Inkscape and browsers honour (Illustrator reads the mm
+        # width/height and rescales to its own points).
         f"<svg xmlns='http://www.w3.org/2000/svg' "
         f"width='{w:.3f}mm' height='{h:.3f}mm' "
         f"viewBox='0 0 {w:.3f} {h:.3f}'>",
-        style,
-        group("fills", "fills", fill_els),
-        group("outlines", "outlines", outline_els),
-        group("darts", "darts", dart_els),
-        group("ticks", "ticks", tick_els),
-        group("align", "align", align_els),
-        group("alignlabels", "alignlabels", align_label_els),
-        group("angles", "angles", angle_els),
-        group("numbers", "numbers", number_els),
-        group("heatform", "heatform", heat_els),
-        group("ruler", "ruler", ruler_els),
+        group("fills", fill_els),
+        group("outlines", outline_els),
+        group("darts", dart_els),
+        group("ticks", tick_els),
+        group("align", align_els),
+        group("alignlabels", align_label_els),
+        group("angles", angle_els),
+        group("numbers", number_els),
+        group("heatform", heat_els),
+        group("ruler", ruler_els),
         "</svg>",
     ]
     return "\n".join(lines)
@@ -243,6 +259,8 @@ class FOAMCRAFT_DRACHIS_OT_export_panel_pattern(bpy.types.Operator):
             # Through the world matrix, as the overlay measures, so an
             # object with unapplied scale gets the same angles on paper as
             # on screen.
+            for note in scale_warnings(obj.matrix_world):
+                self.report({'WARNING'}, note)
             svg_text = generate_svg(bm, uv_layer, settings,
                                     context.scene.unit_settings.scale_length,
                                     obj.matrix_world)
