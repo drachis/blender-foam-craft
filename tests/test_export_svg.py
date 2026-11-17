@@ -1106,6 +1106,200 @@ def test_alignment_ticks_are_a_real_length_not_a_fraction_of_the_sheet():
     return out
 
 
+def _set(**values):
+    """Set scene settings; returns what they were, for `_set(**saved)`."""
+    s = _settings()
+    saved = {k: getattr(s, k) for k in values}
+    for k, v in values.items():
+        setattr(s, k, v)
+    return saved
+
+
+def _overlay_runs(obj):
+    """The overlay's own runs for `obj`, through its own builder.
+
+    The same call tools/golden_marks.py records: `_rebuild` fills the
+    module's cache from an edit-mode BMesh. Returned as the cache's plain
+    _RunMark tuples, so nothing outlives edit mode.
+    """
+    import bl_ext.user_default.foamcraft_drachis.foam_overlay as ov
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        ov._rebuild([(obj, bm, bm.loops.layers.uv.active)], _settings())
+        return list(ov._cache.runs)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def _export_run_count(obj, matrix):
+    """Runs on the exported sheet: one bracket closes every run."""
+    bm = _bmesh_of(obj)
+    try:
+        svg = fx.generate_svg(bm, bm.loops.layers.uv.active, _settings(),
+                              1.0, matrix)
+    finally:
+        bm.free()
+    m = re.search(r'<g id="ticks".*?</g>', svg, re.S)
+    return m.group(0).count("<line") if m else -1
+
+
+def _seamed_prism():
+    """An octagonal prism: both rims seamed, and one vertical edge.
+
+    Three islands with known outlines. Each cap is a flat regular octagon,
+    so it unwraps without distortion and its outline turns exactly 45
+    degrees at every vertex. The side is a developable strip of 8 quads,
+    unwrapping to a rectangle with four 90 degree corners.
+
+    So the run count is arithmetic, not an impression. At a corner angle of
+    35 (the default), every octagon vertex is a corner: 8 runs per cap, 4 on
+    the strip, 20. At 60, no octagon vertex is: each cap rim has one
+    dihedral (90) all the way round and no straightness limit, so it is one
+    run, and the strip is still 4 -- 6 in all.
+
+    The vertical seam is the edge whose lower vertex is smallest by
+    coordinate, chosen geometrically rather than by index (CLAUDE.md:
+    primitives do not number the same way twice).
+    """
+    _clear()
+    bpy.ops.mesh.primitive_cylinder_add(vertices=8, radius=1.0, depth=2.0)
+    obj = bpy.context.object
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    verticals = []
+    for e in bm.edges:
+        a, b = e.verts
+        if abs(a.co.z - b.co.z) < 1e-9:
+            e.seam = True
+        else:
+            low = min((a.co, b.co), key=lambda c: c.z)
+            verticals.append(((round(low.x, 6), round(low.y, 6)), e))
+    min(verticals, key=lambda item: item[0])[1].seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.02)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return obj
+
+
+def test_the_sheet_and_the_screen_break_runs_at_the_same_corners():
+    """Corner Angle reaches the export, so paper and screen agree on runs.
+
+    The export used to ask the core for runs with none of the overlay's
+    arguments: no corner angle, no world matrix, no dart settings. With
+    Corner Angle at its default the two agreed by coincidence (the setting's
+    default is the core's); move the slider and the screen re-segmented
+    while the sheet kept the default. Here it is moved, on a shape whose run
+    counts are known at both values (see `_seamed_prism`).
+    """
+    obj = _seamed_prism()
+    bm = _bmesh_of(obj)
+    try:
+        islands = len(core.uv_islands(bm, bm.loops.layers.uv.active,
+                                      only_selected=False))
+    finally:
+        bm.free()
+    saved = _set(corner_angle_deg=35.0, show_brackets=True)
+    try:
+        default_sheet = _export_run_count(obj, obj.matrix_world)
+        default_screen = len(_overlay_runs(obj))
+        _set(corner_angle_deg=60.0)
+        moved_sheet = _export_run_count(obj, obj.matrix_world)
+        moved_screen = len(_overlay_runs(obj))
+    finally:
+        _set(**saved)
+    return {
+        "islands": islands,
+        "runs_at_35": {"sheet": default_sheet, "screen": default_screen},
+        "runs_at_60": {"sheet": moved_sheet, "screen": moved_screen},
+        "checks": {
+            "three_islands": islands == 3,
+            # The known answers, so agreement cannot be agreement on nonsense.
+            "twenty_runs_at_35_on_the_sheet": default_sheet == 20,
+            "twenty_runs_at_35_on_screen": default_screen == 20,
+            "six_runs_at_60_on_the_sheet": moved_sheet == 6,
+            "six_runs_at_60_on_screen": moved_screen == 6,
+            "sheet_matches_screen_at_60": moved_sheet == moved_screen,
+        },
+    }
+
+
+def test_unapplied_scale_gives_the_sheet_the_screens_run_angles():
+    """An object with unapplied non-uniform scale: same runs, same angles.
+
+    The overlay measures runs through the object's world matrix, because
+    the straightness limit is a real length in metres and object-local
+    coordinates understate a scaled piece. The export did not, so on a
+    scaled object the sheet split runs in different places than the screen
+    and printed different mean angles. Checked through the export operator
+    itself, since passing the matrix is the operator's job.
+
+    A gore sphere stretched 2.5x in z, with a straightness limit set: the
+    meridian seams bow, and how far they bow depends on the stretch, so the
+    matrix changes where runs break. Their dihedral varies with latitude, so
+    a different break gives a different mean angle -- not just a different
+    count. The last check is the one that makes the others mean something:
+    measured without the matrix, the sheet must come out different.
+    """
+    import os
+    import tempfile
+
+    obj = _gore_sphere()
+    obj.scale = (1.0, 1.0, 2.5)
+    bpy.context.view_layer.update()
+    # Decimals is capped at 2 by the property (measured: 3 reads back as 2),
+    # so the screen side is formatted with whatever the setting holds.
+    saved = _set(max_chord_deviation=0.004, decimals=2, show_brackets=True,
+                 max_tilt_deg=89.0)
+    path = os.path.join(tempfile.mkdtemp(prefix="foam_scale_"), "sheet.svg")
+    try:
+        bpy.context.view_layer.objects.active = obj
+        op = bpy.ops.foamcraft_drachis.export_panel_pattern(filepath=path)
+        with open(path, encoding="utf-8") as f:
+            svg = f.read()
+        screen = _overlay_runs(obj)
+        object_space_runs = _export_run_count(obj, None)
+        s = _settings()
+        screen_angles = sorted(
+            "%.*f" % (s.decimals, abs(m.angle_deg)) for m in screen
+            if m.has_dihedral and not m.needs_heat_form
+            and abs(m.angle_deg) >= s.min_angle)
+    finally:
+        _set(**saved)
+
+    body = re.search(r'<g id="angles".*?</g>', svg, re.S)
+    sheet_angles = sorted(re.findall(r'>([\d.]+)' + '\N{DEGREE SIGN}<',
+                                     body.group(0) if body else ""))
+    ticks = re.search(r'<g id="ticks".*?</g>', svg, re.S)
+    sheet_runs = ticks.group(0).count("<line") if ticks else -1
+    first_diff = next(((a, b) for a, b in zip(sheet_angles, screen_angles)
+                       if a != b), None)
+    return {
+        "operator": sorted(op),
+        "scale": tuple(obj.scale),
+        "runs": {"sheet": sheet_runs, "screen": len(screen),
+                 "sheet_in_object_space": object_space_runs},
+        "angle_labels": {"sheet": len(sheet_angles),
+                         "screen": len(screen_angles)},
+        "first_differing_angle": first_diff,
+        "checks": {
+            "operator_finished": op == {'FINISHED'},
+            "scale_is_non_uniform_and_unapplied":
+                tuple(obj.scale) == (1.0, 1.0, 2.5),
+            "sheet_has_the_screens_run_count": sheet_runs == len(screen),
+            "sheet_has_the_screens_angles": sheet_angles == screen_angles,
+            # Both bounds: equal and empty would pass the line above.
+            "there_are_angles_to_compare": len(sheet_angles) >= 12,
+            # The matrix has to matter on this fixture, or the agreement
+            # above proves nothing about passing it.
+            "object_space_would_disagree":
+                object_space_runs != sheet_runs,
+        },
+    }
+
+
 TESTS = (
     test_the_cube_fixture_is_what_we_think,
     test_the_sheet_reproduces_the_uv_layout,
@@ -1123,6 +1317,8 @@ TESTS = (
     test_a_dash_is_never_drawn_twice_in_one_place,
     test_alignment_ticks_are_a_real_length_not_a_fraction_of_the_sheet,
     test_relief_cuts_are_off_by_default,
+    test_the_sheet_and_the_screen_break_runs_at_the_same_corners,
+    test_unapplied_scale_gives_the_sheet_the_screens_run_angles,
 )
 
 result = {}

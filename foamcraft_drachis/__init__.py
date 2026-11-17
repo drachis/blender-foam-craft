@@ -37,7 +37,7 @@ _modules = [
 # Optional foam modules, added as each is built. Missing ones are skipped so a
 # partially-built checkout still registers cleanly.
 for _name in ("foam_island_ids", "foam_overlay", "foam_preview", "foam_export",
-              "foam_gp_pattern"):
+              "foam_raster", "foam_gp_pattern"):
     try:
         _mod = __import__(f"{__name__}.{_name}", fromlist=[_name])
     except ImportError:

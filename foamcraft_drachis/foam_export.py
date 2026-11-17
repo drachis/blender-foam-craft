@@ -17,548 +17,28 @@ unit-tested against a stand-in settings object without registering anything or
 touching ``context.scene.foamcraft_drachis``.
 """
 
-from math import radians, tan
-
 import bpy
 import bmesh
-from mathutils import Vector
 
-from . import foam_angle_core as core
+from . import foam_angle_core as core  # noqa: F401  (kept for importers)
+from .foam_marks import build_marks
 
-# Real-world sizes for pattern elements that only make sense printed at 1:1 --
-# distinct from the overlay's screen-space settings (font_size, tick_length_px,
-# overlay_scale), which scale with UV editor zoom rather than paper size.
-# Darts are physical cuts, so their size is in millimetres of real foam and
-# comes from the stock thickness, not from how the pattern is drawn.
-DART_SLIT_WIDTH_MM = 0.6
-MARGIN_MM = 10.0
-
-# The scale strip. Every number here is an absolute millimetre and must stay
-# that way: the ruler's whole job is to be measurable against a real ruler
-# held to the paper, so it is the one thing on the sheet that must NOT scale
-# with the pattern.
-RULER_STRIP_MM = 34.0
-RULER_LENGTH_MM = 100.0
-RULER_TICK_MM = 4.0
-RULER_FONT_MM = 4.0
-INCH_MM = 25.4
-
-# Annotation sizes are *not* physical. They are parts per thousand of the UV
-# sheet, exactly as the overlay draws them (foam_overlay.py:480-482 computes
-# `permille / 1000 * px_per_uv * overlay_scale`; here the same expression runs
-# against millimetres per UV unit instead of pixels). Printing the same
-# numbers the user is looking at is the whole point -- the SVG is a render of
-# the overlay, not a second opinion about how big a label should be.
-
-
-def _face_uv_area(face, uv_layer):
-    """Shoelace area of one face in UV space.
-
-    Mirrors ``foam_angle_core._uv_area`` -- kept local rather than imported
-    since that name is private to the core module and this is the only other
-    place that needs it.
-    """
-    uvs = [l[uv_layer].uv for l in face.loops]
-    area = 0.0
-    for i in range(1, len(uvs) - 1):
-        u, v = uvs[i] - uvs[0], uvs[i + 1] - uvs[0]
-        area += abs(u.x * v.y - u.y * v.x) * 0.5
-    return area
-
-
-def _polygon_centroid(pts):
-    """Area-weighted centroid of a closed polygon; falls back to the simple
-    mean for degenerate (near-zero-area) polygons such as a two-point sliver."""
-    if len(pts) < 3:
-        return sum(pts, Vector((0.0, 0.0))) / max(len(pts), 1)
-    area = 0.0
-    cx = 0.0
-    cy = 0.0
-    n = len(pts)
-    for i in range(n):
-        x0, y0 = pts[i]
-        x1, y1 = pts[(i + 1) % n]
-        cross = x0 * y1 - x1 * y0
-        area += cross
-        cx += (x0 + x1) * cross
-        cy += (y0 + y1) * cross
-    area *= 0.5
-    if abs(area) < 1e-12:
-        return sum(pts, Vector((0.0, 0.0))) / n
-    cx /= (6 * area)
-    cy /= (6 * area)
-    return Vector((cx, cy))
-
-
-class _Island:
-    """One UV island's geometry, pre-converted to millimetres and placed on
-    the output sheet. Built once per island so every SVG group below can share
-    the same coordinate transform."""
-
-    def __init__(self, index, faces, uv_layer, sheet):
-        self.index = index
-        self.faces = faces
-        self.piece_id = index + 1  # overwritten below if the attribute exists
-        self.cycles = core.island_boundary_cycles(faces, uv_layer)
-        self.sheet = sheet
-
-        # The island's own UV bounds. Used for its centroid, which decides
-        # which way a dart points -- a local question. Nothing about where the
-        # island lands on the sheet is decided here any more; that is the
-        # sheet's single transform, shared by every island.
-        all_uvs = [l[uv_layer].uv for cyc in self.cycles for l in cyc]
-        if not all_uvs:
-            all_uvs = [l[uv_layer].uv for f in faces for l in f.loops]
-        self.min_u = min(p.x for p in all_uvs)
-        self.max_u = max(p.x for p in all_uvs)
-        self.min_v = min(p.y for p in all_uvs)
-        self.max_v = max(p.y for p in all_uvs)
-
-    def to_sheet(self, uv):
-        return self.sheet.to_sheet(uv)
-
-
-class _Sheet:
-    """The one transform from UV space to millimetres on the page.
-
-    There used to be a packer here, which re-arranged the islands into rows
-    and scaled each one independently by its own area distortion. Both are
-    gone, and deliberately: **the UV layout is the arrangement.** The maker
-    positions pieces in the UV editor to suit their stock, and an exporter
-    that quietly re-lays them discards that work and produces a sheet that
-    cannot be checked against what is on screen.
-
-    CLAUDE.md records this exact mistake once already, against the flat layout
-    preview -- a bespoke shelf packer invented for a problem whose answer was
-    u->x, v->y scaled to the mesh. This was the same bug in a second place.
-
-    So: any rearranging belongs in Blender's own UV tools, where it is visible
-    and undoable. This renders what is there.
-
-    The consequence worth stating is that one uniform scale cannot also make
-    each island individually true to size. Where UV distortion differs between
-    islands, a piece is as true as its unwrap is -- which is a property of the
-    unwrap, shown honestly, rather than a correction applied invisibly at
-    export time. Minimum Stretch exists for exactly that, and the craftability
-    check already reports pieces that distort too far.
-    """
-
-    def __init__(self, islands_faces, uv_layer, scale_length):
-        area_3d = sum(f.calc_area() for fs in islands_faces for f in fs)
-        area_uv = sum(_face_uv_area(f, uv_layer)
-                      for fs in islands_faces for f in fs)
-        # One ratio for the whole mesh, so every piece shares a scale and the
-        # sheet is a true picture of the UV layout.
-        m_per_uv = (area_3d / area_uv) ** 0.5 if area_uv > 1e-12 else 1.0
-        self.scale = m_per_uv * scale_length * 1000.0  # mm per UV unit
-
-        uvs = [l[uv_layer].uv for fs in islands_faces for f in fs
-               for l in f.loops]
-        if uvs:
-            self.min_u = min(p.x for p in uvs)
-            self.max_u = max(p.x for p in uvs)
-            self.min_v = min(p.y for p in uvs)
-            self.max_v = max(p.y for p in uvs)
-        else:
-            self.min_u = self.max_u = self.min_v = self.max_v = 0.0
-
-        self.width = (self.max_u - self.min_u) * self.scale + 2 * MARGIN_MM
-        self.height = (self.max_v - self.min_v) * self.scale + 2 * MARGIN_MM
-
-    def to_sheet(self, uv):
-        """UV point -> millimetre point on the page.
-
-        SVG y grows downward and UV v grows upward, so v is measured from the
-        top of the whole sheet -- not, as it once was, from each island's own
-        bounding box, which is what let the islands drift apart.
-        """
-        x = (uv.x - self.min_u) * self.scale + MARGIN_MM
-        y = (self.max_v - uv.y) * self.scale + MARGIN_MM
-        return Vector((x, y))
-
-    def permille(self, parts, overlay_scale):
-        """A size given in thousandths of the UV sheet, in millimetres.
-
-        Mirrors foam_overlay.py's `permille / 1000 * px_per_uv * scale`, with
-        millimetres per UV unit standing in for pixels, so a label prints at
-        the size it is drawn at.
-        """
-        return parts / 1000.0 * self.scale * overlay_scale
-
-
-def _run_polyline(run, uv_layer, isl):
-    pts = [isl.to_sheet(l[uv_layer].uv) for l in run.loops]
-    pts.append(isl.to_sheet(run.uv_end))
-    return pts
-
-
-def _boundary_tangent(pt_before, pt_at):
-    d = pt_at - pt_before
-    return d.normalized() if d.length > 1e-9 else Vector((1.0, 0.0))
-
-
-def _inward_normal(tangent, boundary_pt, centroid):
-    """Perpendicular to the boundary, picked to point into the piece.
-
-    UV winding direction isn't guaranteed consistent across islands (it
-    depends on face-normal orientation, which artists flip freely), so rather
-    than assume a winding convention, pick whichever perpendicular actually
-    points toward the island's own centroid.
-    """
-    n = Vector((-tangent.y, tangent.x))
-    return n if n.dot(centroid - boundary_pt) > 0 else -n
+# What to draw is decided in foam_marks.build_marks; this module only writes
+# it out. The helpers that used to live here moved with that decision, and
+# are re-exported under their old names for the tests, tools and modules
+# that import them from foam_export.
+from .foam_marks import (  # noqa: F401  (re-exports)
+    DART_SLIT_WIDTH_MM, MARGIN_MM, RULER_STRIP_MM, RULER_LENGTH_MM,
+    RULER_TICK_MM, RULER_FONT_MM, INCH_MM, TICK_MERGE_M,
+    _face_uv_area, _polygon_centroid, _Island, _Sheet, _run_polyline,
+    _boundary_tangent, _inward_normal, _boundary_angle_deg,
+    _edge_canonical_start, _run_tick_params, _remember_tick, _seam_chains,
+    _seam_tick_params, chain_direction_start, _shared_vert,
+)
 
 
 def _fmt(v):
     return f"{v:.3f}"
-
-
-def _boundary_angle_deg(run_a, run_b):
-    """Angle to bevel a dart at the corner between two consecutive runs.
-
-    Where both sides of the corner carry a real seam, split the difference;
-    where only one side does (the other is an open rim with no facing panel),
-    use that one; where neither does, there's nothing to bevel.
-    """
-    if run_a.has_dihedral and run_b.has_dihedral:
-        return (run_a.mean_angle_deg + run_b.mean_angle_deg) / 2.0
-    if run_a.has_dihedral:
-        return run_a.mean_angle_deg
-    if run_b.has_dihedral:
-        return run_b.mean_angle_deg
-    return None
-
-
-def _edge_canonical_start(edge):
-    """The end of `edge` that both its faces agree to measure from.
-
-    `edge.verts[0]` is arbitrary and does not survive a rebuild (see
-    foam_gp_pattern._edge_ends and
-    RESEARCH_theta_seam_edge_nondeterminism.md), and here it matters for a
-    second reason: a tick has to land at the *same* point when measured from
-    either of the two faces sharing the seam, or the two pieces carry marks
-    that do not line up -- which is the one thing an alignment mark must not
-    do. Ordering by coordinate gives both sides the same answer.
-    """
-    a, b = edge.verts[0], edge.verts[1]
-    ac, bc = a.co, b.co
-    return a if (ac.x, ac.y, ac.z) <= (bc.x, bc.y, bc.z) else b
-
-
-def _run_tick_params(run, settings):
-    """Where this run wants its ticks, as (edge, t) on the 3D mesh.
-
-    Per Cut Run only. `t` runs from the edge's canonical start, so the two
-    faces sharing the edge derive the same point from it.
-
-    By Distance is not done here, and cannot be: a run is one blade-tilt
-    pass, and restarting the measurement at each run makes the gaps depend on
-    where the bevel happens to change rather than on the foam. Asking for a
-    mark every 30 mm and getting them every 12, 30, 9, 30, 30 is not what the
-    setting says. It walks the seam instead -- see `_seam_tick_params`.
-    """
-    edges = []
-    total = 0.0
-    for loop in run.loops:
-        edge = loop.edge
-        length = edge.calc_length()
-        if length <= 1e-9:
-            continue
-        edges.append((edge, loop, length, total))
-        total += length
-    if total <= 1e-9 or not edges:
-        return []
-
-    count = max(1, int(settings.ticks_per_run))
-    distances = [total * (i + 1) / (count + 1) for i in range(count)]
-
-    out = []
-    for d in distances:
-        for edge, loop, length, start in edges:
-            if d <= start + length or edge is edges[-1][0]:
-                local = (d - start) / length
-                local = max(0.0, min(1.0, local))
-                # Express it from the edge's canonical end.
-                t = local if loop.vert is _edge_canonical_start(edge) \
-                    else 1.0 - local
-                out.append((edge, round(t, 6)))
-                break
-    return out
-
-
-# Two marks closer together than this along a seam are the same mark. A dash
-# is a few millimetres wide, so anything at this range is not a second one.
-TICK_MERGE_M = 0.0005
-
-
-def _remember_tick(wanted, edge, t):
-    """Record a mark at `t` on `edge`, unless one is already there.
-
-    The parameter is merged by *distance on the mesh*, not by its own value.
-    Rounding `t` to six places sounds precise and is not a physical test: on
-    a 30 mm edge it resolves to 30 nanometres, so two runs arriving at the
-    same point by slightly different arithmetic -- 0.666666 and 0.666667 --
-    were kept as two marks and drawn as two dashes on top of each other.
-    Measured on a six-gore sphere: twelve such pairs.
-    """
-    length = edge.calc_length()
-    if length <= 1e-12:
-        return
-    params = wanted.setdefault(edge, [])
-    for existing in params:
-        if abs(existing - t) * length <= TICK_MERGE_M:
-            return
-    params.append(t)
-
-
-def _seam_chains(islands):
-    """The seams, as chains of connected 3D edges.
-
-    A seam is what a maker tapes together, and it is a property of the mesh,
-    not of either piece: the same chain of edges bounds both islands that
-    meet along it. Marks spaced along *this* are evenly spaced on the foam;
-    marks spaced along one island's boundary runs are not, because the runs
-    break wherever the bevel angle changes.
-
-    Chains break at a vertex where more than two boundary edges meet. That is
-    a corner where three or more pieces come together, and carrying a
-    measurement straight through one would be arbitrary -- there is no single
-    "onwards" to continue along.
-    """
-    edges = []
-    seen = set()
-    for isl in islands:
-        for cycle in isl.cycles:
-            for loop in cycle:
-                e = loop.edge
-                if e.index not in seen:
-                    seen.add(e.index)
-                    edges.append(e)
-
-    by_vert = {}
-    for e in edges:
-        for v in e.verts:
-            by_vert.setdefault(v.index, []).append(e)
-
-    chains, used = [], set()
-    def _walk(start_edge, start_vert):
-        chain = [start_edge]
-        used.add(start_edge.index)
-        vert = start_edge.other_vert(start_vert)
-        while vert is not None:
-            nxt = [e for e in by_vert.get(vert.index, ())
-                   if e.index not in used]
-            # Only continue through a plain two-edge join.
-            if len(by_vert.get(vert.index, ())) != 2 or len(nxt) != 1:
-                break
-            edge = nxt[0]
-            chain.append(edge)
-            used.add(edge.index)
-            vert = edge.other_vert(vert)
-        return chain
-
-    # Open chains first, from their loose ends, so a chain that has ends is
-    # not entered in the middle and split into two. The ends are considered
-    # in canonical order, not edge order.
-    for e in edges:
-        if e.index in used:
-            continue
-        start, far = _edge_canonical_start(e), None
-        far = e.other_vert(start)
-        for v in (start, far):
-            if len(by_vert.get(v.index, ())) != 2:
-                chains.append(_walk(e, v))
-                break
-    # Whatever is left is a closed loop. "Any edge will do as a start" is
-    # true; any *end* of that edge is not. A closed chain walked from
-    # verts[0] runs one way round or the other, and By Distance measures
-    # from the start, so every mark on that seam moves with it.
-    #
-    # Scope, measured rather than assumed, because a guard that claims more
-    # than it fixes hides the next bug. Five fresh BMeshes of one *fixed*
-    # mesh give identical edge orientation -- so this is NOT what makes two
-    # exports of one .blend disagree. It is what makes an export disagree
-    # with itself across a *rebuilt* mesh: regenerating the same primitive
-    # flips verts[0] on about 670 of 9120 edges, which is how it surfaced,
-    # as one differing sheet in a 1422-record golden run whose fixtures are
-    # rebuilt each time. Cheap, and it buys reproducibility across a
-    # re-import; it is not load-bearing for the common case.
-    for e in edges:
-        if e.index not in used:
-            chains.append(_walk(e, _edge_canonical_start(e)))
-    return chains
-
-
-def _seam_tick_params(islands, settings):
-    """Marks every `tick_spacing` of real seam, walked continuously.
-
-    Returned as (edge, t) from each edge's canonical start, so both pieces
-    sharing the seam derive the same point and carry the same dash.
-    """
-    step = max(float(settings.tick_spacing), 1e-4)
-    out = []
-    for chain in _seam_chains(islands):
-        lengths = [e.calc_length() for e in chain]
-        total = sum(lengths)
-        if total <= 1e-9:
-            continue
-        # Half a step in from the start, so a chain does not open with a mark
-        # sitting on its own corner.
-        d = step * 0.5
-        if d >= total:
-            # Shorter than one step. One mark in the middle still beats none:
-            # a short seam is exactly where a piece can slip unnoticed.
-            d = total * 0.5
-        walked = 0.0
-        index = 0
-        while d < total and index < len(chain):
-            while index < len(chain) and d > walked + lengths[index]:
-                walked += lengths[index]
-                index += 1
-            if index >= len(chain):
-                break
-            edge = chain[index]
-            local = (d - walked) / lengths[index]
-            start = _edge_canonical_start(edge)
-            # The chain is walked from one end; express the parameter from
-            # the edge's own canonical end so both faces agree on it.
-            if chain_direction_start(chain, index) is not start:
-                local = 1.0 - local
-            out.append((edge, round(max(0.0, min(1.0, local)), 6)))
-            d += step
-    return out
-
-
-def chain_direction_start(chain, index):
-    """Which vertex of `chain[index]` the walk entered it from."""
-    edge = chain[index]
-    if index == 0:
-        if len(chain) == 1:
-            return edge.verts[0]
-        shared = _shared_vert(edge, chain[1])
-        if shared is not None:
-            return edge.other_vert(shared)
-        return edge.verts[0]
-    shared = _shared_vert(edge, chain[index - 1])
-    if shared is not None:
-        return shared
-    return edge.verts[0]
-
-
-def _shared_vert(edge, other):
-    """The first of `edge`'s vertices that `other` also uses, or None.
-
-    Walked in `edge.verts` order rather than read out of a set intersection:
-    `next(iter(set))` over BMesh elements picks by Blender-side address.
-    Two distinct edges share at most one vertex, so this only fixes the
-    pathological case -- but it means the question never needs asking."""
-    return next((v for v in edge.verts if v in other.verts), None)
-
-
-def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
-                     tick_length_mm, font_mm):
-    """Tick marks on every seam, drawn on both pieces that share it.
-
-    Built in two passes, and the split is the whole point.
-
-    First the positions are decided on the *3D mesh* -- a set of (edge, t)
-    pairs -- so a tick belongs to the seam rather than to a piece. Then every
-    island that borders that edge draws it, mapping t into its own UVs. Two
-    pieces glued along a seam therefore carry marks at the same place on the
-    foam, which is what makes them registration marks rather than decoration.
-
-    Deciding per island instead would let the two sides disagree: their runs
-    are segmented from their own boundaries and need not break at the same
-    places.
-    """
-    wanted = {}
-    if settings.tick_mode == 'BY_DISTANCE':
-        for edge, t in _seam_tick_params(islands, settings):
-            _remember_tick(wanted, edge, t)
-    else:
-        for runs in runs_by_island:
-            for run in runs:
-                for edge, t in _run_tick_params(run, settings):
-                    _remember_tick(wanted, edge, t)
-    if not wanted:
-        return [], []
-
-    # A stable index per seam, so "tick 3" means the same mark on both of
-    # its pieces when the numbers are switched on.
-    numbering = {}
-    for edge, params in wanted.items():
-        params.sort()
-        for order, t in enumerate(params):
-            numbering[(edge, t)] = order + 1
-
-    lines, labels = [], []
-    for isl in islands:
-        # One dash per piece per mark. An island's boundary can in principle
-        # traverse the same 3D edge twice -- a seam running up to a point and
-        # back down the far side is met from both directions -- and the mark
-        # would then be drawn twice at identical coordinates. Physically it
-        # is one dash on one piece of foam.
-        #
-        # Note this was *not* the cause of the duplicates seen on a six-gore
-        # sphere, though it was the first explanation offered for them. Those
-        # came from two runs recording the same point as 0.666666 and
-        # 0.666667, which `_remember_tick` now merges. The guard is kept for
-        # the case it actually describes, which this fixture does not reach.
-        drawn = set()
-        for cycle in isl.cycles:
-            for loop in cycle:
-                edge = loop.edge
-                params = wanted.get(edge)
-                if not params:
-                    continue
-                uv_a = loop[uv_layer].uv
-                uv_b = loop.link_loop_next[uv_layer].uv
-                start_vert = _edge_canonical_start(edge)
-                # The face this loop belongs to is inside the island by
-                # definition, so its own centre is a locally correct "in".
-                # An island centroid is not: on a ring it sits in the hole.
-                face_uvs = [l[uv_layer].uv for l in loop.face.loops]
-                face_c = Vector((
-                    sum(p.x for p in face_uvs) / len(face_uvs),
-                    sum(p.y for p in face_uvs) / len(face_uvs)))
-                face_pt = isl.to_sheet(face_c)
-
-                for t in sorted(params):
-                    if (edge.index, t) in drawn:
-                        continue
-                    drawn.add((edge.index, t))
-                    local = t if loop.vert is start_vert else 1.0 - t
-                    uv = uv_a + (uv_b - uv_a) * local
-                    point = isl.to_sheet(uv)
-                    tangent = _boundary_tangent(isl.to_sheet(uv_a), point)
-                    if tangent.length < 1e-9:
-                        continue
-                    inward = _inward_normal(tangent, point, face_pt)
-                    # Shorten where the piece cannot take the full mark. The
-                    # face this loop belongs to spans the piece locally, so
-                    # the distance to its centre is a cheap stand-in for how
-                    # much room there is; a gore's tip has very little, and
-                    # two full-length marks facing each other across it meet
-                    # in the middle.
-                    room = (face_pt - point).length
-                    reach = min(tick_length_mm, max(room * 0.6, 0.2))
-                    # Mostly inward. The outward half of a mark drawn across
-                    # the line is cut away with the waste, so it would be ink
-                    # spent on nothing; a short tail is kept so the mark is
-                    # visibly a crossing and not a scratch.
-                    tip = point + inward * reach
-                    tail = point - inward * (reach * 0.25)
-                    lines.append(
-                        f'<line x1="{_fmt(tail.x)}" y1="{_fmt(tail.y)}" '
-                        f'x2="{_fmt(tip.x)}" y2="{_fmt(tip.y)}"/>')
-                    if settings.tick_numbers:
-                        at = point + inward * (reach * 1.45)
-                        labels.append(
-                            f'<text x="{_fmt(at.x)}" y="{_fmt(at.y)}" '
-                            f'font-size="{_fmt(font_mm)}">'
-                            f'{numbering[(edge, t)]}</text>')
-    return lines, labels
-
 
 
 def _rgb_to_hex(r, g, b):
@@ -567,262 +47,105 @@ def _rgb_to_hex(r, g, b):
                               int(max(0.0, min(1.0, b)) * 255))
 
 
-def _scale_strip(sheet_width, top_y):
-    """A ruler and a one-inch square, in absolute millimetres.
+def _points_attr(points):
+    return " ".join(f"{_fmt(x)},{_fmt(y)}" for x, y in points)
 
-    Printers scale. "Fit to page" silently shrinks a sheet by a few percent,
-    and a pattern that is 3% small produces panels that do not meet -- which
-    is only discovered after the foam is cut. Measuring a printed ruler is the
-    cheapest check there is, so one goes on every sheet.
 
-    Both units, because the stock and the tools rarely agree: foam sheet is
-    sold in metric here and blade settings are often imperial.
+def _line(points):
+    (x1, y1), (x2, y2) = points[0], points[-1]
+    return (f'<line x1="{_fmt(x1)}" y1="{_fmt(y1)}" '
+            f'x2="{_fmt(x2)}" y2="{_fmt(y2)}"/>')
+
+
+def _text(label, extra=""):
+    return (f'<text{extra} x="{_fmt(label.x)}" y="{_fmt(label.y)}" '
+            f'font-size="{_fmt(label.size_mm)}">{label.text}</text>')
+
+
+def _rect(points):
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x, y = min(xs), min(ys)
+    return (f'<rect x="{_fmt(x)}" y="{_fmt(y)}" '
+            f'width="{_fmt(max(xs) - x)}" height="{_fmt(max(ys) - y)}" '
+            f'fill="none"/>')
+
+
+def svg_from_marks(marks):
+    """Serialise a `foam_marks.Marks` as the pattern SVG.
+
+    Writes only. Every decision about whether a mark exists was made in
+    `build_marks`; here a mark's `kind` picks its group and element, and
+    nothing else is consulted. Styling is by group in a <style> block, as it
+    always was, so the text of the file is what generate_svg produced before
+    the split -- byte for byte, which tools/golden_marks.py checks.
     """
-    out = []
-    x0 = MARGIN_MM
-    y = top_y + RULER_STRIP_MM * 0.45
+    fills = [m for m in marks.fills if m.kind == 'piece']
+    relief_fills = [m for m in marks.fills if m.kind == 'relief']
+    strokes_of = lambda k: [s for s in marks.strokes if s.kind == k]  # noqa: E731
+    labels_of = lambda k: [l for l in marks.labels if l.kind == k]    # noqa: E731
 
-    # 100 mm bar with a tick every 10 mm, taller every 50.
-    out.append(f'<line x1="{_fmt(x0)}" y1="{_fmt(y)}" '
-               f'x2="{_fmt(x0 + RULER_LENGTH_MM)}" y2="{_fmt(y)}"/>')
-    step = 10.0
-    n = int(RULER_LENGTH_MM / step)
-    for i in range(n + 1):
-        tx = x0 + i * step
-        tall = RULER_TICK_MM * (1.6 if i % 5 == 0 else 1.0)
-        out.append(f'<line x1="{_fmt(tx)}" y1="{_fmt(y)}" '
-                   f'x2="{_fmt(tx)}" y2="{_fmt(y - tall)}"/>')
-    out.append(f'<text x="{_fmt(x0)}" y="{_fmt(y + RULER_FONT_MM * 1.6)}" '
-               f'font-size="{_fmt(RULER_FONT_MM)}">0</text>')
-    out.append(f'<text x="{_fmt(x0 + RULER_LENGTH_MM)}" '
-               f'y="{_fmt(y + RULER_FONT_MM * 1.6)}" '
-               f'font-size="{_fmt(RULER_FONT_MM)}">100 mm</text>')
+    fill_els = []
+    for f in fills:
+        subpaths = []
+        for ring in f.rings:
+            head = "M %s" % " L ".join("%s,%s" % (_fmt(x), _fmt(y))
+                                       for x, y in ring)
+            subpaths.append(head + " Z")
+        fill_els.append(
+            f'<path d="{" ".join(subpaths)}" fill-rule="evenodd" '
+            f'fill="{_rgb_to_hex(*f.color)}"/>')
 
-    # A one-inch square, which is far easier to check by eye than a bar.
-    sq_x = x0 + RULER_LENGTH_MM + 18.0
-    sq_y = y - INCH_MM
-    out.append(f'<rect x="{_fmt(sq_x)}" y="{_fmt(sq_y)}" '
-               f'width="{_fmt(INCH_MM)}" height="{_fmt(INCH_MM)}" '
-               f'fill="none"/>')
-    out.append(f'<text x="{_fmt(sq_x + INCH_MM / 2)}" '
-               f'y="{_fmt(y + RULER_FONT_MM * 1.6)}" '
-               f'font-size="{_fmt(RULER_FONT_MM)}">1 inch</text>')
+    outline_els = [f'<polygon points="{_points_attr(s.points)}"/>'
+                   for s in strokes_of('outline')]
 
-    out.append(f'<text x="{_fmt(sq_x + INCH_MM + 14.0)}" y="{_fmt(y)}" '
-               f'font-size="{_fmt(RULER_FONT_MM)}">'
-               f'measure this: if it is not exact, the print was scaled'
-               f'</text>')
-    return out
+    # A filled relief (a slit) is one polygon, filled by default and stroked
+    # by the group's style; its outline stroke is the same polygon and is not
+    # written twice. An unfilled relief (a wedge) is written fill="none".
+    dart_els = [f'<polygon points="{_points_attr(f.rings[0])}"/>'
+                for f in relief_fills]
+    filled = {f.rings[0] for f in relief_fills}
+    dart_els += [f'<polygon points="{_points_attr(s.points)}" fill="none"/>'
+                 for s in strokes_of('relief') if s.points not in filled]
 
+    tick_els = [_line(s.points) for s in strokes_of('bracket')]
+    align_els = [_line(s.points) for s in strokes_of('align')]
+    align_label_els = [_text(l) for l in labels_of('align')]
+    angle_els = [_text(l, f' class="{l.tone}"') for l in labels_of('angle')]
+    number_els = [_text(l) for l in labels_of('number')]
 
-def generate_svg(bm, uv_layer, settings, scale_length=1.0):
-    """Build the full SVG pattern as a string. Pure function -- no file I/O,
-    no bpy.context -- so it can be exercised directly in tests."""
-    islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
-    sheet = _Sheet(islands_faces, uv_layer, scale_length)
-    islands = [_Island(i, faces, uv_layer, sheet)
-              for i, faces in enumerate(islands_faces)]
+    # Each heat-form run is a polyline followed by its note.
+    heat_els = []
+    heat_strokes, heat_labels = strokes_of('heat'), labels_of('heat')
+    for i in range(max(len(heat_strokes), len(heat_labels))):
+        if i < len(heat_strokes):
+            heat_els.append(f'<polyline points="'
+                            f'{_points_attr(heat_strokes[i].points)}" '
+                            f'fill="none"/>')
+        if i < len(heat_labels):
+            label = heat_labels[i]
+            heat_els.append(f'<text x="{_fmt(label.x)}" y="{_fmt(label.y)}" '
+                            f'font-size="{_fmt(label.size_mm)}">'
+                            f'{label.text}</text>')
 
-    id_layer = bm.faces.layers.int.get('foam_island_id')
-    if id_layer is not None:
-        for isl in islands:
-            rep = next(iter(isl.faces), None)
-            if rep is not None:
-                isl.piece_id = rep[id_layer]
-
-    total_width, total_height = sheet.width, sheet.height
-    if settings.show_scale_ruler:
-        # Added below the pattern, so the pattern's own coordinates --
-        # and therefore its fidelity to the UV layout -- are unchanged.
-        total_height += RULER_STRIP_MM
-        total_width = max(total_width, MARGIN_MM * 2 + 210.0)
-
-    thickness_mm = settings.foam_thickness * scale_length * 1000.0
-    dart_depth_mm = settings.notch_depth_ratio * thickness_mm
-
-    # Annotation sizes, in millimetres, from the same permille settings the
-    # overlay draws with -- so the printed sheet matches the screen.
-    overlay_scale = settings.overlay_scale
-    angle_font_mm = sheet.permille(settings.angle_text_size, overlay_scale)
-    number_font_mm = sheet.permille(settings.number_size, overlay_scale)
-    tick_length_mm = sheet.permille(settings.mark_size, overlay_scale)
-    # Hairlines scale with the sheet too, or a 2 m pattern gets invisible
-    # outlines and a 100 mm one gets a smeared blob.
-    stroke_mm = sheet.permille(2, overlay_scale)
-
-    all_runs = list(core.iter_boundary_dart_segments(
-        bm, uv_layer, settings.max_chord_deviation,
-        settings.max_angle_variation_deg, islands=islands_faces))
-    runs_by_island = [[] for _ in islands]
-    for r in all_runs:
-        runs_by_island[r.island_index].append(r)
-
-    outlines, darts, ticks, angles, numbers, heatform = [], [], [], [], [], []
-    fills = []
-    align, align_labels = [], []
-
-    for isl in islands:
-        # --- outlines: one polygon per boundary cycle (an island with a hole
-        # yields more than one).
-        for cycle in isl.cycles:
-            if len(cycle) < 2:
-                continue
-            pts = [isl.to_sheet(l[uv_layer].uv) for l in cycle]
-            pts_str = " ".join(f"{_fmt(p.x)},{_fmt(p.y)}" for p in pts)
-            outlines.append(f'<polygon points="{pts_str}"/>')
-
-        # --- fill: one colour per piece, behind everything else.
-        rings = core.order_rings_outer_first(
-            [[(p.x, p.y) for p in
-              (isl.to_sheet(l[uv_layer].uv) for l in cyc)]
-             for cyc in isl.cycles])
-        if settings.island_fill and rings:
-            # One path with every cycle as a subpath and fill-rule evenodd, so
-            # a piece with a hole in it reads as a hole rather than a disc.
-            subpaths = []
-            for ring in rings:
-                head = "M %s" % " L ".join("%s,%s" % (_fmt(x), _fmt(y))
-                                           for x, y in ring)
-                subpaths.append(head + " Z")
-            r, g, b = core.island_palette_color(isl.index, len(islands))
-            fills.append(
-                f'<path d="{" ".join(subpaths)}" fill-rule="evenodd" '
-                f'fill="{_rgb_to_hex(r, g, b)}"/>')
-
-        # --- numbers: piece ID where it actually lands on the piece.
-        if settings.show_island_ids and rings:
-            # Not the centroid. The centroid of a crescent or a C lies outside
-            # the shape, so the number printed there sits on the sheet beside
-            # the piece -- and vanishes entirely once the pattern is used as a
-            # texture on the model, which is the main reason it is printed.
-            # The pole of inaccessibility is inside by construction, and sits
-            # in the piece's widest part so the digits have room.
-            (px, py), room = core.pole_of_inaccessibility(rings)
-            if px is not None:
-                # Shrink a number that will not fit rather than letting
-                # it spill over the cut lines of a small piece -- but never
-                # below something a person can read. The floor used to be
-                # 0.1 mm, which is not a smaller label, it is an invisible
-                # one; three pieces on a test sphere printed their number at
-                # that size and looked simply absent.
-                room_mm = max(room, 0.0)
-                size = min(number_font_mm, max(room_mm * 1.2,
-                                               number_font_mm * 0.25))
-                numbers.append(
-                    f'<text x="{_fmt(px)}" y="{_fmt(py)}" '
-                    f'font-size="{_fmt(size)}">{isl.piece_id}</text>')
-
-        # --- angles + heatform: one entry per run.
-        for run in runs_by_island[isl.index]:
-            if not run.has_dihedral or abs(run.mean_angle_deg) < settings.min_angle:
-                continue
-            bevel = core.compute_bevel(run.mean_angle_deg, settings.foam_thickness,
-                                       settings.max_tilt_deg)
-            mid = (isl.to_sheet(run.uv_start) + isl.to_sheet(run.uv_end)) / 2
-            label = f"{abs(run.mean_angle_deg):.{settings.decimals}f}°"
-            if bevel.needs_heat_form:
-                if settings.show_heat_form:
-                    pts = _run_polyline(run, uv_layer, isl)
-                    pts_str = " ".join(f"{_fmt(p.x)},{_fmt(p.y)}" for p in pts)
-                    heatform.append(f'<polyline points="{pts_str}" fill="none"/>')
-                    heatform.append(
-                        f'<text x="{_fmt(mid.x)}" y="{_fmt(mid.y)}" '
-                        f'font-size="{_fmt(angle_font_mm)}">{label} (heat-form)</text>')
-                # Needs a heat-form joint, not a saw cut -- never also present
-                # it as an ordinary sawable bevel in the angles group.
-                continue
-            if settings.show_brackets:
-                if settings.show_dart_colors:
-                    css_class = "convex" if run.mean_angle_deg >= 0 else "concave"
-                else:
-                    css_class = "neutral"
-                angles.append(
-                    f'<text class="{css_class}" x="{_fmt(mid.x)}" y="{_fmt(mid.y)}" '
-                    f'font-size="{_fmt(angle_font_mm)}">{label}</text>')
-
-        # --- ticks + darts: one per run-to-run corner, grouped by boundary
-        # cycle so the wraparound (last run's end == first run's start)
-        # closes correctly.
-        cycle_loop_sets = [set(cyc) for cyc in isl.cycles]
-        runs_by_cycle = [[] for _ in isl.cycles]
-        for run in runs_by_island[isl.index]:
-            first = run.loops[0]
-            for ci, loopset in enumerate(cycle_loop_sets):
-                if first in loopset:
-                    runs_by_cycle[ci].append(run)
-                    break
-
-        centroid_uv = Vector(((isl.min_u + isl.max_u) / 2, (isl.min_v + isl.max_v) / 2))
-        centroid_pt = isl.to_sheet(centroid_uv)
-
-        for cyc_runs in runs_by_cycle:
-            n = len(cyc_runs)
-            if n == 0:
-                continue
-            for k in range(n):
-                run_a = cyc_runs[k]
-                run_b = cyc_runs[(k + 1) % n]
-                boundary_pt = isl.to_sheet(run_a.uv_end)
-
-                if settings.show_brackets:
-                    prev_loop = run_a.loops[-1]
-                    pt_before = isl.to_sheet(prev_loop[uv_layer].uv)
-                    tangent = _boundary_tangent(pt_before, boundary_pt)
-                    normal = Vector((-tangent.y, tangent.x))
-                    tick_a = boundary_pt + normal * (tick_length_mm / 2)
-                    tick_b = boundary_pt - normal * (tick_length_mm / 2)
-                    ticks.append(
-                        f'<line x1="{_fmt(tick_a.x)}" y1="{_fmt(tick_a.y)}" '
-                        f'x2="{_fmt(tick_b.x)}" y2="{_fmt(tick_b.y)}"/>')
-
-                boundary_angle = _boundary_angle_deg(run_a, run_b)
-                if boundary_angle is None or n < 2:
-                    continue
-                bevel = core.compute_bevel(boundary_angle, settings.foam_thickness,
-                                           settings.max_tilt_deg)
-                prev_loop = run_a.loops[-1]
-                pt_before = isl.to_sheet(prev_loop[uv_layer].uv)
-                tangent = _boundary_tangent(pt_before, boundary_pt)
-                inward = _inward_normal(tangent, boundary_pt, centroid_pt)
-                half_angle = radians(min(abs(bevel.per_side_deg), 89.0))
-
-                if settings.notch_shape == 'V_WEDGE':
-                    half_width = dart_depth_mm * tan(half_angle)
-                    p_left = boundary_pt - tangent * half_width
-                    p_right = boundary_pt + tangent * half_width
-                    apex = boundary_pt + inward * dart_depth_mm
-                    pts_str = (f"{_fmt(p_left.x)},{_fmt(p_left.y)} "
-                              f"{_fmt(apex.x)},{_fmt(apex.y)} "
-                              f"{_fmt(p_right.x)},{_fmt(p_right.y)}")
-                    darts.append(f'<polygon points="{pts_str}" fill="none"/>')
-                else:  # SLIT
-                    half_width = DART_SLIT_WIDTH_MM / 2
-                    p1 = boundary_pt - tangent * half_width
-                    p2 = boundary_pt + tangent * half_width
-                    p3 = p2 + inward * dart_depth_mm
-                    p4 = p1 + inward * dart_depth_mm
-                    pts_str = " ".join(f"{_fmt(p.x)},{_fmt(p.y)}" for p in (p1, p2, p3, p4))
-                    darts.append(f'<polygon points="{pts_str}"/>')
-
-    if settings.show_align_ticks:
-        # A real length, not a fraction of the sheet. The mark is made with a
-        # pen on foam and is the same size whatever the pattern; sizing it
-        # from the sheet gave a 13 mm tick on a 838 mm sheet, which on a gore
-        # only 30 mm wide at the ends meant the marks from its two seams
-        # reached across and crossed each other -- 12 colliding pairs,
-        # measured, and it read as doubled ticks.
-        align, align_labels = _alignment_ticks(
-            islands, uv_layer, runs_by_island, settings,
-            settings.tick_length * scale_length * 1000.0,
-            angle_font_mm * 0.7)
+    # The ruler's bar and ticks first, then its square and captions left to
+    # right -- the order the sheet has always listed them in.
+    ruler_strokes = strokes_of('ruler')
+    ruler_els = [_line(s.points) for s in ruler_strokes if not s.closed]
+    rest = [(min(p[0] for p in s.points), _rect(s.points))
+            for s in ruler_strokes if s.closed]
+    rest += [(l.x, _text(l)) for l in labels_of('ruler')]
+    rest.sort(key=lambda item: item[0])
+    ruler_els += [el for _, el in rest]
 
     def group(gid, css_class, elements):
         body = "\n".join(elements)
         return f'<g id="{gid}" class="{css_class}">\n{body}\n</g>'
 
-    convex_hex = _rgba_to_hex(settings.convex_color)
-    concave_hex = _rgba_to_hex(settings.concave_color)
-    heat_hex = _rgba_to_hex(settings.heat_form_color)
+    stroke_mm = marks.hairline_mm
+    convex_hex = _rgb_to_hex(*marks.convex_color)
+    concave_hex = _rgb_to_hex(*marks.concave_color)
+    heat_hex = _rgb_to_hex(*marks.heat_color)
 
     style = (
         "<style>"
@@ -847,27 +170,36 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0):
         "</style>"
     )
 
+    w, h = marks.width_mm, marks.height_mm
     lines = [
         "<?xml version='1.0' encoding='UTF-8' standalone='no'?>",
         f"<svg xmlns='http://www.w3.org/2000/svg' "
-        f"width='{total_width:.3f}mm' height='{total_height:.3f}mm' "
-        f"viewBox='0 0 {total_width:.3f} {total_height:.3f}'>",
+        f"width='{w:.3f}mm' height='{h:.3f}mm' "
+        f"viewBox='0 0 {w:.3f} {h:.3f}'>",
         style,
-        group("fills", "fills", fills),
-        group("outlines", "outlines", outlines),
-        group("darts", "darts", darts),
-        group("ticks", "ticks", ticks),
-        group("align", "align", align),
-        group("alignlabels", "alignlabels", align_labels),
-        group("angles", "angles", angles),
-        group("numbers", "numbers", numbers),
-        group("heatform", "heatform", heatform),
-        group("ruler", "ruler",
-              _scale_strip(total_width, sheet.height)
-              if settings.show_scale_ruler else []),
+        group("fills", "fills", fill_els),
+        group("outlines", "outlines", outline_els),
+        group("darts", "darts", dart_els),
+        group("ticks", "ticks", tick_els),
+        group("align", "align", align_els),
+        group("alignlabels", "alignlabels", align_label_els),
+        group("angles", "angles", angle_els),
+        group("numbers", "numbers", number_els),
+        group("heatform", "heatform", heat_els),
+        group("ruler", "ruler", ruler_els),
         "</svg>",
     ]
     return "\n".join(lines)
+
+
+def generate_svg(bm, uv_layer, settings, scale_length=1.0, matrix=None):
+    """Build the full SVG pattern as a string. Pure function -- no file I/O,
+    no bpy.context -- so it can be exercised directly in tests.
+
+    Decides nothing itself: `build_marks` says what is on the sheet, and
+    `svg_from_marks` writes it down."""
+    return svg_from_marks(build_marks(bm, uv_layer, settings,
+                                      scale_length, matrix))
 
 
 def _rgba_to_hex(rgba):
@@ -908,8 +240,12 @@ class FOAMCRAFT_DRACHIS_OT_export_panel_pattern(bpy.types.Operator):
                 return {'CANCELLED'}
 
             settings = context.scene.foamcraft_drachis
+            # Through the world matrix, as the overlay measures, so an
+            # object with unapplied scale gets the same angles on paper as
+            # on screen.
             svg_text = generate_svg(bm, uv_layer, settings,
-                                    context.scene.unit_settings.scale_length)
+                                    context.scene.unit_settings.scale_length,
+                                    obj.matrix_world)
         finally:
             if owns_bm:
                 bm.free()

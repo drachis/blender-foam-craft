@@ -990,6 +990,66 @@ class IMAGE_PT_foamcraft_drachis_advice(bpy.types.Panel):
                         sub.label(text=line)
 
 
+def _operator_registered(idname):
+    """True when "category.name" is a registered operator.
+
+    bpy.ops attribute access is lazy, so hasattr() is True for any name
+    (measured on 5.2: a bogus idname passes). get_rna_type() is what actually
+    resolves it and raises KeyError for an unregistered operator. Reads no
+    mesh data.
+    """
+    category, _, name = idname.partition(".")
+    try:
+        getattr(getattr(bpy.ops, category), name).get_rna_type()
+    except (AttributeError, KeyError, TypeError):
+        return False
+    return True
+
+
+class IMAGE_PT_foamcraft_drachis_export(bpy.types.Panel):
+    bl_space_type = 'IMAGE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "FoamCraft"
+    bl_label = "Print / Export"
+    bl_parent_id = "IMAGE_PT_foamcraft_drachis"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = _settings(context)
+        if s is None:
+            layout.label(text="FoamCraft settings unavailable", icon='ERROR')
+            return
+
+        box = layout.box()
+        box.label(text="Alignment Marks")
+        box.prop(s, "show_align_ticks")
+        col = box.column()
+        col.enabled = s.show_align_ticks
+        col.prop(s, "tick_mode")
+        if s.tick_mode == 'BY_DISTANCE':
+            col.prop(s, "tick_spacing")
+        else:
+            col.prop(s, "ticks_per_run")
+        col.prop(s, "tick_length")
+        col.prop(s, "tick_numbers")
+
+        box = layout.box()
+        box.label(text="Sheet")
+        box.prop(s, "island_fill")
+        box.prop(s, "show_scale_ruler")
+
+        for idname, text, icon in (
+                ("foamcraft_drachis.export_pattern_image", "Export Image", 'IMAGE_DATA'),
+                ("foamcraft_drachis.export_panel_pattern", "Export SVG", 'EXPORT')):
+            if _operator_registered(idname):
+                layout.operator(idname, text=text, icon=icon)
+            else:
+                row = layout.row()
+                row.enabled = False
+                row.label(text=f"{text} (unavailable)", icon=icon)
+
+
 def _fmt_len(metres):
     """Length in whichever unit reads naturally, plus inches for the workshop.
 
@@ -1026,6 +1086,7 @@ _classes = (
     IMAGE_PT_foamcraft_drachis,
     IMAGE_PT_foamcraft_drachis_display,
     IMAGE_PT_foamcraft_drachis_advice,
+    IMAGE_PT_foamcraft_drachis_export,
 )
 
 

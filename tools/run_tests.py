@@ -82,9 +82,13 @@ TEST_FILES = (
     "tests/test_region_pattern.py",
     "tests/test_shape_sweep.py",
     "tests/test_export_svg.py",
+    # The model the SVG and raster backends both draw from.
+    "tests/test_marks_model.py",
+    "tests/test_print_panel.py",
     # Pure arithmetic, no scene -- it also runs standalone with
     #     python tests/test_tile_svg.py
     "tests/test_tile_svg.py",
+    "tests/test_export_raster.py",
     "tests/test_overlay_gui.py",
 )
 
@@ -106,6 +110,10 @@ GUI_FILES = frozenset({
     # Compares a capture of the UV editor with the overlay on against one
     # with it off; there is nothing to compare without a window.
     "tests/test_overlay_gui.py",
+    # NOT tests/test_export_raster.py, though it draws into a GPUOffScreen.
+    # A background Blender refuses that at first -- and names the cure in the
+    # refusal, gpu.init(). The file probes both and all of it passes headless
+    # (measured 2026-11-16), so it does not earn a window.
 })
 
 

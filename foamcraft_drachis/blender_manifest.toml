@@ -18,7 +18,7 @@ license = [
 tags = ["Modeling", "Mesh"]
 
 [permissions]
-files = "Write cut-pattern SVG files and a diagnostic log"
+files = "Write cut-pattern SVG and image files and a diagnostic log"
 
 [build]
 # Keep build artefacts and editor leftovers out of the shipped package. The
