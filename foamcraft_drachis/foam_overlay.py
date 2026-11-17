@@ -114,6 +114,19 @@ class _BevelMark(NamedTuple):
     # pointing the blade's way. The UV editor shows the page the right way
     # up, so the page's angle is the screen's. Added 2026-11-17, defaulted.
     rotation_deg: float = 0.0
+    # The label's printed size in sheet mm, after `foam_layout.layout_labels`
+    # has shrunk its piece to fit. Drawn at `angle_px * size_mm /
+    # _cache.angle_font_mm`: the same mapping the overlay already uses for
+    # the sheet's full angle size, so a label shrunk on paper is shrunk on
+    # screen by the same factor. 0 means "the full size".
+    size_mm: float = 0.0
+    # ((u, v), (u, v)): the 'leader' stroke the layout drew from just off
+    # this label to its cut line, when the label had to go outside its
+    # piece; () otherwise. Hidden with its label.
+    leader: tuple = ()
+    # `BevelAnchor.piece` -- the island's sheet-wide ordinal -- or -1 for a
+    # heat-form note, which has no anchor.
+    piece: int = -1
 
 
 class _OverlayCache:
@@ -121,7 +134,7 @@ class _OverlayCache:
 
     __slots__ = ("signature", "runs", "island_labels", "stretch_islands",
                  "align_ticks", "align_labels", "bevel_marks",
-                 "run_end_marks")
+                 "run_end_marks", "angle_font_mm")
 
     def __init__(self):
         self.signature = None
@@ -136,6 +149,9 @@ class _OverlayCache:
         # mid-seam run-end marks: the sheet's own, from foam_marks.
         self.bevel_marks = []        # _BevelMark
         self.run_end_marks = []      # (u0, v0, u1, v1), on the line then in
+        # The sheet's full angle-label size in mm, which `_BevelMark.size_mm`
+        # is measured against when drawing.
+        self.angle_font_mm = 0.0
 
 
 _cache = _OverlayCache()
@@ -329,28 +345,13 @@ class _Model:
                                                  s.overlay_scale)
         self.stroke_mm = self.sheet.permille(2, s.overlay_scale)
 
-        # Invert the sheet transform from the transform itself.
-        o = self.sheet.to_sheet(Vector((0.0, 0.0)))
-        ex = self.sheet.to_sheet(Vector((1.0, 0.0))) - o
-        ey = self.sheet.to_sheet(Vector((0.0, 1.0))) - o
-        det = ex.x * ey.y - ex.y * ey.x
-        if abs(det) < 1e-18:
+        self.to_uv = _sheet_to_uv(self.sheet)
+        if self.to_uv is None:
             self.ok = False
             return
 
-        def to_uv(x, y):
-            dx, dy = x - o.x, y - o.y
-            return ((dx * ey.y - dy * ey.x) / det,
-                    (dy * ex.x - dx * ex.y) / det)
-        self.to_uv = to_uv
-
         # Which of the model's islands (always whole-mesh) are on screen.
-        if s.only_selected:
-            shown_faces = {f.index for faces in shown_islands for f in faces}
-            self.island_shown = [any(f.index in shown_faces for f in isl.faces)
-                                 for isl in self.islands]
-        else:
-            self.island_shown = [True] * len(self.islands)
+        self.island_shown = _island_shown(self.islands, s, shown_islands)
 
     def run_end_marks(self):
         """The sheet's run-end marks, as ((u0, v0, u1, v1), ...).
@@ -421,32 +422,96 @@ class _Model:
 
         return ticks, marks
 
-    def bevel_marks(self):
-        """Seam number, arrow and degrees per run, as the sheet prints them.
 
-        `foam_marks._bevel_marks` is the function `build_marks` itself
-        calls; this maps its labels and arrows back to UV. Only Selected
-        keeps the marks of pieces that are shown.
-        """
-        if not self.ok:
-            return []
-        to_uv = self.to_uv
-        out = []
-        for mark in self.fm._bevel_marks(
-                self.islands, self.uv_layer, self.runs_by_island, self.s,
-                self.angle_font_mm, self.stroke_mm):
-            if mark.label is None or not self.island_shown[mark.island_index]:
-                continue
-            label = mark.label
-            tone = 'heat' if label.kind == 'heat' else label.tone
-            arrow = (tuple(to_uv(x, y) for x, y in mark.arrow.points)
-                     if mark.arrow is not None else ())
-            (ax, ay), (bx, by) = mark.run_ends
-            out.append(_BevelMark(
-                *to_uv(label.x, label.y), str(label.text), tone,
-                label.valign, arrow, *to_uv(ax, ay), *to_uv(bx, by),
-                float(getattr(label, 'rotation_deg', 0.0) or 0.0)))
-        return out
+def _sheet_to_uv(sheet):
+    """The inverse of `sheet.to_sheet` as a plain function of (x, y) mm, or
+    None when the transform is degenerate.
+
+    Derived from the transform itself (it is affine, so three probe points
+    determine it) rather than written out again, so it cannot drift from
+    the forward transform.
+    """
+    o = sheet.to_sheet(Vector((0.0, 0.0)))
+    ex = sheet.to_sheet(Vector((1.0, 0.0))) - o
+    ey = sheet.to_sheet(Vector((0.0, 1.0))) - o
+    ox, oy = float(o.x), float(o.y)
+    exx, exy, eyx, eyy = float(ex.x), float(ex.y), float(ey.x), float(ey.y)
+    det = exx * eyy - exy * eyx
+    if abs(det) < 1e-18:
+        return None
+
+    def to_uv(x, y):
+        dx, dy = x - ox, y - oy
+        return ((dx * eyy - dy * eyx) / det,
+                (dy * exx - dx * exy) / det)
+    return to_uv
+
+
+def _island_shown(islands, s, shown_islands):
+    """Per whole-mesh island, whether Only Selected leaves it on screen."""
+    if not s.only_selected:
+        return [True] * len(islands)
+    shown_faces = {f.index for faces in shown_islands for f in faces}
+    return [any(f.index in shown_faces for f in isl.faces) for isl in islands]
+
+
+def _laid_out_bevel_marks(sheet, parts, s, shown_ordinals, to_uv):
+    """The bevel labels and leaders the sheet prints, mapped back to UV.
+
+    Asks `foam_marks.marks_for_sheet` -- the export's own `Marks`, built on
+    this same sheet and laid out by `foam_layout.layout_labels` -- so every
+    label is where, as big, and as turned as the paper has it, and a label
+    the layout moved outside its piece brings its leader. Nothing about a
+    label is decided here.
+
+    'angle' labels are kept when their `anchor.piece` (the sheet-wide
+    island ordinal) is in `shown_ordinals`. Heat-form notes have no anchor
+    and are not moved by the layout, so they are taken from the same build's
+    `BevelMark`s, which name their island.
+
+    Holds nothing past the call: plain floats and strings out.
+    """
+    from . import foam_marks as fm
+    bevel_out = []
+    marks = fm.marks_for_sheet(sheet, parts, s, _scale_length(s),
+                               bevel_out=bevel_out)
+    leaders = {}
+    for st in marks.strokes:
+        if st.kind == 'leader' and st.anchor is not None:
+            leaders.setdefault(st.anchor, []).append(st)
+
+    out = []
+    for label in marks.labels:
+        anchor = label.anchor
+        if label.kind != 'angle' or anchor is None:
+            continue
+        if anchor.piece not in shown_ordinals:
+            continue
+        leader = ()
+        own = leaders.get(anchor)
+        if own:
+            (x0, y0), (x1, y1) = own[0].points[0], own[0].points[-1]
+            leader = (to_uv(x0, y0), to_uv(x1, y1))
+        (ax, ay), (bx, by) = anchor.run[0], anchor.run[-1]
+        out.append(_BevelMark(
+            *to_uv(label.x, label.y), str(label.text), label.tone,
+            label.valign, (), *to_uv(ax, ay), *to_uv(bx, by),
+            float(label.rotation_deg or 0.0), float(label.size_mm),
+            leader, int(anchor.piece)))
+
+    for part_index, mark in bevel_out:
+        label = mark.label
+        if label is None or label.kind != 'heat':
+            continue
+        isl = parts[part_index].islands[mark.island_index]
+        if isl.ordinal not in shown_ordinals:
+            continue
+        (ax, ay), (bx, by) = mark.run_ends
+        out.append(_BevelMark(
+            *to_uv(label.x, label.y), str(label.text), 'heat',
+            label.valign, (), *to_uv(ax, ay), *to_uv(bx, by),
+            float(label.rotation_deg or 0.0), float(label.size_mm)))
+    return out
 
 
 def _island_uv_centroid(faces, uv_layer):
@@ -513,10 +578,17 @@ def _rebuild(pairs, s):
                       obj.name)
          for obj, bm, uv_layer in pairs], s, _scale_length(s))
     part_of = {part.item.name: part for part in parts}
+    # Sheet-wide island ordinals (`BevelAnchor.piece`) left on screen by
+    # Only Selected, gathered per object below.
+    shown_ordinals = set()
 
     for obj, bm, uv_layer in pairs:
         part = part_of[obj.name]
         islands = core.uv_islands(bm, uv_layer, s.only_selected)
+        shown_ordinals.update(
+            isl.ordinal for isl, shown in zip(
+                part.islands, _island_shown(part.islands, s, islands))
+            if shown)
 
         # Kept as a list, not consumed as a generator: the alignment ticks
         # below are decided from these same runs.
@@ -529,13 +601,12 @@ def _rebuild(pairs, s):
                 max_darts_per_run=s.max_darts_per_run))
 
         # What the sheet prints, asked of the model once per object.
-        if s.show_align_ticks or s.show_brackets or s.show_heat_form:
+        if s.show_align_ticks or s.show_brackets:
             model = _Model(part, sheet, s, islands)
             if s.show_align_ticks:
                 ticks, tick_labels = model.align_ticks()
                 align_ticks.extend(ticks)
                 align_labels.extend(tick_labels)
-            bevel_marks.extend(model.bevel_marks())
             if s.show_brackets:
                 run_end_marks.extend(model.run_end_marks())
             # It holds BMesh elements; nothing of it may outlive this call.
@@ -607,11 +678,23 @@ def _rebuild(pairs, s):
             if vals and sum(vals) / len(vals) > s.stretch_tolerance:
                 flagged.add(key)
 
+    # Bevel labels and leaders: the laid-out ones the export prints, for the
+    # whole sheet at once -- the layout fits labels against every object's
+    # marks together, so it cannot be asked one object at a time.
+    to_uv = _sheet_to_uv(sheet)
+    if (s.show_brackets or s.show_heat_form) and to_uv is not None \
+            and any(part.islands for part in parts):
+        bevel_marks = _laid_out_bevel_marks(sheet, parts, s, shown_ordinals,
+                                            to_uv)
+
     _cache.runs = runs
     _cache.island_labels = labels
     _cache.align_ticks = align_ticks
     _cache.align_labels = align_labels
     _cache.bevel_marks = bevel_marks
+    _cache.angle_font_mm = (float(sheet.permille(s.angle_text_size,
+                                                 s.overlay_scale))
+                            if any(part.islands for part in parts) else 0.0)
     _cache.run_end_marks = run_end_marks
     # Heat forming is a property of a piece, not of a single cut: either some
     # seam on it is too steep to saw, or the piece will not lie flat at all.
@@ -739,6 +822,20 @@ def _ensure_cache(context, s):
         _rebuild(pairs, s)
         _cache.signature = signature
     return True
+
+
+def _label_px(angle_px, size_mm, full_mm):
+    """On-screen pixel size of a bevel label printed `size_mm` tall.
+
+    The sheet's full angle size, `full_mm`, is drawn at `angle_px` (the
+    overlay's existing mapping of `angle_text_size`); a label the layout
+    shrank is drawn smaller by the same factor, so screen and paper keep
+    the same proportions. `size_mm` 0 (unknown) draws at `angle_px`.
+    Clamped to the overlay's usual 6..400 px.
+    """
+    if size_mm <= 0.0 or full_mm <= 0.0:
+        return angle_px
+    return max(6, min(int(round(angle_px * size_mm / full_mm)), 400))
 
 
 def _draw_lines(segments_by_color, width):
@@ -1044,10 +1141,12 @@ def draw_callback():
             if all(abs(c) < 1e6 for c in (x0, y0, x1, y1)):
                 bucket.extend([(x0, y0), (x1, y1)])
 
-    # Bevel labels: seam number, blade-tilt arrow and degrees, at the place
-    # and with the text the exported sheet prints -- cached in UV space by
-    # the rebuild from foam_marks._bevel_marks, so screen and paper cannot
-    # disagree about what a seam is called or which way to tilt.
+    # Bevel labels: seam number, blade-tilt arrow and degrees, at the place,
+    # size and turn the exported sheet prints them -- the laid-out labels
+    # (foam_layout.layout_labels), cached in UV space by the rebuild from
+    # the export's own Marks, so screen and paper cannot disagree about what
+    # a seam is called, which way to tilt, or where the label went. A label
+    # the layout put outside its piece is drawn there with its leader.
     #
     # Hidden where the run is too short on screen to carry a number, the
     # same legibility test the old margin labels used (zoom in and they
@@ -1055,6 +1154,7 @@ def draw_callback():
     neutral = convex if not s.show_dart_colors else tuple(s.island_id_color)
     tones = {'convex': convex, 'concave': concave, 'neutral': neutral,
              'heat': heat}
+    full_mm = _cache.angle_font_mm
     for mark in _cache.bevel_marks:
         ax, ay = view.view_to_region(mark.au, mark.av, clip=False)
         bx, by = view.view_to_region(mark.bu, mark.bv, clip=False)
@@ -1064,8 +1164,15 @@ def draw_callback():
         if ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 < s.min_label_run_px:
             continue
         color = tones.get(mark.tone, neutral)
+        px = _label_px(angle_px, mark.size_mm, full_mm)
         labels.append((x, y, mark.text, color, mark.valign,
-                       mark.rotation_deg))
+                       mark.rotation_deg, px))
+        if mark.leader:
+            (u0, v0), (u1, v1) = mark.leader
+            p = view.view_to_region(u0, v0, clip=False)
+            q = view.view_to_region(u1, v1, clip=False)
+            if all(abs(c) < 1e6 for c in (*p, *q)):
+                segments.setdefault(color, []).extend([p, q])
         if mark.arrow:
             pts = [view.view_to_region(u, v, clip=False)
                    for u, v in mark.arrow]
@@ -1100,7 +1207,11 @@ def draw_callback():
             blf.draw(font_id, "!")
         blf.size(font_id, angle_px)
 
-    for x, y, text, color, valign, turn in labels:
+    current_px = angle_px
+    for x, y, text, color, valign, turn, px in labels:
+        if px != current_px:
+            blf.size(font_id, px)
+            current_px = px
         width, height = blf.dimensions(font_id, text)
         # Where the sheet prints it. 'middle' centres the text on the point;
         # 'baseline' (the heat-form note) sits its baseline there.

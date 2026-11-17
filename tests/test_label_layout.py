@@ -395,7 +395,11 @@ def _marks(obj, **overrides):
             if hasattr(s, k):
                 setattr(s, k, v)
         uv = bm.loops.layers.uv.active
-        return fm.build_marks(bm, uv, s, 1.0, obj.matrix_world)
+        # layout=False: these tests measure the layout's INPUT and run
+        # `fl.layout_labels` on it themselves. build_marks lays the labels
+        # out by default since 2026-11-17 (every export prints that).
+        return fm.build_marks(bm, uv, s, 1.0, obj.matrix_world,
+                              layout=False)
     finally:
         for k, v in saved.items():
             setattr(s, k, v)
@@ -812,7 +816,8 @@ def test_two_objects_keep_their_pieces_apart():
             bms.append(bm)
             items.append(fm.SheetItem(bm, bm.loops.layers.uv.active,
                                       obj.matrix_world, "C", obj.name))
-        before = fm.build_marks_multi(items, s, 1.0)
+        # The raw sheet: laid out below, by hand (see `_marks`).
+        before = fm.build_marks_multi(items, s, 1.0, layout=False)
     finally:
         for k, v in saved.items():
             setattr(s, k, v)
@@ -890,8 +895,9 @@ def _snapshot_marks(obj, settings):
     bm.from_mesh(obj.data)
     try:
         uv = bm.loops.layers.uv.active
+        # The raw sheet, the "before" of the before/after (see `_marks`).
         return fm.build_marks(bm, uv, settings, SNAPSHOT_SCALE_LENGTH,
-                              obj.matrix_world)
+                              obj.matrix_world, layout=False)
     finally:
         bm.free()
 

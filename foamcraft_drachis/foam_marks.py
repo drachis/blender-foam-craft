@@ -1085,8 +1085,10 @@ def _bevel_marks(islands, uv_layer, runs_by_island, settings, font_mm,
 
     One `BevelMark` per run that has anything to say, in island then run
     order. This is the single decision for both the sheet and the screen:
-    `build_marks` sorts the parts into its groups, and the overlay asks
-    this same function and maps the millimetres back to UV.
+    `build_marks` sorts the parts into its groups and lays the labels out
+    (`foam_layout.layout_labels`), and the overlay takes the laid-out
+    labels from that same `Marks` (`marks_for_sheet`) and maps the
+    millimetres back to UV.
 
     Per run with a neighbouring piece (`has_dihedral`):
 
@@ -1796,7 +1798,7 @@ def _label_fit_size(text, room_mm, font_mm):
 
 
 def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None,
-                prefix='', name=''):
+                prefix='', name='', layout=True):
     """Everything to draw for this mesh, as a `Marks`.
 
     `matrix` is the object's world matrix; lengths and angles are measured
@@ -1805,14 +1807,15 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None,
 
     Every `settings.show_*` and `min_angle` decision is made here and nowhere
     else on the export path; a backend draws what it is given. A one-object
-    sheet is `build_marks_multi` with one item.
+    sheet is `build_marks_multi` with one item. `layout`: see
+    `build_marks_multi`.
     """
     return build_marks_multi(
         [SheetItem(bm, uv_layer, matrix, prefix, name)], settings,
-        scale_length)
+        scale_length, layout=layout)
 
 
-def build_marks_multi(items, settings, scale_length=1.0):
+def build_marks_multi(items, settings, scale_length=1.0, layout=True):
     """Everything to draw for several objects on one sheet, as a `Marks`.
 
     `items` are `SheetItem`s. They share one UV->mm transform and are drawn
@@ -1821,9 +1824,42 @@ def build_marks_multi(items, settings, scale_length=1.0):
     Every per-mesh decision -- seams, runs, ticks -- is still made on one
     mesh at a time, since a seam is an edge of one mesh and element indices
     mean nothing across two.
+
+    `layout` (default True): the bevel labels are fitted by
+    `foam_layout.layout_labels` at `settings.min_label_mm` -- slid along
+    their runs, shrunk one size per piece, or put outside on 'leader'
+    strokes -- so every backend prints the laid-out sheet. False returns the
+    labels where `_bevel_marks` first put them, for tests that measure the
+    layout's input.
     """
     sheet, parts = _layout_sheet(items, settings, scale_length)
+    return marks_for_sheet(sheet, parts, settings, scale_length,
+                           layout=layout)
 
+
+def marks_for_sheet(sheet, parts, settings, scale_length=1.0, layout=True,
+                    bevel_out=None):
+    """`build_marks_multi` for a sheet `_layout_sheet` has already built.
+
+    The overlay builds the sheet itself (it needs the parts to map marks
+    back to UV) and asks this for the very `Marks` the export prints, so the
+    screen shows the laid-out labels and leaders the paper carries.
+    `bevel_out`, when a list, receives `(part_index, BevelMark)` for every
+    bevel mark in emission order -- the overlay takes the heat-form notes
+    from it, which carry no anchor to say whose piece they are on.
+    """
+    marks = _sheet_marks(sheet, parts, settings, scale_length, bevel_out)
+    if layout:
+        # Imported here: foam_layout imports this module.
+        from .foam_layout import DEFAULT_MIN_LABEL_MM, layout_labels
+        marks = layout_labels(
+            marks, float(getattr(settings, 'min_label_mm',
+                                 DEFAULT_MIN_LABEL_MM)))
+    return marks
+
+
+def _sheet_marks(sheet, parts, settings, scale_length, bevel_out=None):
+    """The un-laid-out `Marks` for a built sheet (`marks_for_sheet`)."""
     total_width, total_height = sheet.width, sheet.height
     if settings.show_scale_ruler:
         # Added below the pattern, so the pattern's own coordinates --
@@ -1857,7 +1893,7 @@ def build_marks_multi(items, settings, scale_length=1.0):
     arrows = []
     align, align_labels = [], []
 
-    for part in parts:
+    for part_index, part in enumerate(parts):
         uv_layer = part.item.uv_layer
         matrix = part.item.matrix
         islands = part.islands
@@ -1865,6 +1901,8 @@ def build_marks_multi(items, settings, scale_length=1.0):
         # --- seam number, blade-tilt arrow and degrees: one entry per run.
         for mark in _bevel_marks(islands, uv_layer, runs_by_island, settings,
                                  angle_font_mm, stroke_mm):
+            if bevel_out is not None:
+                bevel_out.append((part_index, mark))
             if mark.heat_stroke is not None:
                 heat_strokes.append(mark.heat_stroke)
             if mark.arrow is not None:

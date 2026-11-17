@@ -40,6 +40,7 @@ for _name in [n for n in list(sys.modules) if n.startswith(_MOD)]:
 import bl_ext.user_default.foamcraft_drachis.foam_marks as fm         # noqa: E402
 import bl_ext.user_default.foamcraft_drachis.foam_angle_core as core  # noqa: E402
 import bl_ext.user_default.foamcraft_drachis.foam_overlay as ov       # noqa: E402
+import bl_ext.user_default.foamcraft_drachis.foam_layout as fl        # noqa: E402
 
 # Two marks are the same mark when every coordinate agrees to within this
 # fraction of the sheet's size.
@@ -445,7 +446,15 @@ def _bevel_measure(obj, **overrides):
             p = sheet.to_sheet(Vector((u, v)))
             return (p.x, p.y)
 
-        screen_labels = [mm(m.u, m.v) + (m.text,) for m in cached]
+        # Place, turn, size and text (2026-11-17): the labels are laid out
+        # by foam_layout before they print -- slid, shrunk one size per
+        # piece, or put outside on a leader -- and the screen must show the
+        # laid-out label, not the one `_bevel_marks` first proposed. Size is
+        # in mm on both sides (`_BevelMark.size_mm` is the printed size).
+        screen_labels = [mm(m.u, m.v) + (m.rotation_deg, m.size_mm, m.text)
+                         for m in cached]
+        screen_leaders = [mm(*m.leader[0]) + mm(*m.leader[1])
+                          for m in cached if m.leader]
         # The blade arrow is a glyph in the label since 2026-11-17 (the
         # drawn 'bevel_arrow' stroke is retired), so "arrows" now compares
         # every glyph-bearing label's place and turn, screen against paper.
@@ -454,10 +463,24 @@ def _bevel_measure(obj, **overrides):
                          if any(g in m.text for g in glyphs)]
         screen_ends = [mm(u0, v0) + mm(u1, v1)
                        for u0, v0, u1, v1 in cached_ends]
+        # What every export prints: build_marks lays the labels out by
+        # default.
         marks = fm.build_marks(bm, uv_layer, s, scale_length,
                                obj.matrix_world)
-        paper_labels = [(l.x, l.y, l.text) for l in marks.labels
+        paper_labels = [(l.x, l.y, l.rotation_deg, l.size_mm, l.text)
+                        for l in marks.labels
                         if l.kind in ('angle', 'heat')]
+        paper_leaders = [st.points[0] + st.points[-1] for st in marks.strokes
+                         if st.kind == 'leader']
+        # The layout's own account of the same sheet, from the raw marks,
+        # so a fixture can say whether it actually slid or led anything.
+        layout_report = {}
+        laid = fl.layout_labels(
+            fm.build_marks(bm, uv_layer, s, scale_length, obj.matrix_world,
+                           layout=False),
+            float(s.min_label_mm), layout_report)
+        default_is_laid_out = laid == marks
+        full_mm = ov._cache.angle_font_mm
         paper_arrows = [(l.x, l.y, l.rotation_deg) for l in marks.labels
                         if l.kind == 'angle'
                         and any(g in l.text for g in glyphs)]
@@ -467,31 +490,46 @@ def _bevel_measure(obj, **overrides):
             isinstance(m.u, float) and isinstance(m.v, float)
             and isinstance(m.text, str)
             and all(isinstance(x, float) for pt in m.arrow for x in pt)
+            and isinstance(m.size_mm, float)
+            and all(isinstance(x, float) for pt in m.leader for x in pt)
             for m in cached) and all(isinstance(c, float)
                                      for t in cached_ends for c in t)
     finally:
         for k, v in saved.items():
             setattr(s, k, v)
     tol = TOL_REL * max(marks.width_mm, marks.height_mm)
+    hows = layout_report.get("how", [])
     return {
         "labels": (screen_labels, paper_labels),
         "arrows": (screen_arrows, paper_arrows),
         "ends": (screen_ends, paper_ends),
+        "leaders": (screen_leaders, paper_leaders),
         "plain": plain, "tol": tol,
+        "how": {h: hows.count(h) for h in sorted(set(hows))},
+        "default_is_laid_out": default_is_laid_out,
+        "full_mm": full_mm,
+        "sizes_mm": sorted({round(m.size_mm, 4) for m in cached}),
     }
 
 
-def _bevel_parity(fixture, want_ends):
-    """Cached on-screen bevel labels, arrows and run-end marks equal the
-    sheet's as multisets. `want_ends`: whether this fixture has run ends
-    part way along a seam (the gore sphere does; on a cube every run end
-    is a corner, and nothing may be cached there)."""
+def _bevel_parity(fixture, want_ends, **overrides):
+    """Cached on-screen bevel labels (place, turn, size, text), arrows,
+    run-end marks and leaders equal the sheet's as multisets. `want_ends`:
+    whether this fixture has run ends part way along a seam (the gore
+    sphere does; on a cube every run end is a corner, and nothing may be
+    cached there)."""
     obj = fixture()
-    m = _bevel_measure(obj)
+    m = _bevel_measure(obj, **overrides)
     bpy.ops.object.mode_set(mode='OBJECT')
     tol = m["tol"]
     out, checks = {}, {}
-    for key in ("labels", "arrows", "ends"):
+    out["how"] = m["how"]
+    out["sizes_mm"] = m["sizes_mm"]
+    out["full_mm"] = m["full_mm"]
+    # The exports print the laid-out sheet: build_marks' default is exactly
+    # layout_labels applied to its raw marks, not some other pass.
+    checks["build_marks_default_is_the_layout"] = m["default_is_laid_out"]
+    for key in ("labels", "arrows", "ends", "leaders"):
         screen, paper = m[key]
         only_screen, only_paper = _unmatched(screen, paper, tol)
         out[key] = {"screen": len(screen), "paper": len(paper),
@@ -510,6 +548,290 @@ def _bevel_parity(fixture, want_ends):
     out["tolerance_mm"] = tol
     out["checks"] = checks
     return out
+
+
+def _crowded_box():
+    """The crowded fixture, from tests/test_label_layout.py's two known
+    cases at once: a 2 x 2 x 0.2 m box, every edge a seam -- its side strips
+    are 2000 x 200 mm, and the labels of a strip's two long edges each run
+    right across it and meet, so the layout must SLIDE them (measured there:
+    they collide before) -- with the top square shrunk to 0.5% in UV, about
+    10 mm on the sheet, narrower than one label at the 2.5 mm floor, so its
+    four labels must go out on LEADERS. Left in edit mode."""
+    _clear()
+    bpy.ops.mesh.primitive_cube_add(size=2.0)
+    obj = bpy.context.object
+    obj.scale = (1.0, 1.0, 0.1)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    for e in bm.edges:
+        e.seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.02)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    top = max(obj.data.polygons, key=lambda p: p.normal.z)
+    uv = obj.data.uv_layers.active.data
+    idx = list(top.loop_indices)
+    cu = sum(uv[i].uv.x for i in idx) / len(idx)
+    cv = sum(uv[i].uv.y for i in idx) / len(idx)
+    for i in idx:
+        uv[i].uv = (cu + (uv[i].uv.x - cu) * 0.005,
+                    cv + (uv[i].uv.y - cv) * 0.005)
+    bpy.ops.object.mode_set(mode='EDIT')
+    return obj
+
+
+def test_crowded_box_laid_out_labels_and_leaders_match_the_sheet():
+    """The crowded box: the screen shows the LAID-OUT labels -- where the
+    layout slid them, at the size it shrank them to, turned as printed --
+    and the leaders of the four that went outside, all equal to the sheet's
+    as multisets.
+
+    Piece numbers are off: on a 10 mm piece a number covers the whole
+    piece and every leader would cross it, so the tiny piece's labels come
+    back 'unplaced' instead (pinned in test_label_layout.py). Expected from
+    that file's measurements: some labels 'slid', exactly 4 'leader', 0
+    'unplaced', and the screen holds the same 4 leaders.
+    """
+    report = _bevel_parity(_crowded_box, want_ends=False,
+                           show_island_ids=False, show_align_ticks=True)
+    how = report["how"]
+    c = report["checks"]
+    c["layout_slid_some_labels"] = how.get("slid", 0) > 0
+    c["layout_led_exactly_four"] = how.get("leader", 0) == 4
+    c["nothing_unplaced"] = how.get("unplaced", 0) == 0
+    c["four_leaders_on_screen"] = report["leaders"]["screen"] == 4
+    # Some piece was shrunk, and the screen carries the shrunk size: at
+    # least two sizes cached, the largest the sheet's full angle size.
+    c["a_shrunk_size_is_cached"] = len(report["sizes_mm"]) >= 2 and \
+        abs(max(report["sizes_mm"]) - report["full_mm"]) < 1e-3 * max(
+            report["full_mm"], 1e-9)
+    return report
+
+
+def test_label_px_scales_with_printed_size():
+    """`_label_px`: the full angle size draws at angle_px, half the size at
+    half (rounded), and the 6..400 px clamp holds both ways. Arithmetic,
+    so a wrong ratio cannot pass."""
+    f = ov._label_px
+    return {
+        "checks": {
+            "full_size_is_angle_px": f(40, 8.0, 8.0) == 40,
+            "half_size_is_half": f(40, 4.0, 8.0) == 20,
+            "unknown_size_is_angle_px": f(40, 0.0, 8.0) == 40
+            and f(40, 4.0, 0.0) == 40,
+            "floor_is_six": f(40, 0.1, 8.0) == 6,
+            "ceiling_is_four_hundred": f(300, 16.0, 8.0) == 400,
+        },
+    }
+
+
+SNAPSHOT = r"O:\Work\BlenderPlugin\FoamCraft\tests\fixtures\beast_skull_snapshot.blend"
+HEADS = ("head_simplified", "head_simplified.001")
+
+
+def _copy_settings(src, dst):
+    """Every writable non-pointer setting, src -> dst (as
+    tests/test_multi_object.py does for the same snapshot)."""
+    for prop in src.bl_rna.properties:
+        name = prop.identifier
+        if name in ("rna_type", "name") or prop.is_readonly \
+                or prop.type == 'POINTER':
+            continue
+        try:
+            setattr(dst, name, getattr(src, name))
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+
+def _world_height(obj):
+    """World-space bounding-box extent in z, from the vertices through
+    matrix_world, in Blender units."""
+    mw = obj.matrix_world
+    zs = [(mw @ v.co).z for v in obj.data.vertices]
+    return (max(zs) - min(zs)) if zs else 0.0
+
+
+def test_snapshot_heads_overlay_is_the_printed_layout():
+    """The maker's two heads in multi-object edit mode: the overlay's cached
+    bevel labels and leaders equal, as multisets, the laid-out labels the
+    IMAGE OPERATOR hands its renderer -- captured by wrapping the
+    operator's own `render_marks` while it runs, so this is the real export
+    path, not a re-derivation. And that laid-out sheet has 0 label/label
+    overlaps (foam_layout's own oriented boxes).
+
+    From a temp copy of the snapshot, appended (opening a file inside a
+    bridge request replaces the session), with the snapshot scene's
+    settings and unit scale copied on; never saved. Only Selected is
+    forced off (every piece is then on screen) and the image is drawn at
+    10 dpi, small, since only its marks are compared.
+
+    Also reports -- measures, asserts nothing about -- the scale question
+    for the maker: the head's world-space height, its parent's scale, the
+    scene's unit scale, and what size the sheet prints at.
+    """
+    import os
+    import shutil
+    import tempfile
+    if not os.path.exists(SNAPSHOT):
+        return {"skipped": "fixture %s is absent (git-ignored, local only)"
+                           % SNAPSHOT, "checks": {}}
+    _clear()
+    tmp = os.path.join(tempfile.mkdtemp(prefix="foam_overlay_"), "copy.blend")
+    shutil.copyfile(SNAPSHOT, tmp)
+    with bpy.data.libraries.load(tmp, link=False) as (src, dst):
+        dst.objects = [n for n in src.objects if n in HEADS]
+        dst.scenes = list(src.scenes[:1])
+    objs = {o.name: o for o in dst.objects if o is not None}
+    if set(objs) != set(HEADS):
+        return {"skipped": "snapshot lacks %r" % (HEADS,), "checks": {}}
+    for o in objs.values():
+        bpy.context.scene.collection.objects.link(o)
+    snap_scene = next((sc for sc in dst.scenes if sc is not None), None)
+    s = bpy.context.scene.foamcraft_drachis
+    file_unit_scale = None
+    if snap_scene is not None:
+        file_unit_scale = snap_scene.unit_settings.scale_length
+        if getattr(snap_scene, "foamcraft_drachis", None):
+            _copy_settings(snap_scene.foamcraft_drachis, s)
+        bpy.context.scene.unit_settings.scale_length = file_unit_scale
+    saved_only = s.only_selected
+    s.only_selected = False
+    a, b = objs[HEADS[0]], objs[HEADS[1]]
+    # What a reader who skips the update sees (test_label_layout.py's
+    # snapshot path appends and reads matrix_world without one).
+    before_update_scale = [round(x, 4) for x in a.matrix_world.to_scale()]
+    # The parent ("retopo") comes along unlinked; evaluate before reading
+    # matrix_world (tests/test_multi_object.py found it stale otherwise).
+    bpy.context.view_layer.update()
+    parent = a.parent
+    mw = a.matrix_world
+    world = [mw @ v.co for v in a.data.vertices]
+    local = [v.co for v in a.data.vertices]
+    scale_report = {
+        "head_world_scale_before_view_layer_update": before_update_scale,
+        "head_world_extent_xyz_bu": [
+            round(max(p[i] for p in world) - min(p[i] for p in world), 4)
+            for i in range(3)],
+        "head_mesh_extent_xyz_bu": [
+            round(max(p[i] for p in local) - min(p[i] for p in local), 3)
+            for i in range(3)],
+        "head_world_height_bu": round(_world_height(a), 4),
+        "head_dimensions_bu": [round(x, 4) for x in a.dimensions],
+        "head_local_scale": [round(x, 4) for x in a.scale],
+        "parent": parent.name if parent else None,
+        "parent_scale": [round(x, 4) for x in parent.scale] if parent else None,
+        "parent_world_scale": [round(x, 4)
+                               for x in parent.matrix_world.to_scale()]
+        if parent else None,
+        "parent_rotation_deg": [round(math.degrees(x), 2) for x in
+                                parent.matrix_world.to_euler()]
+        if parent else None,
+        "head_world_scale": [round(x, 4) for x in a.matrix_world.to_scale()],
+        "scene_unit_scale_length": file_unit_scale,
+        "scene_length_unit": snap_scene.unit_settings.length_unit
+        if snap_scene else None,
+    }
+
+    bpy.ops.object.select_all(action='DESELECT')
+    a.select_set(True)
+    b.select_set(True)
+    bpy.context.view_layer.objects.active = a
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+
+    pairs = ov._edit_meshes(bpy.context)
+    ov._rebuild(pairs, s)
+    cached = list(ov._cache.bevel_marks)
+
+    # The image operator's own marks: wrap the `render_marks` its execute()
+    # calls (looked up in the module the registered class came from, which
+    # is not the freshly imported one above).
+    op_cls = bpy.types.FOAMCRAFT_DRACHIS_OT_export_pattern_image
+    g = op_cls.execute.__globals__
+    original = g["render_marks"]
+    seen = {}
+
+    def spy(marks, path, **kw):
+        seen["marks"] = marks
+        info = original(marks, path, **kw)
+        seen["info"] = info
+        return info
+    g["render_marks"] = spy
+    path = os.path.join(os.path.dirname(tmp), "heads.png")
+    try:
+        status = bpy.ops.foamcraft_drachis.export_pattern_image(
+            filepath=path, file_format='PNG', resolution_mode='DPI', dpi=10)
+    finally:
+        g["render_marks"] = original
+    sheet, _parts = fm._layout_sheet(
+        [fm.SheetItem(bm, uv, o.matrix_world.copy(),
+                      fm.object_prefix(o.name, o.foamcraft_drachis_prefix),
+                      o.name) for o, bm, uv in pairs],
+        s, bpy.context.scene.unit_settings.scale_length)
+    del _parts
+    bpy.ops.object.mode_set(mode='OBJECT')
+    s.only_selected = saved_only
+
+    marks = seen.get("marks")
+    if marks is None:
+        return {"status": list(status), "checks": {"operator_rendered": False}}
+
+    def mm(u, v):
+        p = sheet.to_sheet(Vector((u, v)))
+        return (p.x, p.y)
+    screen = [mm(m.u, m.v) + (m.rotation_deg, m.size_mm, m.text)
+              for m in cached if m.tone != 'heat']
+    paper = [(l.x, l.y, l.rotation_deg, l.size_mm, l.text)
+             for l in marks.labels if l.kind == 'angle']
+    screen_leaders = [mm(*m.leader[0]) + mm(*m.leader[1])
+                      for m in cached if m.leader]
+    paper_leaders = [st.points[0] + st.points[-1] for st in marks.strokes
+                     if st.kind == 'leader']
+    tol = TOL_REL * max(marks.width_mm, marks.height_mm)
+    only_s, only_p = _unmatched(screen, paper, tol)
+    lead_s, lead_p = _unmatched(screen_leaders, paper_leaders, tol)
+
+    quads = [fl._label_quad(l) for l in marks.labels if l.kind == 'angle']
+    overlaps = sum(1 for i in range(len(quads))
+                   for j in range(i + 1, len(quads))
+                   if fl._quads_overlap(quads[i], quads[j]))
+    info = seen.get("info") or {}
+    scale_report.update({
+        "sheet_mm": [round(marks.width_mm, 1), round(marks.height_mm, 1)],
+        # World z extent at the file's unit scale, in mm. (The head lies
+        # along world y: its longest side is head_world_extent_xyz_bu[1].)
+        "head_world_z_height_mm": round(
+            _world_height(a) * file_unit_scale * 1000.0, 1)
+        if file_unit_scale else None,
+        "image_dpi": info.get("dpi"), "image_pixels": info.get("pixels"),
+        "angle_full_mm": round(ov._cache.angle_font_mm, 3),
+        "min_label_mm": float(s.min_label_mm),
+    })
+    return {
+        "scale": scale_report,
+        "labels": {"screen": len(screen), "paper": len(paper),
+                   "only_on_screen": only_s, "only_on_paper": only_p},
+        "leaders": {"screen": len(screen_leaders),
+                    "paper": len(paper_leaders),
+                    "only_on_screen": lead_s, "only_on_paper": lead_p},
+        "label_label_overlaps": overlaps,
+        "sizes_mm": sorted({round(l.size_mm, 3) for l in marks.labels
+                            if l.kind == 'angle'}),
+        "tolerance_mm": tol,
+        "checks": {
+            "operator_finished": status == {'FINISHED'},
+            "there_are_labels": len(paper) > 0,
+            "labels_match_the_printed_layout":
+                len(screen) == len(paper) and only_s == 0 and only_p == 0,
+            "leaders_match_the_printed_layout":
+                len(screen_leaders) == len(paper_leaders)
+                and lead_s == 0 and lead_p == 0,
+            "no_label_label_overlap": overlaps == 0,
+        },
+    }
 
 
 def test_cube_bevel_labels_match_the_sheet():
@@ -542,6 +864,9 @@ TESTS = (
     test_tick_settings_are_in_the_cache_signature,
     test_cube_bevel_labels_match_the_sheet,
     test_gore_sphere_bevel_labels_match_the_sheet,
+    test_crowded_box_laid_out_labels_and_leaders_match_the_sheet,
+    test_label_px_scales_with_printed_size,
+    test_snapshot_heads_overlay_is_the_printed_layout,
 )
 
 result = {}
