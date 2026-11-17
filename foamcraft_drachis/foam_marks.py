@@ -28,15 +28,35 @@ re-deriving anything:
                  'relief'   a relief wedge to cut out
                  'ruler'    the 1 inch square's interior, if filled
     Stroke.kind  'outline'  a piece boundary -- the cut line
-                 'bracket'  a run-end bracket / tick
-                 'align'    an alignment (registration) mark
+                 'bracket'  a run-end mark: where one bevel angle stops
+                            and the next starts *part way along* a seam.
+                            Two points, the first on the cut line, the
+                            second inside the piece, square to the line,
+                            `tick_length` long. None at corners or
+                            junctions (`_run_end_marks`).
+                 'align'    an alignment (registration) mark. Two points,
+                            the first on the cut line, the second inside
+                            the piece, perpendicular to the line there.
+                 'bevel_arrow'  which way to tilt the blade for a run. One
+                            open polyline of five points: tail, tip, barb,
+                            tip, barb -- so points[0] -> points[1] is the
+                            direction, perpendicular to the cut line. It
+                            points to the side of the line the blade's tip
+                            (the far face of the sheet) ends up on. Absent
+                            for a straight cut. See `_blade_tip_inward`.
                  'relief'   a relief cut drawn open
                  'heat'     a heat-form run marker
                  'ruler'    scale bar and 1 inch square
     Label.kind   'number'   a piece number, inside its piece
-                 'angle'    a bevel angle
+                 'angle'    a run's bevel label: "<seam>, <deg>°" -- the
+                            seam number the two glued pieces share, and the
+                            blade tilt for this piece (per side, absolute).
+                            Just "<seam>" for a straight cut (fold below
+                            `min_angle`); just "<deg>°" with seam numbers
+                            switched off. The comma is the maker's: "4 3°"
+                            read as "43°".
                  'align'    an alignment mark's number
-                 'heat'     a heat-form note
+                 'heat'     a heat-form note, "<seam>, <deg>° (heat-form)"
                  'ruler'    scale bar captions
 """
 
@@ -329,43 +349,78 @@ def _run_polyline(run, uv_layer, isl):
     return pts
 
 
-def _polyline_midpoint(pts):
-    """The point half way along `pts` by length, not the chord's middle."""
+def _run_midpoint_frame(run, uv_layer, isl):
+    """(point, inward unit normal, loop index) half way along a run.
+
+    The point is half way along the run *as drawn*, which on a curved run is
+    nowhere near the middle of its chord. The normal is perpendicular to the
+    one edge the point sits on -- not to the chord -- because an arrow drawn
+    there has to read as square to the line the maker is looking at. Its
+    sign comes from the face behind that edge, which is inside the piece by
+    definition (an island centroid is not: on a ring it sits in the hole).
+
+    The loop index says which of the run's edges carries the midpoint, and
+    so which seam the run is labelled with when it spans more than one.
+    """
+    pts = _run_polyline(run, uv_layer, isl)
     lengths = [(pts[i + 1] - pts[i]).length for i in range(len(pts) - 1)]
     half = sum(lengths) / 2
+    index = min(len(pts) // 2, len(lengths) - 1)
+    mid = pts[len(pts) // 2].copy()
     for i, seg in enumerate(lengths):
         if seg >= half and seg > 1e-12:
-            return pts[i].lerp(pts[i + 1], half / seg)
+            index, mid = i, pts[i].lerp(pts[i + 1], half / seg)
+            break
         half -= seg
-    return pts[len(pts) // 2].copy()
+    inward, _room = _inward_at(isl, uv_layer, mid, run.loops[index])
+    return mid, inward, index
 
 
-def _angle_label_anchor(run, uv_layer, isl, text, font_mm):
-    """Where a run's angle is written: inside its own piece.
+def _loop_sheet_dir(isl, uv_layer, loop):
+    """Unit direction of a boundary loop's edge on the sheet, or None."""
+    d = (isl.to_sheet(loop.link_loop_next[uv_layer].uv)
+         - isl.to_sheet(loop[uv_layer].uv))
+    return d.normalized() if d.length > 1e-9 else None
 
-    It used to be centred on the cut line itself, at the middle of the
-    run's chord. Two pieces packed side by side then wrote their labels
-    on top of each other across the seam -- a cube read "9090" -- and
-    half of every label was cut off with the offcut.
 
-    So it is pushed inward until its own box clears the line, the same
-    projection of half-extents onto the normal the overlay uses, and it
-    starts from the middle of the run as drawn, which on a curved run is
-    nowhere near the middle of its chord.
+def _inward_at(isl, uv_layer, point, loop, other=None):
+    """(inward unit normal, room) at `point` on a boundary loop's edge.
 
-    Inward comes from the boundary's winding, computed in core, flipped
-    in v because the sheet's y grows downward.
+    Perpendicular to that edge on the sheet. With `other` -- the boundary
+    loop on the far side of a vertex the point sits exactly on -- it is
+    perpendicular to the average of the two edge directions instead, so a
+    mark on a bend leans into neither side.
+
+    "Inward" is the side of the edge the face behind `loop` lies on, read
+    from that face's winding on the sheet: a face is to the left of its own
+    loops when its signed (shoelace) area is positive and to the right when
+    negative, in whatever frame both are computed in. It used to be "towards
+    the face's centre", which is right for a convex face and undecided for a
+    concave one -- an L-shaped face has its vertex average exactly on its
+    reflex corner, so for the two edges meeting there the centre lay on the
+    edge's own line and the sign was whatever rounding said
+    (tests/test_marks_model.py, the L prism).
+
+    `room` is still the distance to the face's centre: a cheap stand-in for
+    how much piece there is to draw into.
     """
-    mid = _polyline_midpoint(_run_polyline(run, uv_layer, isl))
-    out = run.uv_outward
-    if out is None or out.length < 1e-9:
-        return mid
-    inward = Vector((-out.x, out.y)).normalized()
-    width = len(text) * font_mm * GLYPH_ADVANCE_EM
-    height = font_mm
-    clear = (abs(inward.x) * width / 2 + abs(inward.y) * height / 2
-             + font_mm * 0.3)
-    return mid + inward * clear
+    direction = _loop_sheet_dir(isl, uv_layer, loop)
+    if other is not None:
+        second = _loop_sheet_dir(isl, uv_layer, other)
+        if direction is None:
+            direction = second
+        elif second is not None and (direction + second).length > 1e-9:
+            direction = (direction + second).normalized()
+    if direction is None:
+        direction = Vector((1.0, 0.0))
+    face_pts = [isl.to_sheet(l[uv_layer].uv) for l in loop.face.loops]
+    area2 = sum(a.x * b.y - b.x * a.y
+                for a, b in zip(face_pts, face_pts[1:] + face_pts[:1]))
+    left = Vector((-direction.y, direction.x))
+    inward = left if area2 > 0.0 else -left
+    face_pt = Vector((sum(p.x for p in face_pts) / len(face_pts),
+                      sum(p.y for p in face_pts) / len(face_pts)))
+    return inward, (face_pt - point).length
 
 
 def _boundary_tangent(pt_before, pt_at):
@@ -668,6 +723,326 @@ def _tick_segments(islands, corner_angle_deg, matrix=None):
     return segments
 
 
+def _segment_end_verts(islands, corner_angle_deg):
+    """Indices of the vertices where a seam segment ends.
+
+    The same two things `_tick_segments` ends a segment at: a junction (a
+    boundary vertex where other than two boundary edges meet -- a third
+    piece or an open rim joins) and a corner of either piece's outline.
+    Nothing is drawn at these. A corner aligns itself: the two pieces can
+    only meet one way there, so a mark on it tells the maker nothing and
+    crosses the marks of the neighbouring edge.
+    """
+    degree = {}
+    seen = set()
+    for isl in islands:
+        for cycle in isl.cycles:
+            for loop in cycle:
+                e = loop.edge
+                if e.index in seen:
+                    continue
+                seen.add(e.index)
+                for v in e.verts:
+                    degree[v.index] = degree.get(v.index, 0) + 1
+    ends = {v for v, n in degree.items() if n != 2}
+    ends |= _outline_corner_verts(islands, corner_angle_deg)
+    return ends
+
+
+def _segment_key(segment):
+    """A segment's place in the numbering: its vertices' coordinates.
+
+    Coordinates, because they are the one key that survives both a fresh
+    BMesh and a renumbering (CLAUDE.md, "What survives rebuilding a
+    BMesh"). The whole sorted vertex list rather than the two ends, since
+    two seams can run between the same two corners.
+    """
+    return tuple(sorted({_co_key(v) for edge, _entry, _len in segment
+                         for v in edge.verts}))
+
+
+def _seam_numbers(islands, corner_angle_deg):
+    """edge index -> seam number, 1..N, one per corner-to-corner segment.
+
+    A seam number is what the maker writes on both pieces that glue
+    together along one stretch, so it belongs to the segment
+    (`_tick_segments`), not to a piece or a cut run. An open rim has no
+    neighbouring piece and gets no number.
+    """
+    seams = [seg for seg in _tick_segments(islands, corner_angle_deg)
+             if any(len(edge.link_faces) == 2 for edge, _v, _l in seg)]
+    seams.sort(key=_segment_key)
+    numbers = {}
+    for number, seg in enumerate(seams, 1):
+        for edge, _entry, _len in seg:
+            numbers[edge.index] = number
+    return numbers
+
+
+def _run_seams(run, seam_of_edge):
+    """The distinct seam numbers a run's edges belong to, in run order."""
+    out = []
+    for loop in run.loops:
+        number = seam_of_edge.get(loop.edge.index)
+        if number is not None and number not in out:
+            out.append(number)
+    return out
+
+
+def _blade_tip_inward(angle_deg, pattern_surface):
+    """True when the blade's tip ends up on the piece's side of the line.
+
+    The maker's rule: the arrow points "in the direction the tip of the
+    blade will need to be from the edge line". The outline is drawn on the
+    face of the foam that is up on the table; the blade enters on the
+    outline and its tip leaves through the far face, to one side.
+
+    Derivation, pattern on the OUTER skin (thickness t goes inward). Take
+    the top of a cube: the piece is the slab z in [1 - t, 1] and its
+    outline edge is the cube's edge x = 1, z = 1. The neighbouring piece is
+    the slab x in [1 - t, 1]. Left square, the two slabs both claim the
+    corner block x, z in [1 - t, 1]; the mitre that shares it is the plane
+    bisecting the two faces, which passes through the outer edge and runs
+    towards the cube's centre: x = z. On the far face of the top piece,
+    z = 1 - t, that plane is at x = 1 - t -- *inside* the outline by
+    t * tan(45 deg). So at a convex (mountain, positive) seam the far face
+    is smaller than the outline, the tip is inside the piece, and the arrow
+    points INTO the piece. The tilt off square is half the fold angle:
+    `compute_bevel(...).per_side_deg`, 45 on a cube.
+
+    A concave (valley, negative) seam is the mirror image: the bisecting
+    plane leans away from the piece as it goes down through the foam, the
+    far face has to reach past the outline to meet its neighbour, and the
+    arrow points OUT of the piece.
+
+    Pattern on the INNER skin (thickness goes outward) swaps "far face"
+    for the other one, so both cases reverse.
+
+    Sign convention as pinned in CLAUDE.md: positive = convex.
+    """
+    convex = angle_deg >= 0.0
+    return convex if pattern_surface != 'INNER' else not convex
+
+
+# Arrow proportions, as multiples of the angle font size so the arrow reads
+# as part of its label at any sheet scale.
+BEVEL_ARROW_GAP_EM = 0.3      # cut line to the arrow's near end
+BEVEL_ARROW_LENGTH_EM = 1.2
+BEVEL_ARROW_HEAD_EM = 0.4     # barb length; half that to each side
+BEVEL_LABEL_PAD_EM = 0.3      # clear space between marks and text
+
+
+def _bevel_arrow(mid, inward, font_mm, tip_inward, width_mm, colour):
+    """The arrow for one run: tail, tip, barb, tip, barb.
+
+    It lies on the piece's side of the cut line whichever way it points,
+    square to the line, starting a small gap in: an inward arrow has its
+    tail by the line and its tip further in, an outward one has its tip by
+    the line -- pointing at it, and so out of the piece -- because an
+    arrow drawn outside the outline is cut off with the waste.
+    """
+    near = mid + inward * (font_mm * BEVEL_ARROW_GAP_EM)
+    far = near + inward * (font_mm * BEVEL_ARROW_LENGTH_EM)
+    tail, tip = (near, far) if tip_inward else (far, near)
+    along = (tip - tail).normalized()
+    across = Vector((-along.y, along.x))
+    head = font_mm * BEVEL_ARROW_HEAD_EM
+    barb_a = tip - along * head + across * (head * 0.5)
+    barb_b = tip - along * head - across * (head * 0.5)
+    return Stroke('bevel_arrow',
+                  (_pt(tail), _pt(tip), _pt(barb_a), _pt(tip), _pt(barb_b)),
+                  False, width_mm, colour)
+
+
+def _text_clearance(inward, text, font_mm):
+    """How far along `inward` a centred label must sit for its box to clear
+    a line through the origin square to `inward`."""
+    width = len(text) * font_mm * GLYPH_ADVANCE_EM
+    return abs(inward.x) * width / 2 + abs(inward.y) * font_mm / 2
+
+
+class BevelMark(NamedTuple):
+    """What one cut run is labelled with. Any of the three may be None."""
+    island_index: int
+    label: Optional[Label]        # kind 'angle', or 'heat'
+    arrow: Optional[Stroke]       # kind 'bevel_arrow'
+    heat_stroke: Optional[Stroke]  # kind 'heat'
+    # The run's two ends in sheet mm, plain floats: the overlay hides a
+    # label whose run is too short on screen to carry one.
+    run_ends: Tuple[Point, Point]
+
+
+def _bevel_marks(islands, uv_layer, runs_by_island, settings, font_mm,
+                 stroke_mm):
+    """Seam number, blade-tilt arrow and degrees for every cut run.
+
+    One `BevelMark` per run that has anything to say, in island then run
+    order. This is the single decision for both the sheet and the screen:
+    `build_marks` sorts the parts into its groups, and the overlay asks
+    this same function and maps the millimetres back to UV.
+
+    Per run with a neighbouring piece (`has_dihedral`):
+
+      * fold below `min_angle` -- a straight cut. The seam number alone, no
+        arrow, no degrees. The maker's convention: no arrow means cut at
+        90 degrees.
+      * too steep to saw (`needs_heat_form`) -- the heat-form note, seam
+        number first, when Heat-form Warnings is on. No arrow: it is not a
+        saw cut.
+      * otherwise "<seam>, <deg>" and an arrow. Degrees are the blade tilt
+        for this one piece -- half the fold -- which is what the saw is set
+        to. The sheet used to print the whole fold angle while the screen
+        printed the half; both now print the half.
+
+    A run labelled with a seam is labelled with the one its midpoint lies
+    on. A run normally lies within one seam segment, but need not: runs
+    break at this piece's own corners, segments also break where a third
+    piece joins on the far side, and a straight edge shared with two
+    neighbours is one run over two seams. Measured in
+    tests/test_marks_model.py (`test_a_cut_run_can_span_two_seams`): never
+    on the gore sphere, twice on a cube with its top cut in two -- and
+    there the second seam's number is then written on its other piece
+    only, never on this one. A known gap, not yet decided.
+
+    `show_brackets` ("Cut Runs") gates the labels and arrows, as it gated
+    the angle labels before; colour follows `show_dart_colors`.
+    """
+    seam_of_edge = _seam_numbers(islands, settings.corner_angle_deg)
+    show_numbers = getattr(settings, 'show_seam_numbers', True)
+    surface = getattr(settings, 'pattern_surface', 'OUTER')
+    convex_rgb = tuple(settings.convex_color[:3])
+    concave_rgb = tuple(settings.concave_color[:3])
+    heat_rgb = tuple(settings.heat_form_color[:3])
+
+    out = []
+    for isl in islands:
+        for run in runs_by_island[isl.index]:
+            if not run.has_dihedral:
+                continue
+            mid, inward, index = _run_midpoint_frame(run, uv_layer, isl)
+            seam = seam_of_edge.get(run.loops[index].edge.index)
+            number = str(seam) if (show_numbers and seam is not None) else ""
+            ends = (_pt(isl.to_sheet(run.uv_start)),
+                    _pt(isl.to_sheet(run.uv_end)))
+
+            if abs(run.mean_angle_deg) < settings.min_angle:
+                # A straight cut: the number says which seam, and the
+                # absence of an arrow says "square".
+                if settings.show_brackets and number:
+                    at = mid + inward * (
+                        _text_clearance(inward, number, font_mm)
+                        + font_mm * BEVEL_LABEL_PAD_EM)
+                    out.append(BevelMark(isl.index, Label(
+                        'angle', at.x, at.y, font_mm, number, BLACK,
+                        'middle', 'neutral'), None, None, ends))
+                continue
+
+            bevel = core.compute_bevel(run.mean_angle_deg,
+                                       settings.foam_thickness,
+                                       settings.max_tilt_deg)
+            degrees_text = f"{abs(bevel.per_side_deg):.{settings.decimals}f}°"
+            # A comma between them, the maker's request: "4 3°" was read
+            # as "43°". "4, 3°" cannot be.
+            text = f"{number}, {degrees_text}" if number else degrees_text
+
+            if bevel.needs_heat_form:
+                # Needs a heat-form joint, not a saw cut -- never also
+                # present it as an ordinary sawable bevel among the angles.
+                if settings.show_heat_form:
+                    chord = (isl.to_sheet(run.uv_start)
+                             + isl.to_sheet(run.uv_end)) / 2
+                    pts = tuple(_pt(p)
+                                for p in _run_polyline(run, uv_layer, isl))
+                    out.append(BevelMark(
+                        isl.index,
+                        Label('heat', chord.x, chord.y, font_mm,
+                              f"{text} (heat-form)", heat_rgb, 'baseline'),
+                        None,
+                        Stroke('heat', pts, False, 1.0, heat_rgb, (2.0, 1.0)),
+                        ends))
+                continue
+
+            if not settings.show_brackets:
+                continue
+            if settings.show_dart_colors:
+                if run.mean_angle_deg >= 0:
+                    tone, colour = "convex", convex_rgb
+                else:
+                    tone, colour = "concave", concave_rgb
+            else:
+                tone, colour = "neutral", BLACK
+            arrow = _bevel_arrow(
+                mid, inward, font_mm,
+                _blade_tip_inward(run.mean_angle_deg, surface),
+                stroke_mm, colour)
+            # Line, gap, arrow, gap, text: the text starts where the arrow
+            # ends, so the two never touch and both stay on the piece.
+            at = mid + inward * (
+                font_mm * (BEVEL_ARROW_GAP_EM + BEVEL_ARROW_LENGTH_EM
+                           + BEVEL_LABEL_PAD_EM)
+                + _text_clearance(inward, text, font_mm))
+            out.append(BevelMark(isl.index, Label(
+                'angle', at.x, at.y, font_mm, text, colour, 'middle', tone),
+                arrow, None, ends))
+    return out
+
+
+def _runs_by_cycle(isl, runs):
+    """An island's runs grouped by the boundary cycle they lie on, in run
+    order, so a cycle's last run ends where its first starts."""
+    cycle_loop_sets = [set(cyc) for cyc in isl.cycles]
+    out = [[] for _ in isl.cycles]
+    for run in runs:
+        first = run.loops[0]
+        for ci, loopset in enumerate(cycle_loop_sets):
+            if first in loopset:
+                out[ci].append(run)
+                break
+    return out
+
+
+def _run_end_marks(islands, uv_layer, runs_by_island, settings,
+                   tick_length_mm, width_mm):
+    """(island index, 'bracket' Stroke) for each run end part way along a
+    seam segment.
+
+    A run ends where this piece's outline turns a corner, or where the bevel
+    angle drifts or the chord bows too far for one saw pass. Only the second
+    kind gets a mark: the bevel label changes there, and nothing else on the
+    sheet says where. A corner or a junction (`_segment_end_verts`) gets
+    none -- the maker: "There is no need for alignment marks at the corners.
+    The corners are implicitly aligning." There used to be one on every
+    corner of every piece, crossing the neighbouring piece's.
+
+    Drawn as an alignment mark is: starting on the cut line and going into
+    the piece only, square to the line -- to the average of the two edges
+    when it sits on a bend -- `tick_length` long, shortened where the piece
+    is too narrow to take it.
+
+    The caller decides whether to draw them (`show_brackets`).
+    """
+    segment_ends = _segment_end_verts(islands, settings.corner_angle_deg)
+    out = []
+    for isl in islands:
+        for cyc_runs in _runs_by_cycle(isl, runs_by_island[isl.index]):
+            n = len(cyc_runs)
+            if n < 2:
+                continue
+            for k in range(n):
+                run_a, run_b = cyc_runs[k], cyc_runs[(k + 1) % n]
+                end_vert = run_a.loops[-1].link_loop_next.vert
+                if end_vert.index in segment_ends:
+                    continue
+                at = isl.to_sheet(run_a.uv_end)
+                inward, room = _inward_at(isl, uv_layer, at,
+                                          run_a.loops[-1], run_b.loops[0])
+                reach = min(tick_length_mm, max(room * 0.6, 0.2))
+                out.append((isl.index, Stroke(
+                    'bracket', (_pt(at), _pt(at + inward * reach)),
+                    False, width_mm, BLACK)))
+    return out
+
+
 def _segment_distances(total, settings, mode=None):
     """Where along a segment of length `total` its marks go.
 
@@ -816,7 +1191,7 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
         # the case it actually describes, which this fixture does not reach.
         drawn = set()
         for cycle in isl.cycles:
-            for loop in cycle:
+            for k, loop in enumerate(cycle):
                 edge = loop.edge
                 params = wanted.get(edge)
                 if not params:
@@ -824,14 +1199,6 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
                 uv_a = loop[uv_layer].uv
                 uv_b = loop.link_loop_next[uv_layer].uv
                 start_vert = _edge_canonical_start(edge)
-                # The face this loop belongs to is inside the island by
-                # definition, so its own centre is a locally correct "in".
-                # An island centroid is not: on a ring it sits in the hole.
-                face_uvs = [l[uv_layer].uv for l in loop.face.loops]
-                face_c = Vector((
-                    sum(p.x for p in face_uvs) / len(face_uvs),
-                    sum(p.y for p in face_uvs) / len(face_uvs)))
-                face_pt = isl.to_sheet(face_c)
 
                 for t in sorted(params):
                     if (edge.index, t) in drawn:
@@ -840,25 +1207,37 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
                     local = t if loop.vert is start_vert else 1.0 - t
                     uv = uv_a + (uv_b - uv_a) * local
                     point = isl.to_sheet(uv)
-                    tangent = _boundary_tangent(isl.to_sheet(uv_a), point)
-                    if tangent.length < 1e-9:
-                        continue
-                    inward = _inward_normal(tangent, point, face_pt)
+                    # Square to the edge the mark sits on. A mark exactly on
+                    # a vertex sits on two edges at once, and is squared to
+                    # the average of them. (It is never a segment end --
+                    # marks are placed strictly inside a segment -- so the
+                    # neighbour is the same seam.)
+                    other = None
+                    if len(cycle) > 1:
+                        if local <= 1e-9:
+                            other = cycle[k - 1]
+                        elif local >= 1.0 - 1e-9:
+                            other = cycle[(k + 1) % len(cycle)]
+                    # The face this loop belongs to is inside the island by
+                    # definition, so its own centre is a locally correct
+                    # "in". An island centroid is not: on a ring it sits in
+                    # the hole.
+                    inward, room = _inward_at(isl, uv_layer, point, loop,
+                                              other)
                     # Shorten where the piece cannot take the full mark. The
                     # face this loop belongs to spans the piece locally, so
                     # the distance to its centre is a cheap stand-in for how
                     # much room there is; a gore's tip has very little, and
                     # two full-length marks facing each other across it meet
                     # in the middle.
-                    room = (face_pt - point).length
                     reach = min(tick_length_mm, max(room * 0.6, 0.2))
-                    # Mostly inward. The outward half of a mark drawn across
-                    # the line is cut away with the waste, so it would be ink
-                    # spent on nothing; a short tail is kept so the mark is
-                    # visibly a crossing and not a scratch.
+                    # From the cut line inward, and nothing outside it. The
+                    # mark used to carry a short tail across the line "so it
+                    # reads as a crossing"; the tail is cut away with the
+                    # waste, and the maker asked for marks that start on the
+                    # edge and extend inwards, perpendicular to it.
                     tip = point + inward * reach
-                    tail = point - inward * (reach * 0.25)
-                    strokes.append(Stroke('align', (_pt(tail), _pt(tip)),
+                    strokes.append(Stroke('align', (_pt(point), _pt(tip)),
                                           False, width_mm, BLACK))
                     if settings.tick_numbers:
                         at = point + inward * (reach * 1.45)
@@ -983,7 +1362,8 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
     overlay_scale = settings.overlay_scale
     angle_font_mm = sheet.permille(settings.angle_text_size, overlay_scale)
     number_font_mm = sheet.permille(settings.number_size, overlay_scale)
-    tick_length_mm = sheet.permille(settings.mark_size, overlay_scale)
+    # (mark_size no longer sizes anything on the sheet: run-end marks are
+    # now drawn as alignment marks are, at the physical tick_length.)
     # Hairlines scale with the sheet too, or a 2 m pattern gets invisible
     # outlines and a 100 mm one gets a smeared blob.
     stroke_mm = sheet.permille(2, overlay_scale)
@@ -1012,6 +1392,24 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
     piece_fills, relief_fills = [], []
     outlines, reliefs, brackets, heat_strokes = [], [], [], []
     angle_labels, number_labels, heat_labels = [], [], []
+    arrows = []
+
+    # --- seam number, blade-tilt arrow and degrees: one entry per run.
+    for mark in _bevel_marks(islands, uv_layer, runs_by_island, settings,
+                             angle_font_mm, stroke_mm):
+        if mark.heat_stroke is not None:
+            heat_strokes.append(mark.heat_stroke)
+        if mark.arrow is not None:
+            arrows.append(mark.arrow)
+        if mark.label is not None:
+            (heat_labels if mark.label.kind == 'heat'
+             else angle_labels).append(mark.label)
+
+    # --- run-end marks: only part way along a seam, never at a corner.
+    if settings.show_brackets:
+        brackets = [stroke for _i, stroke in _run_end_marks(
+            islands, uv_layer, runs_by_island, settings,
+            settings.tick_length * scale_length * 1000.0, stroke_mm * 0.7)]
 
     for isl in islands:
         # --- outlines: one polygon per boundary cycle (an island with a hole
@@ -1058,51 +1456,10 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
                                            str(isl.piece_id), BLACK,
                                            'middle'))
 
-        # --- angles + heatform: one entry per run.
-        for run in runs_by_island[isl.index]:
-            if not run.has_dihedral or abs(run.mean_angle_deg) < settings.min_angle:
-                continue
-            bevel = core.compute_bevel(run.mean_angle_deg, settings.foam_thickness,
-                                       settings.max_tilt_deg)
-            mid = (isl.to_sheet(run.uv_start) + isl.to_sheet(run.uv_end)) / 2
-            label = f"{abs(run.mean_angle_deg):.{settings.decimals}f}°"
-            if bevel.needs_heat_form:
-                if settings.show_heat_form:
-                    pts = tuple(_pt(p) for p in _run_polyline(run, uv_layer, isl))
-                    heat_strokes.append(Stroke('heat', pts, False, 1.0,
-                                               heat_rgb, (2.0, 1.0)))
-                    heat_labels.append(Label('heat', mid.x, mid.y,
-                                             angle_font_mm,
-                                             f"{label} (heat-form)",
-                                             heat_rgb, 'baseline'))
-                # Needs a heat-form joint, not a saw cut -- never also present
-                # it as an ordinary sawable bevel among the angles.
-                continue
-            if settings.show_brackets:
-                if settings.show_dart_colors:
-                    if run.mean_angle_deg >= 0:
-                        tone, colour = "convex", convex_rgb
-                    else:
-                        tone, colour = "concave", concave_rgb
-                else:
-                    tone, colour = "neutral", BLACK
-                at = _angle_label_anchor(run, uv_layer, isl, label,
-                                         angle_font_mm)
-                angle_labels.append(Label('angle', at.x, at.y,
-                                          angle_font_mm, label, colour,
-                                          'middle', tone))
-
         # --- ticks + darts: one per run-to-run corner, grouped by boundary
         # cycle so the wraparound (last run's end == first run's start)
         # closes correctly.
-        cycle_loop_sets = [set(cyc) for cyc in isl.cycles]
-        runs_by_cycle = [[] for _ in isl.cycles]
-        for run in runs_by_island[isl.index]:
-            first = run.loops[0]
-            for ci, loopset in enumerate(cycle_loop_sets):
-                if first in loopset:
-                    runs_by_cycle[ci].append(run)
-                    break
+        runs_by_cycle = _runs_by_cycle(isl, runs_by_island[isl.index])
 
         centroid_uv = Vector(((isl.min_u + isl.max_u) / 2, (isl.min_v + isl.max_v) / 2))
         centroid_pt = isl.to_sheet(centroid_uv)
@@ -1115,16 +1472,6 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
                 run_a = cyc_runs[k]
                 run_b = cyc_runs[(k + 1) % n]
                 boundary_pt = isl.to_sheet(run_a.uv_end)
-
-                if settings.show_brackets:
-                    prev_loop = run_a.loops[-1]
-                    pt_before = isl.to_sheet(prev_loop[uv_layer].uv)
-                    tangent = _boundary_tangent(pt_before, boundary_pt)
-                    normal = Vector((-tangent.y, tangent.x))
-                    tick_a = boundary_pt + normal * (tick_length_mm / 2)
-                    tick_b = boundary_pt - normal * (tick_length_mm / 2)
-                    brackets.append(Stroke('bracket', (_pt(tick_a), _pt(tick_b)),
-                                           False, stroke_mm * 0.7, BLACK))
 
                 # Relief cuts remove material, so they are opt-in: the same
                 # "Relief Cuts" toggle (show_darts) the overlay obeys. They
@@ -1186,7 +1533,7 @@ def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None):
         width_mm=total_width,
         height_mm=total_height,
         fills=tuple(piece_fills + relief_fills),
-        strokes=tuple(outlines + reliefs + brackets + align
+        strokes=tuple(outlines + reliefs + brackets + align + arrows
                       + heat_strokes + ruler),
         labels=tuple(align_labels + angle_labels + number_labels
                      + heat_labels + ruler_labels),

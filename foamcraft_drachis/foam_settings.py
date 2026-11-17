@@ -254,6 +254,26 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
     # --- Display
     show_overlay: bpy.props.BoolProperty(name="Show Overlay", default=True)
     show_brackets: bpy.props.BoolProperty(name="Cut Runs", default=True)
+    show_seam_numbers: bpy.props.BoolProperty(
+        name="Seam Numbers", default=True,
+        description="Write a seam number beside each bevel, the same number "
+                    "on the two pieces that glue together along that edge. "
+                    "Off leaves the arrow and the degrees")
+    pattern_surface: bpy.props.EnumProperty(
+        name="Pattern Is On",
+        description="Which face of the foam the pattern is traced on. It "
+                    "decides which way the bevel arrows point: an arrow "
+                    "shows the side of the line the blade's tip has to end "
+                    "up on, and that reverses when the sheet is turned over",
+        items=[
+            ('OUTER', "Outer Skin",
+             "Pattern is traced on the outer skin -- the sculpt surface -- "
+             "and the foam's thickness goes inward"),
+            ('INNER', "Inner Skin",
+             "Pattern is traced on the inner face and the foam's thickness "
+             "goes outward. Every arrow flips"),
+        ],
+        default='OUTER')
     show_island_ids: bpy.props.BoolProperty(name="Piece Numbers", default=True)
     island_fill: bpy.props.BoolProperty(
         name="Colour Pieces", default=True,

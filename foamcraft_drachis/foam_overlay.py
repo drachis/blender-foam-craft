@@ -89,11 +89,34 @@ class _RunMark(NamedTuple):
     length_3d: float = 0.0
 
 
+class _BevelMark(NamedTuple):
+    """One run's label as the sheet prints it, mapped back to UV space.
+
+    Plain floats and strings only, like _RunMark.
+    """
+    u: float
+    v: float
+    text: str
+    # 'convex' / 'concave' / 'neutral' for a bevel label, 'heat' for a
+    # heat-form note.
+    tone: str
+    valign: str
+    # The arrow's five points, (u, v) each -- tail, tip, barb, tip, barb --
+    # or () when the run has none.
+    arrow: tuple
+    # The run's two ends, for the on-screen "too short to label" test.
+    au: float
+    av: float
+    bu: float
+    bv: float
+
+
 class _OverlayCache:
     """Computed overlay geometry, in UV space, plus the state it was built from."""
 
     __slots__ = ("signature", "runs", "island_labels", "stretch_islands",
-                 "align_ticks", "align_labels")
+                 "align_ticks", "align_labels", "bevel_marks",
+                 "run_end_marks")
 
     def __init__(self):
         self.signature = None
@@ -104,6 +127,10 @@ class _OverlayCache:
         # sheet prints, mapped back into UV space. Plain floats only.
         self.align_ticks = []        # (u0, v0, u1, v1), tail then tip
         self.align_labels = []       # (u, v, text)
+        # Seam number, blade-tilt arrow and degrees per run, and the
+        # mid-seam run-end marks: the sheet's own, from foam_marks.
+        self.bevel_marks = []        # _BevelMark
+        self.run_end_marks = []      # (u0, v0, u1, v1), on the line then in
 
 
 _cache = _OverlayCache()
@@ -208,6 +235,18 @@ def _signature(pairs, s):
         round(s.tick_length, 6),
         s.tick_numbers,
         round(_scale_length(s), 6),
+        # Everything that decides a cached bevel label: whether it exists,
+        # what it says, which way its arrow points, how far in it sits
+        # (placement is in multiples of the angle font) and its colour tone.
+        s.show_brackets,
+        s.show_heat_form,
+        s.show_dart_colors,
+        s.show_seam_numbers,
+        s.pattern_surface,
+        s.decimals,
+        s.angle_text_size,
+        s.mark_size,
+        round(s.overlay_scale, 6),
     )
 
 
@@ -232,110 +271,193 @@ def _segments_touch(a, b, c, d, eps=1e-7):
            ((d3 <= eps and d4 >= -eps) or (d3 >= -eps and d4 <= eps))
 
 
-def _align_ticks_uv(obj, bm, uv_layer, s, shown_islands, shown_runs):
-    """The alignment ticks the export will print, as plain UV-space floats.
+class _Model:
+    """The sheet `foam_marks.build_marks` would build for one object, kept
+    for the length of one rebuild so the screen can ask the model what it
+    prints instead of deciding again.
 
-    Returns (ticks, labels): ((u0, v0, u1, v1), ...) and ((u, v, text), ...).
-
-    Nothing about *where* a tick goes is decided here. foam_marks decides it
-    for the sheet -- `_alignment_ticks`, on the `_Sheet`/`_Island` objects
-    `build_marks` itself constructs -- and this asks that same function and
-    maps its millimetres back to UV. A second implementation would agree with
-    the first only until one of them changed, and then the screen would show
-    marks the paper does not carry.
+    Nothing about *where* a mark goes is decided in this module. foam_marks
+    decides it for the sheet, on the `_Sheet`/`_Island` objects `build_marks`
+    itself constructs, and the overlay asks those same functions and maps
+    their millimetres back to UV. A second implementation would agree with
+    the first only until one of them changed, and then the screen would
+    show marks the paper does not carry.
 
     The way back is derived from `sheet.to_sheet` itself (the transform is
     affine, so three probe points determine its inverse) rather than written
-    out again, so it cannot drift from the forward transform either. Tick
-    length needs no handling of its own: the sheet is one uniform scale, so
-    a tick `tick_length` metres long on paper is that same physical length
-    against the pieces on screen, at any zoom.
+    out again, so it cannot drift from the forward transform either.
 
     Only Selected: the *decision* is always made on the whole mesh, because
-    the export ignores selection and a By Distance walk over a subset of
-    seams starts in different places -- the marks would move when the
-    selection changed, and stop matching the sheet. Selection only *hides*:
-    a tick is kept when it crosses the boundary of a shown piece.
+    the export ignores selection and a walk over a subset of seams starts in
+    different places -- the marks would move when the selection changed, and
+    stop matching the sheet. Selection only *hides*.
 
-    Runs from the timer's rebuild, never from a draw handler.
+    Holds BMesh elements, so it must not outlive `_rebuild`. Built from the
+    timer's rebuild, never from a draw handler.
     """
-    from . import foam_marks as fm
 
-    # `_seam_chains` and the per-piece de-duplication key on vertex and edge
-    # indices, which the export path refreshes before it builds its marks.
-    bm.verts.index_update()
-    bm.edges.index_update()
+    def __init__(self, obj, bm, uv_layer, s, shown_islands, shown_runs):
+        from . import foam_marks as fm
+        self.fm = fm
+        self.obj, self.uv_layer, self.s = obj, uv_layer, s
+        self.shown_islands = shown_islands
 
-    scale_length = _scale_length(s)
-    if s.only_selected:
-        islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
-        all_runs = list(core.iter_boundary_dart_segments(
-            bm, uv_layer, s.max_chord_deviation, s.max_angle_variation_deg,
-            islands=islands_faces,
-            corner_angle_deg=s.corner_angle_deg,
-            matrix=obj.matrix_world,
-            dart_wedge_deg=s.dart_wedge_deg,
-            max_darts_per_run=s.max_darts_per_run))
-    else:
-        # Already exactly what build_marks asks for; do not pay twice.
-        islands_faces, all_runs = shown_islands, shown_runs
-    if not islands_faces:
-        return [], []
+        # `_seam_chains` and the per-piece de-duplication key on vertex and
+        # edge indices, which the export path refreshes before it builds
+        # its marks.
+        bm.verts.index_update()
+        bm.edges.index_update()
+        bm.faces.index_update()
 
-    # The object's world matrix, as build_marks passes it: sheet scale and
-    # By Distance spacing are both measured through it.
-    sheet = fm._Sheet(islands_faces, uv_layer, scale_length,
-                      obj.matrix_world)
-    islands = [fm._Island(i, faces, uv_layer, sheet)
-               for i, faces in enumerate(islands_faces)]
-    runs_by_island = [[] for _ in islands]
-    for run in all_runs:
-        runs_by_island[run.island_index].append(run)
+        self.scale_length = _scale_length(s)
+        if s.only_selected:
+            islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
+            all_runs = list(core.iter_boundary_dart_segments(
+                bm, uv_layer, s.max_chord_deviation,
+                s.max_angle_variation_deg,
+                islands=islands_faces,
+                corner_angle_deg=s.corner_angle_deg,
+                matrix=obj.matrix_world,
+                dart_wedge_deg=s.dart_wedge_deg,
+                max_darts_per_run=s.max_darts_per_run))
+        else:
+            # Already exactly what build_marks asks for; do not pay twice.
+            islands_faces, all_runs = shown_islands, shown_runs
+        self.ok = bool(islands_faces)
+        if not self.ok:
+            return
 
-    angle_font_mm = sheet.permille(s.angle_text_size, s.overlay_scale)
-    stroke_mm = sheet.permille(2, s.overlay_scale)
-    strokes, labels = fm._alignment_ticks(
-        islands, uv_layer, runs_by_island, s,
-        s.tick_length * scale_length * 1000.0,
-        angle_font_mm * 0.7, stroke_mm * 0.9, obj.matrix_world)
+        # The object's world matrix, as build_marks passes it: sheet scale
+        # and By Distance spacing are both measured through it.
+        self.sheet = fm._Sheet(islands_faces, uv_layer, self.scale_length,
+                               obj.matrix_world)
+        self.islands = [fm._Island(i, faces, uv_layer, self.sheet)
+                        for i, faces in enumerate(islands_faces)]
+        self.runs_by_island = [[] for _ in self.islands]
+        for run in all_runs:
+            self.runs_by_island[run.island_index].append(run)
 
-    # Invert the sheet transform from the transform itself.
-    o = sheet.to_sheet(Vector((0.0, 0.0)))
-    ex = sheet.to_sheet(Vector((1.0, 0.0))) - o
-    ey = sheet.to_sheet(Vector((0.0, 1.0))) - o
-    det = ex.x * ey.y - ex.y * ey.x
-    if abs(det) < 1e-18:
-        return [], []
+        self.angle_font_mm = self.sheet.permille(s.angle_text_size,
+                                                 s.overlay_scale)
+        self.stroke_mm = self.sheet.permille(2, s.overlay_scale)
 
-    def to_uv(x, y):
-        dx, dy = x - o.x, y - o.y
-        return ((dx * ey.y - dy * ey.x) / det, (dy * ex.x - dx * ex.y) / det)
+        # Invert the sheet transform from the transform itself.
+        o = self.sheet.to_sheet(Vector((0.0, 0.0)))
+        ex = self.sheet.to_sheet(Vector((1.0, 0.0))) - o
+        ey = self.sheet.to_sheet(Vector((0.0, 1.0))) - o
+        det = ex.x * ey.y - ex.y * ey.x
+        if abs(det) < 1e-18:
+            self.ok = False
+            return
 
-    ticks = []
-    for stroke in strokes:
-        (x0, y0), (x1, y1) = stroke.points[0], stroke.points[-1]
-        ticks.append(to_uv(x0, y0) + to_uv(x1, y1))
-    marks = [to_uv(l.x, l.y) + (str(l.text),) for l in labels]
+        def to_uv(x, y):
+            dx, dy = x - o.x, y - o.y
+            return ((dx * ey.y - dy * ey.x) / det,
+                    (dy * ex.x - dx * ex.y) / det)
+        self.to_uv = to_uv
 
-    if s.only_selected:
-        boundary = []
-        for faces in shown_islands:
-            for face in faces:
-                for loop in face.loops:
-                    if core.uv_boundary_edge(loop.edge, uv_layer):
-                        a = loop[uv_layer].uv
-                        b = loop.link_loop_next[uv_layer].uv
-                        boundary.append(((a.x, a.y), (b.x, b.y)))
-        keep = [any(_segments_touch(t[0:2], t[2:4], a, b)
-                    for a, b in boundary) for t in ticks]
-        # A number belongs to the dash it was emitted with; when the two
-        # lists do not pair up there is no telling which, so none are shown
-        # rather than some on the wrong piece.
-        marks = ([m for m, k in zip(marks, keep) if k]
-                 if len(marks) == len(ticks) else [])
-        ticks = [t for t, k in zip(ticks, keep) if k]
+        # Which of the model's islands (always whole-mesh) are on screen.
+        if s.only_selected:
+            shown_faces = {f.index for faces in shown_islands for f in faces}
+            self.island_shown = [any(f.index in shown_faces for f in faces)
+                                 for faces in islands_faces]
+        else:
+            self.island_shown = [True] * len(islands_faces)
 
-    return ticks, marks
+    def run_end_marks(self):
+        """The sheet's run-end marks, as ((u0, v0, u1, v1), ...).
+
+        `foam_marks._run_end_marks` is what `build_marks` draws them with:
+        only where a run ends part way along a seam, never at a corner or a
+        junction, from the cut line inward. Only Selected keeps the marks
+        of pieces that are shown.
+        """
+        if not self.ok:
+            return []
+        to_uv, s = self.to_uv, self.s
+        out = []
+        for island_index, stroke in self.fm._run_end_marks(
+                self.islands, self.uv_layer, self.runs_by_island, s,
+                s.tick_length * self.scale_length * 1000.0,
+                self.stroke_mm * 0.7):
+            if not self.island_shown[island_index]:
+                continue
+            (x0, y0), (x1, y1) = stroke.points[0], stroke.points[-1]
+            out.append(to_uv(x0, y0) + to_uv(x1, y1))
+        return out
+
+    def align_ticks(self):
+        """The alignment ticks the export will print, as UV-space floats.
+
+        Returns (ticks, labels): ((u0, v0, u1, v1), ...) and
+        ((u, v, text), ...). Tick length needs no handling of its own: the
+        sheet is one uniform scale, so a tick `tick_length` metres long on
+        paper is that same physical length against the pieces on screen,
+        at any zoom.
+
+        Only Selected: a tick is kept when it touches the boundary of a
+        shown piece.
+        """
+        if not self.ok:
+            return [], []
+        s, to_uv, uv_layer = self.s, self.to_uv, self.uv_layer
+        strokes, labels = self.fm._alignment_ticks(
+            self.islands, uv_layer, self.runs_by_island, s,
+            s.tick_length * self.scale_length * 1000.0,
+            self.angle_font_mm * 0.7, self.stroke_mm * 0.9,
+            self.obj.matrix_world)
+
+        ticks = []
+        for stroke in strokes:
+            (x0, y0), (x1, y1) = stroke.points[0], stroke.points[-1]
+            ticks.append(to_uv(x0, y0) + to_uv(x1, y1))
+        marks = [to_uv(l.x, l.y) + (str(l.text),) for l in labels]
+
+        if s.only_selected:
+            boundary = []
+            for faces in self.shown_islands:
+                for face in faces:
+                    for loop in face.loops:
+                        if core.uv_boundary_edge(loop.edge, uv_layer):
+                            a = loop[uv_layer].uv
+                            b = loop.link_loop_next[uv_layer].uv
+                            boundary.append(((a.x, a.y), (b.x, b.y)))
+            keep = [any(_segments_touch(t[0:2], t[2:4], a, b)
+                        for a, b in boundary) for t in ticks]
+            # A number belongs to the dash it was emitted with; when the two
+            # lists do not pair up there is no telling which, so none are
+            # shown rather than some on the wrong piece.
+            marks = ([m for m, k in zip(marks, keep) if k]
+                     if len(marks) == len(ticks) else [])
+            ticks = [t for t, k in zip(ticks, keep) if k]
+
+        return ticks, marks
+
+    def bevel_marks(self):
+        """Seam number, arrow and degrees per run, as the sheet prints them.
+
+        `foam_marks._bevel_marks` is the function `build_marks` itself
+        calls; this maps its labels and arrows back to UV. Only Selected
+        keeps the marks of pieces that are shown.
+        """
+        if not self.ok:
+            return []
+        to_uv = self.to_uv
+        out = []
+        for mark in self.fm._bevel_marks(
+                self.islands, self.uv_layer, self.runs_by_island, self.s,
+                self.angle_font_mm, self.stroke_mm):
+            if mark.label is None or not self.island_shown[mark.island_index]:
+                continue
+            label = mark.label
+            tone = 'heat' if label.kind == 'heat' else label.tone
+            arrow = (tuple(to_uv(x, y) for x, y in mark.arrow.points)
+                     if mark.arrow is not None else ())
+            (ax, ay), (bx, by) = mark.run_ends
+            out.append(_BevelMark(
+                *to_uv(label.x, label.y), str(label.text), tone,
+                label.valign, arrow, *to_uv(ax, ay), *to_uv(bx, by)))
+        return out
 
 
 def _island_uv_centroid(faces, uv_layer):
@@ -381,6 +503,8 @@ def _rebuild(pairs, s):
     heat_islands = set()
     align_ticks = []
     align_labels = []
+    bevel_marks = []
+    run_end_marks = []
 
     for obj, bm, uv_layer in pairs:
         islands = core.uv_islands(bm, uv_layer, s.only_selected)
@@ -395,11 +519,18 @@ def _rebuild(pairs, s):
                 dart_wedge_deg=s.dart_wedge_deg,
                 max_darts_per_run=s.max_darts_per_run))
 
-        if s.show_align_ticks:
-            ticks, tick_labels = _align_ticks_uv(
-                obj, bm, uv_layer, s, islands, object_runs)
-            align_ticks.extend(ticks)
-            align_labels.extend(tick_labels)
+        # What the sheet prints, asked of the model once per object.
+        if s.show_align_ticks or s.show_brackets or s.show_heat_form:
+            model = _Model(obj, bm, uv_layer, s, islands, object_runs)
+            if s.show_align_ticks:
+                ticks, tick_labels = model.align_ticks()
+                align_ticks.extend(ticks)
+                align_labels.extend(tick_labels)
+            bevel_marks.extend(model.bevel_marks())
+            if s.show_brackets:
+                run_end_marks.extend(model.run_end_marks())
+            # It holds BMesh elements; nothing of it may outlive this call.
+            del model
 
         for run in object_runs:
             if run.has_dihedral:
@@ -472,6 +603,8 @@ def _rebuild(pairs, s):
     _cache.island_labels = labels
     _cache.align_ticks = align_ticks
     _cache.align_labels = align_labels
+    _cache.bevel_marks = bevel_marks
+    _cache.run_end_marks = run_end_marks
     # Heat forming is a property of a piece, not of a single cut: either some
     # seam on it is too steep to saw, or the piece will not lie flat at all.
     # Marking every affected run cluttered the sheet without telling the user
@@ -579,6 +712,8 @@ def _timer_tick():
         _cache.island_labels = []
         _cache.align_ticks = []
         _cache.align_labels = []
+        _cache.bevel_marks = []
+        _cache.run_end_marks = []
         _dirty = False
         _await_refresh = False
     for area in getattr(context.screen, "areas", ()):
@@ -740,11 +875,12 @@ def draw_callback():
             # The offset outline, segment by segment, so it hugs the curve.
             for (x0, y0, *_), (x1, y1, *_) in zip(bracket, bracket[1:]):
                 bucket.extend([(x0, y0), (x1, y1)])
-            # Ends are drawn as a T: a bar crossing the bracket both ways, which
-            # is how a dimension line terminates on the reference sheets.
-            for bxp, byp, _ex, _ey, nxp, nyp in (bracket[0], bracket[-1]):
-                bucket.extend([(bxp - nxp * tick * 0.5, byp - nyp * tick * 0.5),
-                               (bxp + nxp * tick * 0.5, byp + nyp * tick * 0.5)])
+            # The ends used to be drawn as a T, a bar crossing the bracket
+            # both ways at every run end -- so at every corner of every
+            # piece, crossing its neighbour's. The maker: "There is no need
+            # for alignment marks at the corners." Where a run ends part way
+            # along a seam the sheet's own run-end mark is drawn instead
+            # (_cache.run_end_marks, below), and at a corner nothing is.
 
         # Relief cuts are a different mark from the angle guide: they are the
         # cuts themselves. Drawn as a T lying on the boundary -- the bar runs
@@ -800,26 +936,10 @@ def draw_callback():
             else:
                 mx, my, _, _, nx, ny = bracket[mid]
             nlen = (nx * nx + ny * ny) ** 0.5 or 1.0
-            # Both marks anchor to the same point on the bracket, so note
-            # whether a number is also going to land here and needs clearing.
-            hidden.append((mx, my, nx / nlen, ny / nlen,
-                           run_px >= s.min_label_run_px))
-        if labelled and run_px >= s.min_label_run_px:
-            text = f"{abs(run.per_side_deg):.{s.decimals}f}°"
-            # Sit the number against the middle of the bracket as drawn, which
-            # on a curved run is nowhere near the midpoint of its chord.
-            mid = len(bracket) // 2
-            if len(bracket) % 2 == 0:
-                a_pt, b_pt = bracket[mid - 1], bracket[mid]
-                mx, my = (a_pt[0] + b_pt[0]) * 0.5, (a_pt[1] + b_pt[1]) * 0.5
-                nx, ny = (a_pt[4] + b_pt[4]) * 0.5, (a_pt[5] + b_pt[5]) * 0.5
-            else:
-                mx, my, _, _, nx, ny = bracket[mid]
-            nlen = (nx * nx + ny * ny) ** 0.5 or 1.0
-            # Keep the normal with the anchor rather than resolving the
-            # position now: the text has to clear its own height to stay off
-            # the piece, and that is only known once the font is measured.
-            labels.append((mx, my, nx / nlen, ny / nlen, text, color))
+            # The bevel label is no longer written out here in the margin
+            # -- it is inside the piece, where the sheet prints it -- so the
+            # warning has this anchor to itself.
+            hidden.append((mx, my, nx / nlen, ny / nlen, False))
 
     for (u, v), (tu, tv, nu, nv, color, load) in dart_seen.items():
         px0, py0 = view.view_to_region(u, v, clip=False)
@@ -906,6 +1026,44 @@ def draw_callback():
                 if all(abs(c) < 1e6 for c in (x, y)):
                     tick_marks.append((x, y, text))
 
+    # Run-end marks, where one bevel hands over to the next part way along
+    # a seam: the sheet's own, from the line inward. None at corners.
+    if s.show_brackets and _cache.run_end_marks:
+        bucket = segments.setdefault(tuple(s.island_id_color), [])
+        for u0, v0, u1, v1 in _cache.run_end_marks:
+            x0, y0 = view.view_to_region(u0, v0, clip=False)
+            x1, y1 = view.view_to_region(u1, v1, clip=False)
+            if all(abs(c) < 1e6 for c in (x0, y0, x1, y1)):
+                bucket.extend([(x0, y0), (x1, y1)])
+
+    # Bevel labels: seam number, blade-tilt arrow and degrees, at the place
+    # and with the text the exported sheet prints -- cached in UV space by
+    # the rebuild from foam_marks._bevel_marks, so screen and paper cannot
+    # disagree about what a seam is called or which way to tilt.
+    #
+    # Hidden where the run is too short on screen to carry a number, the
+    # same legibility test the old margin labels used (zoom in and they
+    # come back); that is about the view, never about the pattern.
+    neutral = convex if not s.show_dart_colors else tuple(s.island_id_color)
+    tones = {'convex': convex, 'concave': concave, 'neutral': neutral,
+             'heat': heat}
+    for mark in _cache.bevel_marks:
+        ax, ay = view.view_to_region(mark.au, mark.av, clip=False)
+        bx, by = view.view_to_region(mark.bu, mark.bv, clip=False)
+        x, y = view.view_to_region(mark.u, mark.v, clip=False)
+        if not all(abs(c) < 1e6 for c in (ax, ay, bx, by, x, y)):
+            continue
+        if ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 < s.min_label_run_px:
+            continue
+        color = tones.get(mark.tone, neutral)
+        labels.append((x, y, mark.text, color, mark.valign))
+        if mark.arrow:
+            pts = [view.view_to_region(u, v, clip=False)
+                   for u, v in mark.arrow]
+            bucket = segments.setdefault(color, [])
+            for p, q in zip(pts, pts[1:]):
+                bucket.extend([p, q])
+
     _draw_lines(segments, max(1.0, scale))
 
     if tick_marks:
@@ -924,29 +1082,21 @@ def draw_callback():
     if hidden:
         warn_color = tuple(s.suppressed_color)
         blf.size(font_id, max(8, int(angle_px * 0.9)))
-        for ax0, ay0, nx, ny, numbered in hidden:
+        for ax0, ay0, nx, ny, _numbered in hidden:
             width, height = blf.dimensions(font_id, "!")
             clear = abs(nx) * width * 0.5 + abs(ny) * height * 0.5 + tick * 0.35
-            if numbered:
-                # The number is drawing at this same anchor, so sit outboard of
-                # it rather than on top of it.
-                nwidth, nheight = blf.dimensions(font_id, "0.0°")
-                clear += abs(nx) * nwidth + abs(ny) * nheight
             blf.position(font_id, ax0 + nx * clear - width / 2,
                          ay0 + ny * clear - height / 2, 0)
             blf.color(font_id, *warn_color)
             blf.draw(font_id, "!")
         blf.size(font_id, angle_px)
 
-    for ax0, ay0, nx, ny, text, color in labels:
+    for x, y, text, color, valign in labels:
         width, height = blf.dimensions(font_id, text)
-        # Push the text out far enough that its own box clears the boundary.
-        # Projecting the half-extents onto the normal handles labels sitting
-        # against a diagonal edge, where half the height alone is not enough.
-        clearance = abs(nx) * width * 0.5 + abs(ny) * height * 0.5 + tick * 0.35
-        x = ax0 + nx * clearance
-        y = ay0 + ny * clearance
-        blf.position(font_id, x - width / 2, y - height / 2, 0)
+        # Where the sheet prints it. 'middle' centres the text on the point;
+        # 'baseline' (the heat-form note) sits its baseline there.
+        drop = height / 2 if valign == 'middle' else 0.0
+        blf.position(font_id, x - width / 2, y - drop, 0)
         blf.color(font_id, *color)
         blf.draw(font_id, text)
 
@@ -1222,6 +1372,11 @@ class IMAGE_PT_foamcraft_drachis_export(bpy.types.Panel):
             col.prop(s, "ticks_per_run")
         col.prop(s, "tick_length")
         col.prop(s, "tick_numbers")
+
+        box = layout.box()
+        box.label(text="Bevels")
+        box.prop(s, "show_seam_numbers")
+        box.prop(s, "pattern_surface")
 
         box = layout.box()
         box.label(text="Sheet")

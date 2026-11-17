@@ -63,6 +63,8 @@ BASE = {
     "tick_length": 0.006,
     "tick_numbers": False,
     "only_selected": False,
+    "show_seam_numbers": True,
+    "pattern_surface": 'OUTER',
 }
 
 
@@ -259,14 +261,16 @@ def _parity(fixture, **overrides):
             "labels_match_the_sheet":
                 len(m["overlay_labels"]) == len(m["export_labels"])
                 and lab_overlay == 0 and lab_export == 0,
-            # The sheet draws a tick `tick_length` long with a quarter of
-            # that again as its tail, shortened where a piece is narrow. So
-            # on screen none may exceed 1.25x, and the longest must be a
-            # real fraction of it -- a tick mapped back at the wrong scale
-            # fails one bound or the other.
+            # The sheet draws a tick `tick_length` long, from the cut line
+            # inward, shortened where a piece is narrow. (Until 2026-11-17
+            # it also had a tail a quarter as long across the line, and the
+            # upper bound here was 1.25x; the maker asked for marks that
+            # only go inward.) So none may exceed 1x, and the longest must
+            # be a real fraction of it -- a tick mapped back at the wrong
+            # scale fails one bound or the other.
             "length_is_the_physical_one":
                 0.2 * m["tick_length_mm"] < m["longest_mm"]
-                <= 1.25 * m["tick_length_mm"] + 2 * tol,
+                <= m["tick_length_mm"] + 2 * tol,
             "cache_holds_plain_numbers": m["plain"],
         },
     }
@@ -374,7 +378,7 @@ def test_tick_settings_are_in_the_cache_signature():
 
     The ticks are cached; a setting missing from the signature leaves the
     old marks on screen until something unrelated forces a rebuild. Each of
-    the six is flipped alone and compared against the unchanged baseline,
+    the settings is flipped alone and compared against the unchanged baseline,
     and the baseline is taken twice so "differs" is not satisfied by a
     signature that never repeats.
     """
@@ -388,6 +392,10 @@ def test_tick_settings_are_in_the_cache_signature():
         "tick_spacing": 0.05,
         "tick_length": 0.009,
         "tick_numbers": True,
+        # The bevel labels' two settings (2026-11-17): what a label says,
+        # and which way its arrow points.
+        "show_seam_numbers": False,
+        "pattern_surface": 'INNER',
     }
     try:
         for k, v in BASE.items():
@@ -411,6 +419,111 @@ def test_tick_settings_are_in_the_cache_signature():
     return {"settings_checked": len(differs), "checks": checks}
 
 
+def _bevel_measure(obj, **overrides):
+    """The overlay's cached bevel labels, arrows and run-end marks, pushed
+    forward to sheet mm, beside the sheet's own -- one edit BMesh, one
+    state, as `_measure` does for the ticks."""
+    s = bpy.context.scene.foamcraft_drachis
+    wanted = dict(BASE)
+    wanted.update(show_brackets=True, show_heat_form=True,
+                  show_seam_numbers=True, pattern_surface='OUTER')
+    wanted.update(overrides)
+    saved = {k: getattr(s, k) for k in wanted}
+    try:
+        for k, v in wanted.items():
+            setattr(s, k, v)
+        bm = bmesh.from_edit_mesh(obj.data)
+        uv_layer = bm.loops.layers.uv.active
+        scale_length = bpy.context.scene.unit_settings.scale_length
+        ov._rebuild([(obj, bm, uv_layer)], s)
+        cached = list(ov._cache.bevel_marks)
+        cached_ends = list(ov._cache.run_end_marks)
+        sheet = fm._Sheet(core.uv_islands(bm, uv_layer, only_selected=False),
+                          uv_layer, scale_length, obj.matrix_world)
+
+        def mm(u, v):
+            p = sheet.to_sheet(Vector((u, v)))
+            return (p.x, p.y)
+
+        screen_labels = [mm(m.u, m.v) + (m.text,) for m in cached]
+        screen_arrows = [sum((mm(u, v) for u, v in m.arrow), ())
+                         for m in cached if m.arrow]
+        screen_ends = [mm(u0, v0) + mm(u1, v1)
+                       for u0, v0, u1, v1 in cached_ends]
+        marks = fm.build_marks(bm, uv_layer, s, scale_length,
+                               obj.matrix_world)
+        paper_labels = [(l.x, l.y, l.text) for l in marks.labels
+                        if l.kind in ('angle', 'heat')]
+        paper_arrows = [sum(st.points, ()) for st in marks.strokes
+                        if st.kind == 'bevel_arrow']
+        paper_ends = [st.points[0] + st.points[-1] for st in marks.strokes
+                      if st.kind == 'bracket']
+        plain = all(
+            isinstance(m.u, float) and isinstance(m.v, float)
+            and isinstance(m.text, str)
+            and all(isinstance(x, float) for pt in m.arrow for x in pt)
+            for m in cached) and all(isinstance(c, float)
+                                     for t in cached_ends for c in t)
+    finally:
+        for k, v in saved.items():
+            setattr(s, k, v)
+    tol = TOL_REL * max(marks.width_mm, marks.height_mm)
+    return {
+        "labels": (screen_labels, paper_labels),
+        "arrows": (screen_arrows, paper_arrows),
+        "ends": (screen_ends, paper_ends),
+        "plain": plain, "tol": tol,
+    }
+
+
+def _bevel_parity(fixture, want_ends):
+    """Cached on-screen bevel labels, arrows and run-end marks equal the
+    sheet's as multisets. `want_ends`: whether this fixture has run ends
+    part way along a seam (the gore sphere does; on a cube every run end
+    is a corner, and nothing may be cached there)."""
+    obj = fixture()
+    m = _bevel_measure(obj)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    tol = m["tol"]
+    out, checks = {}, {}
+    for key in ("labels", "arrows", "ends"):
+        screen, paper = m[key]
+        only_screen, only_paper = _unmatched(screen, paper, tol)
+        out[key] = {"screen": len(screen), "paper": len(paper),
+                    "only_on_screen": only_screen,
+                    "only_on_paper": only_paper}
+        checks[key + "_match_the_sheet"] = (
+            len(screen) == len(paper) and only_screen == 0
+            and only_paper == 0)
+    checks["there_are_labels"] = out["labels"]["screen"] > 0
+    checks["there_are_arrows"] = out["arrows"]["screen"] > 0
+    if want_ends:
+        checks["there_are_mid_seam_run_end_marks"] = out["ends"]["screen"] > 0
+    else:
+        checks["no_run_end_marks_at_corners"] = out["ends"]["screen"] == 0
+    checks["cache_holds_plain_values"] = m["plain"]
+    out["tolerance_mm"] = tol
+    out["checks"] = checks
+    return out
+
+
+def test_cube_bevel_labels_match_the_sheet():
+    """Cube: 24 labels "<n>, 45\u00b0" and 24 arrows on screen, exactly where and
+    as the sheet prints them, and no run-end mark at all -- every run end
+    on a cube is a corner, where the maker wants nothing drawn. (The screen
+    used to draw a T-bar at both ends of every run's bracket.)"""
+    report = _bevel_parity(_seamed_cube, want_ends=False)
+    report["checks"]["twenty_four_of_each"] = \
+        report["labels"]["screen"] == 24 and report["arrows"]["screen"] == 24
+    return report
+
+
+def test_gore_sphere_bevel_labels_match_the_sheet():
+    """Gore sphere: labels, arrows and the mid-seam run-end marks on
+    screen are the sheet's, as multisets, and there are some of each."""
+    return _bevel_parity(_gore_sphere, want_ends=True)
+
+
 TESTS = (
     test_cube_per_run_ticks_match_the_sheet,
     test_cube_by_distance_ticks_match_the_sheet,
@@ -420,6 +533,8 @@ TESTS = (
     test_ticks_off_caches_none,
     test_only_selected_hides_ticks_without_moving_them,
     test_tick_settings_are_in_the_cache_signature,
+    test_cube_bevel_labels_match_the_sheet,
+    test_gore_sphere_bevel_labels_match_the_sheet,
 )
 
 result = {}

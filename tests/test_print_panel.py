@@ -27,6 +27,9 @@ PANEL_ID = "IMAGE_PT_foamcraft_drachis_export"
 EXPORT_PROPS = (
     "show_align_ticks", "tick_mode", "ticks_per_run", "tick_spacing",
     "tick_length", "tick_numbers", "island_fill", "show_scale_ruler",
+    # The bevel labels (2026-11-17): what each one says, and which face of
+    # the foam the pattern is traced on, which decides the arrows.
+    "show_seam_numbers", "pattern_surface",
 )
 TICK_DETAIL = ("tick_mode", "ticks_per_run", "tick_spacing",
                "tick_length", "tick_numbers")
@@ -136,7 +139,8 @@ def test_per_run_mode():
             "no_tick_spacing": "tick_spacing" not in names,
             "all_other_export_props":
                 {"show_align_ticks", "tick_mode", "tick_length", "tick_numbers",
-                 "island_fill", "show_scale_ruler"} <= names,
+                 "island_fill", "show_scale_ruler", "show_seam_numbers",
+                 "pattern_surface"} <= names,
         },
     }
 
@@ -170,6 +174,9 @@ def test_ticks_off_disables_detail():
             "no_tick_detail_enabled": not (enabled & set(TICK_DETAIL)),
             "sheet_props_still_enabled":
                 {"island_fill", "show_scale_ruler"} <= enabled,
+            # Bevel labels do not depend on the ticks.
+            "bevel_props_still_enabled":
+                {"show_seam_numbers", "pattern_surface"} <= enabled,
         },
     }
 

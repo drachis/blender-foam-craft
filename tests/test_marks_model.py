@@ -161,11 +161,17 @@ def test_cube_marks_have_the_known_counts():
             "every_number_inside_its_own_piece":
                 len(own) == 6 and all(own),
             "no_number_inside_another_piece": foreign == 0,
-            # 4 runs per square, 24 in all: one bracket at each run's end.
-            "twenty_four_brackets": len(brackets) == 24,
-            # Every dihedral of a cube is 90, so every angle says so.
-            "twenty_four_angles_all_90": len(angles) == 24 and all(
-                l.text.startswith("90") for l in angles),
+            # Was "twenty_four_brackets": one run-end bracket at each of
+            # the 24 run ends. Every one of those ends is a corner of the
+            # piece, and the maker asked for nothing at corners
+            # (2026-11-17): run-end marks are now drawn only part way along
+            # a seam, which a cube does not have. So exactly 0.
+            "no_brackets_at_the_corners": len(brackets) == 0,
+            # Was "all 90": the sheet printed the whole fold. It now prints
+            # the blade tilt for this one piece, half the fold -- 45 on a
+            # cube -- after the seam number ("<n>, 45°"), as the screen does.
+            "twenty_four_angles_all_45_per_side": len(angles) == 24 and all(
+                l.text.endswith(", 45\u00b0") for l in angles),
         },
     }
 
@@ -178,12 +184,17 @@ def test_marks_hold_no_bmesh_and_no_vectors():
     runner reports as an error -- also a failure). Checked across every mark
     kind the sweep can produce, with the optional ones switched on.
     """
-    obj = _seamed_cube()
-    marks, _ = _marks_of(obj, island_fill=True, show_island_ids=True,
-                         show_brackets=True, show_align_ticks=True,
-                         tick_numbers=True, show_scale_ruler=True)
-    foreign = _foreign_leaves(marks)
-    kinds = sorted({m.kind for m in marks.fills + marks.strokes + marks.labels})
+    # The gore sphere as well as the cube: since 2026-11-17 a 'bracket'
+    # (run-end mark) is drawn only part way along a seam, and every run end
+    # on a cube is a corner -- the gores are where brackets now appear.
+    foreign, kinds = [], set()
+    for build in (_seamed_cube, _gore_sphere):
+        marks, _ = _marks_of(build(), island_fill=True, show_island_ids=True,
+                             show_brackets=True, show_align_ticks=True,
+                             tick_numbers=True, show_scale_ruler=True)
+        foreign += _foreign_leaves(marks)
+        kinds |= {m.kind for m in marks.fills + marks.strokes + marks.labels}
+    kinds = sorted(kinds)
     return {
         "foreign_leaves": foreign[:10],
         "kinds_present": kinds,
@@ -192,7 +203,7 @@ def test_marks_hold_no_bmesh_and_no_vectors():
             # Both bounds: an empty Marks would pass the check above.
             "every_optional_kind_was_produced": set(kinds) >= {
                 'piece', 'outline', 'bracket', 'align', 'ruler',
-                'number', 'angle'},
+                'number', 'angle', 'bevel_arrow'},
         },
     }
 
@@ -219,10 +230,24 @@ def test_every_angle_is_written_inside_its_own_piece():
 
     Known answer: a cube with every edge seamed has 6 square pieces and 24
     runs, so 24 labels, 4 per piece, each inside exactly one outline.
+
+    Updated 2026-11-17: a label now reads "<seam>, 45°" and has a blade-tilt
+    arrow between it and the cut line, so the arrows are held to the same
+    rule -- all 24 wholly inside one piece -- and must not run into any
+    label's box.
     """
-    marks, _ = _marks_of(_seamed_cube())
+    marks, _ = _marks_of(_seamed_cube(), show_brackets=True)
     outlines = [s for s in marks.strokes if s.kind == 'outline']
     angles = [l for l in marks.labels if l.kind == 'angle']
+    arrows = [s for s in marks.strokes if s.kind == 'bevel_arrow']
+    arrows_inside = sum(
+        1 for a in arrows
+        if sum(1 for o in outlines
+               if all(_inside(p, o.points) for p in a.points)) == 1)
+
+    def arrow_box(a):
+        xs, ys = [p[0] for p in a.points], [p[1] for p in a.points]
+        return (min(xs), min(ys), max(xs), max(ys))
     owners = [[i for i, o in enumerate(outlines)
                if _inside((l.x, l.y), o.points)] for l in angles]
     per_piece = [sum(1 for own in owners if own == [i])
@@ -242,11 +267,18 @@ def test_every_angle_is_written_inside_its_own_piece():
         "per_piece": per_piece,
         "overlapping_pairs": overlaps,
         "boxes_wholly_inside": corners_inside,
+        "arrows": len(arrows),
+        "arrows_wholly_inside": arrows_inside,
         "checks": {
             "there_are_24_labels": len(angles) == 24,
             "each_piece_has_exactly_4": per_piece == [4] * 6,
             "no_two_labels_overlap": overlaps == 0,
             "every_box_is_wholly_inside_its_piece": corners_inside == 24,
+            "24_arrows_wholly_inside_one_piece":
+                len(arrows) == 24 and arrows_inside == 24,
+            "no_arrow_runs_into_a_label": not any(
+                _boxes_overlap(arrow_box(a), b) for a in arrows
+                for b in boxes),
         },
     }
 
@@ -720,7 +752,9 @@ def test_relief_cuts_follow_the_relief_cuts_toggle():
     corners, all with a 90 degree dihedral -- 6 x 4 = 24 'relief' strokes
     and no 'relief' fills (a V wedge is an open stroke; only a slit is
     filled). Slit: 24 fills and 24 strokes. Off: zero of either.
-    Brackets stay on show_brackets throughout: 24 either way.
+    Bevel arrows stay on show_brackets throughout: 24 either way. (This
+    used to count brackets, 24 either way; since 2026-11-17 a cube has none,
+    every run end on it being a corner, so the arrows carry the check.)
     """
     obj = _cube(2.0)
     rows = {}
@@ -733,8 +767,8 @@ def test_relief_cuts_follow_the_relief_cuts_toggle():
             "relief_strokes": sum(1 for st in marks.strokes
                                   if st.kind == 'relief'),
             "relief_fills": sum(1 for f in marks.fills if f.kind == 'relief'),
-            "brackets": sum(1 for st in marks.strokes
-                            if st.kind == 'bracket'),
+            "arrows": sum(1 for st in marks.strokes
+                          if st.kind == 'bevel_arrow'),
         }
     out = dict(rows)
     out["checks"] = {
@@ -745,7 +779,7 @@ def test_relief_cuts_follow_the_relief_cuts_toggle():
         "on_slit_is_24_fills_and_strokes":
             rows["on_slit"]["relief_strokes"] == 24
             and rows["on_slit"]["relief_fills"] == 24,
-        "brackets_unaffected": all(r["brackets"] == 24 for r in rows.values()),
+        "arrows_unaffected": all(r["arrows"] == 24 for r in rows.values()),
     }
     return out
 
@@ -800,6 +834,656 @@ def test_unapplied_scale_sizes_the_sheet_and_warns_when_non_uniform():
     }
 
 
+# ---------------------------------------------------------------------------
+# Bevel labels: seam number, blade-tilt arrow, degrees (2026-11-17).
+#
+# The maker's hand-marked sheets carry "8->" on one piece and "8<-" on the
+# piece it glues to: a seam number shared by the two pieces, and an arrow
+# pointing to the side of the cut line the blade's tip has to end up on.
+# Everything below is asserted geometrically from the Marks -- which side of
+# the line a point is on, how far from it -- never by reading back the
+# function that decided it.
+# ---------------------------------------------------------------------------
+
+import math as _math
+
+# The degree sign is written ° in code: tools/blender_bridge.py does
+# not carry a literal one through intact.
+# The degree sign is written \u00b0 in code: tools/blender_bridge.py does
+# not carry a literal one through intact.
+# Every test below sets these, so a changed default cannot move an answer.
+BEVEL_BASE = dict(show_brackets=True, show_seam_numbers=True,
+                  pattern_surface='OUTER', decimals=0, min_angle=1.0,
+                  show_heat_form=True, max_tilt_deg=45.0, show_darts=False,
+                  show_align_ticks=True, tick_mode='PER_RUN', ticks_per_run=2,
+                  tick_length=0.006, tick_numbers=False)
+
+
+def _bevel_marks_of(obj, **overrides):
+    wanted = dict(BEVEL_BASE)
+    wanted.update(overrides)
+    marks, _ = _marks_of(obj, **wanted)
+    return marks
+
+
+def _seg_dist(p, a, b):
+    """Distance from point p to segment ab, all plain (x, y)."""
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    l2 = dx * dx + dy * dy
+    t = 0.0 if l2 == 0 else max(0.0, min(1.0, ((p[0] - ax) * dx
+                                               + (p[1] - ay) * dy) / l2))
+    return _math.hypot(p[0] - ax - t * dx, p[1] - ay - t * dy)
+
+
+def _ring_edges(ring):
+    return [(ring[i], ring[(i + 1) % len(ring)]) for i in range(len(ring))]
+
+
+def _dist_to_ring(p, ring):
+    return min(_seg_dist(p, a, b) for a, b in _ring_edges(ring))
+
+
+def _owners(pts, outlines):
+    """Indices of the outlines that contain every one of `pts`."""
+    return [i for i, o in enumerate(outlines)
+            if all(_inside(p, o.points) for p in pts)]
+
+
+def _ulp32(x):
+    """The gap between adjacent float32 values near |x|: mathutils Vectors
+    are 32-bit, and every sheet coordinate passes through one."""
+    return 2.0 ** (_math.frexp(max(abs(x), 1e-30))[1] - 24)
+
+
+def _sheet_ulp(marks):
+    return _ulp32(max(marks.width_mm, marks.height_mm))
+
+
+def _arrow_report(marks):
+    """Each arrow: its owner piece, and whether it points into it.
+
+    Into the piece means the tip is further from the cut line than the
+    tail -- the arrow heads away from the line. Out of it: closer, so it
+    points at the line and through it. Every point of the arrow must be
+    inside one piece, or it has no owner. Also how square it is to the
+    nearest outline edge (|cos|).
+    """
+    outlines = [s for s in marks.strokes if s.kind == 'outline']
+    arrows = [s for s in marks.strokes if s.kind == 'bevel_arrow']
+    rows = []
+    for a in arrows:
+        own = _owners(a.points, outlines)
+        if len(own) != 1:
+            rows.append({"owner": None})
+            continue
+        ring = outlines[own[0]].points
+        tail, tip = a.points[0], a.points[1]
+        d_tail, d_tip = _dist_to_ring(tail, ring), _dist_to_ring(tip, ring)
+        mid = ((tail[0] + tip[0]) / 2, (tail[1] + tip[1]) / 2)
+        ea, eb = min(_ring_edges(ring), key=lambda e: _seg_dist(mid, *e))
+        ex, ey = eb[0] - ea[0], eb[1] - ea[1]
+        ax, ay = tip[0] - tail[0], tip[1] - tail[1]
+        dot = abs(ex * ax + ey * ay) / (_math.hypot(ex, ey)
+                                       * _math.hypot(ax, ay))
+        rows.append({"owner": own[0], "inward": d_tip > d_tail,
+                     "outward": d_tip < d_tail, "dot": dot})
+    return rows
+
+
+def _arrow_counts(rows):
+    return {"arrows": len(rows),
+            "inward": sum(1 for r in rows if r.get("inward")),
+            "outward": sum(1 for r in rows if r.get("outward")),
+            "unowned": sum(1 for r in rows if r["owner"] is None)}
+
+
+def _seam_table(obj):
+    """{seam number: (frozenset of island indices of its edges' faces,
+    sorted tuple of rounded vertex coordinates)}, read from the mesh, so a
+    label can be checked against the geometric edge it names."""
+    s = bpy.context.scene.foamcraft_drachis
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    try:
+        bm.verts.index_update()
+        bm.edges.index_update()
+        uv_layer = bm.loops.layers.uv.active
+        islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
+        sheet = fm._Sheet(islands_faces, uv_layer, 1.0)
+        islands = [fm._Island(i, f, uv_layer, sheet)
+                   for i, f in enumerate(islands_faces)]
+        island_of = {f.index: i for i, fs in enumerate(islands_faces)
+                     for f in fs}
+        numbers = fm._seam_numbers(islands, s.corner_angle_deg)
+        table = {}
+        for e in bm.edges:
+            n = numbers.get(e.index)
+            if n is None:
+                continue
+            pieces, coords = table.setdefault(n, (set(), set()))
+            pieces |= {island_of[f.index] for f in e.link_faces}
+            coords |= {tuple(round(c, 6) for c in v.co) for v in e.verts}
+    finally:
+        bm.free()
+    return {n: (frozenset(p), tuple(sorted(c)))
+            for n, (p, c) in table.items()}
+
+
+def _flipped_cube():
+    """The all-seamed cube with every normal reversed: every dihedral -90
+    (CLAUDE.md, the sign convention pinned three ways)."""
+    obj = _seamed_cube()
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    bmesh.ops.reverse_faces(bm, faces=list(bm.faces))
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.02)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return obj
+
+
+def _from_pydata(name, verts, faces):
+    """A mesh from plain data, normals made consistent and outward, every
+    edge a seam, unwrapped."""
+    _clear()
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, [], faces)
+    me.update()
+    obj = bpy.data.objects.new(name, me)
+    bpy.context.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    for e in bm.edges:
+        e.seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.02)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return obj
+
+
+def _l_prism():
+    """An L-shaped prism, 1 m tall, every edge a seam: 8 pieces.
+
+    Known answer: the L outline (0,0) (2,0) (2,1) (1,1) (1,2) (0,2) has five
+    convex corners and one reflex one at (1,1). Of the 18 edges, the 12
+    round the top and bottom and 5 of the 6 uprights fold +90 (convex); the
+    upright at (1,1) folds -90 (concave): 17 convex seams, 1 concave.
+
+    It is also the face shape that defeated the old "towards the face's
+    centre" test for inward: the L's vertex average is (1, 1), exactly its
+    reflex corner, which lies on the line of both edges meeting there.
+    """
+    ring = [(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2)]
+    verts = [(x, y, 0.0) for x, y in ring] + [(x, y, 1.0) for x, y in ring]
+    n = len(ring)
+    faces = [tuple(reversed(range(n))), tuple(range(n, 2 * n))]
+    faces += [(i, (i + 1) % n, n + (i + 1) % n, n + i) for i in range(n)]
+    return _from_pydata("LPrism", verts, faces)
+
+
+def _flat_pair():
+    """Two coplanar 1 m quads side by side with a seam between: a fold of
+    exactly 0, a straight cut. The rim is open (one face per edge), so it
+    has no neighbour and no seam number."""
+    verts = [(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 0), (1, 1, 0), (2, 1, 0)]
+    faces = [(0, 1, 4, 3), (1, 2, 5, 4)]
+    return _from_pydata("FlatPair", verts, faces)
+
+
+def _split_top_cube(fraction=0.3):
+    """A 2 m cube whose top is cut in two, off-centre, along x: three pieces
+    (a side and the two halves of the top) meet at one vertex on the +x
+    side's top edge, and three more on the -x side's.
+
+    The side's outline runs straight through that vertex, so its cut run
+    does not end there -- but the seam does: one part of the edge glues to
+    one top piece, the rest to the other. The known-answer case for a run
+    spanning two seam segments. Off-centre so the run's midpoint is not the
+    junction itself.
+    """
+    _clear()
+    bpy.ops.mesh.primitive_cube_add(size=2.0)
+    obj = bpy.context.object
+    bpy.ops.object.mode_set(mode='EDIT')
+    bm = bmesh.from_edit_mesh(obj.data)
+    # The two top edges running along y, at x = -1 and x = +1.
+    top = [e for e in bm.edges
+           if all(abs(v.co.z - 1.0) < 1e-6 for v in e.verts)
+           and abs(e.verts[0].co.x - e.verts[1].co.x) < 1e-6]
+    new = []
+    for e in sorted(top, key=lambda e: e.verts[0].co.x):
+        a = min(e.verts, key=lambda v: v.co.y)
+        _e, v = bmesh.utils.edge_split(e, a, fraction)
+        new.append(v)
+    bmesh.ops.connect_verts(bm, verts=new)
+    for e in bm.edges:
+        e.seam = True
+    bmesh.update_edit_mesh(obj.data)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.02)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return obj
+
+
+def _parse(text):
+    """'<n>, <deg>°' -> (n, '<deg>'); '<n>' -> (n, None); '<deg>°' ->
+    (None, '<deg>'). The comma is asserted where it matters, not
+    stripped silently: see the cube's label check."""
+    n = deg = None
+    for part in text.replace(",", " ").split():
+        if part.endswith("\u00b0"):
+            deg = part[:-1]
+        else:
+            n = int(part)
+    return n, deg
+
+
+def test_cube_seams_are_numbered_once_and_shared_by_both_pieces():
+    """All-seamed cube, pattern on the outer skin.
+
+    Known answers: 12 edges, each its own seam (every cube vertex is a
+    junction of three) -> numbers exactly {1..12}. Each number is written on
+    exactly two labels, on two different pieces, and those two are the
+    pieces either side of that cube edge. Every fold is +90 (convex), so
+    the blade tilt is 45 per side: 24 labels "<n>, 45°" and 24 arrows, every
+    one pointing INTO its own piece -- the far face of a 45 degree mitre on
+    the outer skin lies inside the outline (foam_marks._blade_tip_inward
+    has the derivation).
+    """
+    obj = _seamed_cube()
+    marks = _bevel_marks_of(obj)
+    table = _seam_table(obj)
+    outlines = [s for s in marks.strokes if s.kind == 'outline']
+    angles = [l for l in marks.labels if l.kind == 'angle']
+    parsed = [_parse(l.text) for l in angles]
+    by_number = {}
+    for l, (n, _deg) in zip(angles, parsed):
+        by_number.setdefault(n, []).append(
+            tuple(_owners([(l.x, l.y)], outlines)))
+    pieces_match = bool(by_number) and all(
+        len(owners) == 2 and all(len(o) == 1 for o in owners)
+        and frozenset(o[0] for o in owners) == table.get(n, (None,))[0]
+        and len({o[0] for o in owners}) == 2
+        for n, owners in by_number.items())
+    counts = _arrow_counts(_arrow_report(marks))
+    return {
+        "numbers": sorted(n for n in by_number if n is not None),
+        "texts": sorted({l.text.split()[-1] for l in angles}),
+        "labels": len(angles),
+        "arrows": counts,
+        "checks": {
+            "numbers_are_1_to_12": sorted(by_number) == list(range(1, 13)),
+            "mesh_agrees_12_seams": sorted(table) == list(range(1, 13)),
+            "each_number_on_the_two_pieces_of_that_edge": pieces_match,
+            # "<n>, 45°": the comma is the maker's, so "4 3°" is not
+            # read as "43°" (2026-11-17).
+            "twenty_four_labels_reading_n_comma_45": len(angles) == 24
+            and all(l.text == "%d, 45\u00b0" % n
+                    for l, (n, deg) in zip(angles, parsed) if n is not None)
+            and all(n is not None for n, _d in parsed),
+            "twenty_four_arrows_all_into_their_piece": counts == {
+                "arrows": 24, "inward": 24, "outward": 0, "unowned": 0},
+        },
+    }
+
+
+def test_arrows_flip_for_the_inner_skin_and_for_valleys():
+    """Which way an arrow points, on three known-answer shapes.
+
+    Cube, pattern on the INNER skin: all 24 point outward, still drawn
+    inside the piece. Normals-flipped cube (every fold -90, all valleys),
+    OUTER: all 24 outward. L prism, OUTER: 17 convex and 1 concave seam, so
+    34 arrows inward and 2 outward. The two outward ones are on the edges of
+    the two side pieces that meet at the reflex upright.
+
+    Measured 2026-11-17 with the old "towards the face's centre" inward
+    test put back: 32 in, 2 out, and 2 arrows drawn off the piece entirely
+    -- the L top's two edges at its reflex corner, where that centre lies
+    on the edge's own line. foam_marks._inward_at now reads the face's
+    winding instead.
+    """
+    cube = _seamed_cube()
+    a = _arrow_counts(_arrow_report(
+        _bevel_marks_of(cube, pattern_surface='INNER')))
+    b = _arrow_counts(_arrow_report(_bevel_marks_of(_flipped_cube())))
+    l_obj = _l_prism()
+    c = _arrow_counts(_arrow_report(_bevel_marks_of(l_obj)))
+    l_seams = len(_seam_table(l_obj))
+    return {
+        "inner_cube": a, "flipped_cube": b, "l_prism": c,
+        "l_prism_seams": l_seams,
+        "checks": {
+            "inner_all_24_outward": a == {"arrows": 24, "inward": 0,
+                                          "outward": 24, "unowned": 0},
+            "flipped_all_24_outward": b == {"arrows": 24, "inward": 0,
+                                            "outward": 24, "unowned": 0},
+            "l_prism_has_18_seams": l_seams == 18,
+            "l_prism_34_in_2_out": c == {"arrows": 36, "inward": 34,
+                                         "outward": 2, "unowned": 0},
+        },
+    }
+
+
+def test_a_straight_cut_gets_a_number_and_no_arrow():
+    """Below `min_angle` there is no bevel: the number only -- no arrow and
+    no degrees, the maker's "no arrow means cut at 90 degrees".
+
+    Flat pair: one seam of fold 0 between two pieces -> exactly 2 labels,
+    both "1", and 0 arrows; the open rim gets nothing. Cube with min_angle
+    91 (above every fold of 90): 24 number-only labels, 0 arrows. And Seam
+    Numbers off on the cube: 24 labels reading "45°", 24 arrows.
+    """
+    flat = _bevel_marks_of(_flat_pair())
+    flat_labels = sorted(l.text for l in flat.labels if l.kind == 'angle')
+    flat_arrows = sum(1 for s in flat.strokes if s.kind == 'bevel_arrow')
+    cube = _seamed_cube()
+    steep = _bevel_marks_of(cube, min_angle=91.0)
+    steep_labels = [l.text for l in steep.labels if l.kind == 'angle']
+    steep_arrows = sum(1 for s in steep.strokes if s.kind == 'bevel_arrow')
+    plain = _bevel_marks_of(cube, show_seam_numbers=False)
+    plain_labels = [l.text for l in plain.labels if l.kind == 'angle']
+    plain_arrows = sum(1 for s in plain.strokes if s.kind == 'bevel_arrow')
+    return {
+        "flat_labels": flat_labels, "flat_arrows": flat_arrows,
+        "min_angle_91_labels": sorted(set(steep_labels)),
+        "min_angle_91_arrows": steep_arrows,
+        "numbers_off_labels": sorted(set(plain_labels)),
+        "numbers_off_arrows": plain_arrows,
+        "checks": {
+            "flat_two_labels_both_1": flat_labels == ["1", "1"],
+            "flat_no_arrow": flat_arrows == 0,
+            # Each of the 12 seam numbers twice, and nothing else.
+            "min_angle_24_number_only": sorted(steep_labels, key=int)
+            == sorted([str(n) for n in range(1, 13)] * 2, key=int),
+            "min_angle_no_arrow": steep_arrows == 0,
+            "numbers_off_24_reading_45": plain_labels == ["45\u00b0"] * 24,
+            "numbers_off_24_arrows": plain_arrows == 24,
+        },
+    }
+
+
+def test_seam_numbers_survive_a_fresh_bmesh():
+    """The same seam gets the same number on every export.
+
+    Numbers are ordered by vertex coordinates, never by element order (the
+    BMesh tables are stable for one mesh, sets of elements are not --
+    CLAUDE.md, "What survives rebuilding a BMesh"). Four fresh BMeshes of
+    the gore sphere must give the same {number: (pieces, coordinates)}
+    table. The gore sphere has 6 pole-to-pole seams, so numbers 1..6.
+    """
+    obj = _gore_sphere()
+    tables = [_seam_table(obj) for _ in range(4)]
+    return {
+        "numbers": sorted(tables[0]),
+        "checks": {
+            "six_seams": sorted(tables[0]) == list(range(1, 7)),
+            "identical_four_times": all(t == tables[0] for t in tables[1:]),
+        },
+    }
+
+
+def _run_spans(obj):
+    """For each cut run with a neighbour, how many seam segments its edges
+    lie on. From the mesh; plain numbers out."""
+    s = bpy.context.scene.foamcraft_drachis
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    try:
+        bm.verts.index_update()
+        bm.edges.index_update()
+        uv_layer = bm.loops.layers.uv.active
+        islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
+        sheet = fm._Sheet(islands_faces, uv_layer, 1.0)
+        islands = [fm._Island(i, f, uv_layer, sheet)
+                   for i, f in enumerate(islands_faces)]
+        numbers = fm._seam_numbers(islands, s.corner_angle_deg)
+        runs = list(core.iter_boundary_dart_segments(
+            bm, uv_layer, s.max_chord_deviation, s.max_angle_variation_deg,
+            islands=islands_faces, corner_angle_deg=s.corner_angle_deg,
+            matrix=obj.matrix_world, dart_wedge_deg=s.dart_wedge_deg,
+            max_darts_per_run=s.max_darts_per_run))
+        spans = [len(fm._run_seams(r, numbers)) for r in runs
+                 if r.has_dihedral]
+    finally:
+        bm.free()
+    return spans
+
+
+def test_a_cut_run_can_span_two_seams():
+    """Measured: can one cut run lie on more than one seam segment? Yes.
+
+    Runs break at *this* piece's corners (and where the bevel drifts);
+    seam segments also break where a third piece joins on the far side.
+    Where the near piece's outline runs straight past such a junction, one
+    run covers two seams. The split-top cube is the known answer: the +x
+    and -x sides each have one top-edge run over two seams, and no other
+    run spans more than one -- exactly 2 runs spanning 2.
+
+    The gore sphere, by contrast: every seam runs pole to pole and every
+    run ends at a pole or part way along one seam, so none spans two.
+
+    What the label then says: the seam its midpoint lies on
+    (foam_marks._run_midpoint_frame). So on the split-top cube the other
+    seam's number appears on its top piece only, never on the side it
+    glues to -- 2 numbers written once instead of twice. Pinned here so
+    that changing it shows up as a change.
+    """
+    gore = _run_spans(_gore_sphere())
+    split = _split_top_cube()
+    split_spans = _run_spans(split)
+    marks = _bevel_marks_of(split)
+    numbers = [_parse(l.text)[0] for l in marks.labels if l.kind == 'angle']
+    singles = sorted(n for n in set(numbers) if numbers.count(n) == 1)
+    return {
+        "gore_runs": len(gore),
+        "gore_max_span": max(gore) if gore else None,
+        "split_runs": len(split_spans),
+        "split_spans": sorted(split_spans),
+        "split_seams": len(set(numbers)),
+        "split_numbers_written_once": singles,
+        "checks": {
+            "gore_has_runs": len(gore) > 0,
+            "gore_no_run_spans_two": bool(gore) and max(gore) == 1,
+            "split_exactly_two_runs_span_two":
+                sorted(split_spans).count(2) == 2 and max(split_spans) == 2,
+            "split_two_numbers_written_once": len(singles) == 2,
+        },
+    }
+
+
+def test_nothing_is_drawn_at_a_corner():
+    """The maker: "There is no need for alignment marks at the corners. The
+    corners are implicitly aligning."
+
+    Cube: every outline vertex is a corner and a junction. Exactly 0
+    strokes of any kind other than the outline itself have a point within
+    1 mm of one (relief cuts off: they are cuts, not marks, and sit at run
+    ends by design) -- while all 48 alignment marks (2 per seam side, 12
+    seams, 2 sides) are still drawn, so the zero is not an empty sheet. And
+    no 'bracket' at all: every run on a cube ends at a corner.
+
+    Why 1 mm and not 1e-6: sheet coordinates are float32, 4.9e-4 mm apart
+    on this ~8 m sheet, so a mark placed *at* a corner could land a few
+    steps off it and slip under a micron-sized radius. 1 mm is far above
+    that noise and far below the nearest legitimate mark (a third of a
+    2000 mm edge). The nearest distance is reported.
+    """
+    marks = _bevel_marks_of(_seamed_cube())
+    corners = [p for s in marks.strokes if s.kind == 'outline'
+               for p in s.points]
+    dists = [(_math.hypot(p[0] - c[0], p[1] - c[1]), s.kind)
+             for s in marks.strokes if s.kind != 'outline'
+             for p in s.points for c in corners]
+    near = [kind for d, kind in dists if d < 1.0]
+    align = sum(1 for s in marks.strokes if s.kind == 'align')
+    brackets = sum(1 for s in marks.strokes if s.kind == 'bracket')
+    return {
+        "outline_corners": len(corners),
+        "strokes_at_a_corner": near,
+        "nearest_mark_to_a_corner_mm": min(d for d, _k in dists)
+        if dists else None,
+        "align": align, "brackets": brackets,
+        "checks": {
+            "24_outline_corners": len(corners) == 24,
+            "nothing_at_a_corner": near == [],
+            "still_48_alignment_marks": align == 48,
+            "no_run_end_marks_on_a_cube": brackets == 0,
+        },
+    }
+
+
+def _start_mark_report(marks, kind):
+    """Each `kind` stroke: does it start on its piece's outline, end
+    strictly inside, run square to the outline edge it starts on, and how
+    long is it. The owner is the piece holding its inner end."""
+    outlines = [s for s in marks.strokes if s.kind == 'outline']
+    rows = []
+    for st in (s for s in marks.strokes if s.kind == kind):
+        start, end = st.points[0], st.points[-1]
+        own = _owners([end], outlines)
+        if len(own) != 1:
+            rows.append(None)
+            continue
+        ring = outlines[own[0]].points
+        edges = _ring_edges(ring)
+        near = sorted(edges, key=lambda e: _seg_dist(start, *e))
+        # On a vertex the mark is meant to be square to the average of the
+        # two edges meeting there.
+        on_vertex = any(_math.hypot(start[0] - v[0], start[1] - v[1]) < 1e-3
+                        for v in ring)
+        dirs = []
+        for a, b in (near[:2] if on_vertex else near[:1]):
+            L = _math.hypot(b[0] - a[0], b[1] - a[1])
+            dirs.append(((b[0] - a[0]) / L, (b[1] - a[1]) / L))
+        if len(dirs) == 2 and (dirs[0][0] * dirs[1][0]
+                               + dirs[0][1] * dirs[1][1]) < 0:
+            dirs[1] = (-dirs[1][0], -dirs[1][1])
+        ex, ey = sum(d[0] for d in dirs), sum(d[1] for d in dirs)
+        mx, my = end[0] - start[0], end[1] - start[1]
+        length = _math.hypot(mx, my)
+        rows.append({"start_off_line": _seg_dist(start, *near[0]),
+                     "end_depth": _dist_to_ring(end, ring),
+                     "dot": abs(ex * mx + ey * my)
+                     / (_math.hypot(ex, ey) * length),
+                     "length": length, "on_vertex": on_vertex})
+    return rows
+
+
+def _shortest_outline_edge(marks):
+    return min(_math.hypot(b[0] - a[0], b[1] - a[1])
+               for s in marks.strokes if s.kind == 'outline'
+               for a, b in _ring_edges(s.points))
+
+
+def test_alignment_marks_go_inward_and_square_to_the_line():
+    """The maker: "The alignment marks should extend inwards and be
+    perpendicular to the edge they are aligned along."
+
+    Cube (2 m, tick_length 6 mm): each of the 48 'align' strokes starts on
+    its piece's outline, ends strictly inside it, is square to the outline
+    edge (|cos| < 1e-6) and is 6 mm long (to 4 float32 steps). "On the
+    outline" was first asked to 1e-6 mm and measured 1.6e-4 mm: the cube's
+    sheet is ~8 m across, where adjacent float32 values are 4.9e-4 mm apart
+    (the same finding as TOL_REL in tests/test_overlay_ticks.py), so a
+    point interpolated along an edge that is not exactly axis-aligned in UV
+    cannot sit closer to it than that. The tolerance is one float32 step.
+
+    Gore sphere: the same, with tolerances from float32 rather than chosen.
+    Sheet coordinates are 32-bit (mathutils), so a point is good to about
+    one float32 step `u` of the sheet's largest coordinate. A point on a
+    slanted edge can then be ~u off it; a 6 mm mark's direction is good to
+    ~2u / 6 mm and an edge's to ~2u / its length. So: 4u on position, and
+    4u / 6 mm + 4u / (shortest outline edge) on |cos|. Length at most 6 mm
+    (+4u) -- shortened at a gore's narrow tip -- and at least one at 6 mm.
+    """
+    out, checks = {}, {}
+    for name, build in (("cube", _seamed_cube), ("gores", _gore_sphere)):
+        marks = _bevel_marks_of(build())
+        rows = _start_mark_report(marks, 'align')
+        good = [r for r in rows if r is not None]
+        u = _sheet_ulp(marks)
+        if name == "cube":
+            pos_tol, dot_tol = u, 1e-6
+        else:
+            pos_tol = 4 * u
+            dot_tol = 4 * u / 6.0 + 4 * u / _shortest_outline_edge(marks)
+        out[name] = {
+            "align": len(rows), "owned": len(good),
+            "on_a_vertex": sum(1 for r in good if r["on_vertex"]),
+            "worst_start_off_line": max((r["start_off_line"] for r in good),
+                                        default=None),
+            "min_end_depth": min((r["end_depth"] for r in good),
+                                 default=None),
+            "worst_cos": max((r["dot"] for r in good), default=None),
+            "length_range": [min(r["length"] for r in good),
+                             max(r["length"] for r in good)] if good else None,
+            "float32_step_mm": u, "pos_tol": pos_tol, "cos_tol": dot_tol,
+        }
+        checks[name + "_has_marks_all_owned"] = \
+            len(good) > 0 and len(good) == len(rows)
+        checks[name + "_start_on_the_line"] = all(
+            r["start_off_line"] < pos_tol for r in good)
+        checks[name + "_end_strictly_inside"] = all(
+            r["end_depth"] > pos_tol for r in good)
+        checks[name + "_perpendicular"] = all(r["dot"] < dot_tol for r in good)
+        if name == "cube":
+            checks["cube_48_marks"] = len(rows) == 48
+            checks["cube_length_is_tick_length"] = all(
+                abs(r["length"] - 6.0) < 4 * u for r in good)
+        else:
+            checks["gores_never_longer_than_tick_length"] = all(
+                r["length"] <= 6.0 + 4 * u for r in good)
+            checks["gores_some_at_full_length"] = any(
+                abs(r["length"] - 6.0) < 4 * u for r in good)
+    out["checks"] = checks
+    return out
+
+
+def test_run_end_marks_only_part_way_along_a_seam():
+    """On the gore sphere the bevel drifts with latitude, so each side of a
+    gore breaks into several cut runs along one pole-to-pole seam. Those
+    breaks get a run-end mark, inward and square to the line like an
+    alignment mark. Both bounds: more than 0 of them, and 0 at a segment
+    end -- the poles, where six gores meet, are the only segment ends here,
+    and on the sheet each is a gore's topmost or bottommost outline point.
+
+    Tolerances as for the gore's alignment marks, from float32.
+    """
+    marks = _bevel_marks_of(_gore_sphere())
+    rows = _start_mark_report(marks, 'bracket')
+    good = [r for r in rows if r is not None]
+    u = _sheet_ulp(marks)
+    dot_tol = 4 * u / 6.0 + 4 * u / _shortest_outline_edge(marks)
+    tips = []
+    for s in marks.strokes:
+        if s.kind == 'outline':
+            ys = sorted(s.points, key=lambda p: p[1])
+            tips += [ys[0], ys[-1]]
+    at_end = sum(1 for st in marks.strokes if st.kind == 'bracket'
+                 and any(_math.hypot(st.points[0][0] - t[0],
+                                     st.points[0][1] - t[1]) < 1.0
+                         for t in tips))
+    return {
+        "run_end_marks": len(rows),
+        "at_a_pole": at_end,
+        "worst_cos": max((r["dot"] for r in good), default=None),
+        "cos_tol": dot_tol,
+        "checks": {
+            "some_mid_seam_marks": len(good) > 0 and len(good) == len(rows),
+            "none_at_a_segment_end": at_end == 0,
+            "start_on_the_line": all(r["start_off_line"] < 4 * u
+                                     for r in good),
+            "inward": all(r["end_depth"] > 4 * u for r in good),
+            "perpendicular": all(r["dot"] < dot_tol for r in good),
+        },
+    }
+
 TESTS = (
     test_bmesh_vertex_wrappers_compare_by_identity,
     test_what_the_old_per_run_placement_did,
@@ -812,6 +1496,14 @@ TESTS = (
     test_the_ruler_strip_stays_clear_of_the_pattern_and_of_itself,
     test_cube_marks_have_the_known_counts,
     test_marks_hold_no_bmesh_and_no_vectors,
+    test_cube_seams_are_numbered_once_and_shared_by_both_pieces,
+    test_arrows_flip_for_the_inner_skin_and_for_valleys,
+    test_a_straight_cut_gets_a_number_and_no_arrow,
+    test_seam_numbers_survive_a_fresh_bmesh,
+    test_a_cut_run_can_span_two_seams,
+    test_nothing_is_drawn_at_a_corner,
+    test_alignment_marks_go_inward_and_square_to_the_line,
+    test_run_end_marks_only_part_way_along_a_seam,
 )
 
 result = {}

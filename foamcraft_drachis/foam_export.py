@@ -156,6 +156,13 @@ def svg_from_marks(marks):
     align_els = [_line(s) for s in strokes_of('align')]
     align_label_els = [_text(l) for l in labels_of('align')]
     angle_els = [_text(l) for l in labels_of('angle')]
+    # One polyline per arrow: tail, tip, barb, tip, barb. Round joins, so
+    # the doubled-back point at the tip does not throw a mitre spike.
+    arrow_els = [
+        f'<polyline points="{_points_attr(s.points)}" fill="none" '
+        f'{_stroke_attrs(s)} stroke-linejoin="round" '
+        f'stroke-linecap="round"/>'
+        for s in strokes_of('bevel_arrow')]
     number_els = [_text(l) for l in labels_of('number')]
 
     # Each heat-form run is a polyline followed by its note.
@@ -200,6 +207,7 @@ def svg_from_marks(marks):
         group("align", align_els),
         group("alignlabels", align_label_els),
         group("angles", angle_els),
+        group("arrows", arrow_els),
         group("numbers", number_els),
         group("heatform", heat_els),
         group("ruler", ruler_els),

@@ -1138,11 +1138,13 @@ def test_alignment_ticks_are_a_real_length_not_a_fraction_of_the_sheet():
     a, b = rows["gore_sphere"], rows["seamed_cube"]
     out = dict(rows)
     out["checks"] = {
-        # 6 mm plus a quarter-length tail on the far side = 7.5 mm.
+        # 6 mm, from the cut line inward. It was 7.5 mm until 2026-11-17:
+        # 6 mm plus a quarter-length tail across the line, which the maker
+        # asked to drop ("the alignment marks should extend inwards").
         "gore_tick_is_the_requested_length":
-            abs(a["longest_tick_mm"] - 7.5) < 0.1,
+            abs(a["longest_tick_mm"] - 6.0) < 0.1,
         "cube_tick_is_the_same_length":
-            abs(b["longest_tick_mm"] - 7.5) < 0.1,
+            abs(b["longest_tick_mm"] - 6.0) < 0.1,
         # Both bounds: the two sheets really are different sizes, so the
         # equality above means the length is independent of the sheet.
         "the_sheets_differ_in_size": a["sheet_mm"] != b["sheet_mm"],
@@ -1178,16 +1180,32 @@ def _overlay_runs(obj):
         bpy.ops.object.mode_set(mode='OBJECT')
 
 
+def _sheet_run_labels(svg):
+    """Runs on an exported sheet, counted by their labels.
+
+    Every run with a neighbouring piece carries exactly one label: a bevel
+    label (or a bare seam number for a straight cut) in the "angles" group,
+    or a heat-form note in "heatform". This used to count the brackets in
+    "ticks", one per run end; since 2026-11-17 those are drawn only where a
+    run ends part way along a seam (none at corners), so they no longer
+    count runs. Every fixture here is closed, so every run has a neighbour.
+    """
+    total = 0
+    for gid in ("angles", "heatform"):
+        m = re.search(r'<g id="%s".*?</g>' % gid, svg, re.S)
+        total += m.group(0).count("<text") if m else 0
+    return total
+
+
 def _export_run_count(obj, matrix):
-    """Runs on the exported sheet: one bracket closes every run."""
+    """Runs on the exported sheet, by their labels (`_sheet_run_labels`)."""
     bm = _bmesh_of(obj)
     try:
         svg = fx.generate_svg(bm, bm.loops.layers.uv.active, _settings(),
                               1.0, matrix)
     finally:
         bm.free()
-    m = re.search(r'<g id="ticks".*?</g>', svg, re.S)
-    return m.group(0).count("<line") if m else -1
+    return _sheet_run_labels(svg)
 
 
 def _seamed_prism():
@@ -1307,24 +1325,29 @@ def test_unapplied_scale_gives_the_sheet_the_screens_run_angles():
         screen = _overlay_runs(obj)
         object_space_runs = _export_run_count(obj, None)
         s = _settings()
+        # Per side since 2026-11-17: the sheet prints the blade tilt for
+        # its piece (half the fold), as the screen always has.
         screen_angles = sorted(
-            "%.*f" % (s.decimals, abs(m.angle_deg)) for m in screen
+            "%.*f" % (s.decimals, abs(m.per_side_deg)) for m in screen
             if m.has_dihedral and not m.needs_heat_form
             and abs(m.angle_deg) >= s.min_angle)
+        screen_labelled = sum(1 for m in screen if m.has_dihedral)
     finally:
         _set(**saved)
 
     body = re.search(r'<g id="angles".*?</g>', svg, re.S)
-    sheet_angles = sorted(re.findall(r'>([\d.]+)' + '\N{DEGREE SIGN}<',
+    # A label reads "<seam>, <deg>°" now; the degrees are its last word.
+    sheet_angles = sorted(re.findall(r'>(?:\d+, )?([\d.]+)'
+                                     + '\N{DEGREE SIGN}<',
                                      body.group(0) if body else ""))
-    ticks = re.search(r'<g id="ticks".*?</g>', svg, re.S)
-    sheet_runs = ticks.group(0).count("<line") if ticks else -1
+    sheet_runs = _sheet_run_labels(svg)
     first_diff = next(((a, b) for a, b in zip(sheet_angles, screen_angles)
                        if a != b), None)
     return {
         "operator": sorted(op),
         "scale": tuple(obj.scale),
         "runs": {"sheet": sheet_runs, "screen": len(screen),
+                 "screen_with_a_neighbour": screen_labelled,
                  "sheet_in_object_space": object_space_runs},
         "angle_labels": {"sheet": len(sheet_angles),
                          "screen": len(screen_angles)},
@@ -1333,7 +1356,10 @@ def test_unapplied_scale_gives_the_sheet_the_screens_run_angles():
             "operator_finished": op == {'FINISHED'},
             "scale_is_non_uniform_and_unapplied":
                 tuple(obj.scale) == (1.0, 1.0, 2.5),
-            "sheet_has_the_screens_run_count": sheet_runs == len(screen),
+            # Every run on this closed sphere has a neighbour, so the
+            # sheet's one label per such run is one per screen run.
+            "sheet_has_the_screens_run_count":
+                sheet_runs == len(screen) == screen_labelled,
             "sheet_has_the_screens_angles": sheet_angles == screen_angles,
             # Both bounds: equal and empty would pass the line above.
             "there_are_angles_to_compare": len(sheet_angles) >= 12,
@@ -1485,6 +1511,40 @@ def test_a_middle_label_baseline_is_shifted_numerically():
     }
 
 
+def test_the_bevel_arrows_are_their_own_group_after_the_angles():
+    """The blade-tilt arrows reach the file, in their own group.
+
+    Known answer on the seamed cube: 24 runs, every one a +90 fold, so 24
+    arrows, each one open <polyline> of five points (tail, tip, barb, tip,
+    barb), all in <g id="arrows">, which sits right after "angles". The
+    other groups keep the order they always had -- a reader that relied on
+    it (or a diff of two sheets) must not see them move.
+    """
+    import xml.etree.ElementTree as ET
+    svg, marks = _svg_and_marks_for_cube()
+    root = ET.fromstring(svg)
+    order = [g.get("id") for g in root.iter(_SVG_NS + "g")]
+    arrows = [g for g in root.iter(_SVG_NS + "g") if g.get("id") == "arrows"]
+    kids = list(arrows[0]) if arrows else []
+    points = [len(e.get("points", "").split()) for e in kids]
+    model = sum(1 for s in marks.strokes if s.kind == 'bevel_arrow')
+    return {
+        "group_order": order,
+        "arrow_elements": len(kids),
+        "points_per_arrow": sorted(set(points)),
+        "checks": {
+            "group_order_unchanged_with_arrows_after_angles": order == [
+                "fills", "outlines", "darts", "ticks", "align",
+                "alignlabels", "angles", "arrows", "numbers", "heatform",
+                "ruler"],
+            "twenty_four_polylines": len(kids) == 24 and all(
+                e.tag == _SVG_NS + "polyline" for e in kids),
+            "as_many_as_the_model_has": model == len(kids),
+            "five_points_each": points == [5] * 24,
+        },
+    }
+
+
 TESTS = (
     test_the_cube_fixture_is_what_we_think,
     test_the_sheet_reproduces_the_uv_layout,
@@ -1508,6 +1568,7 @@ TESTS = (
     test_every_drawn_element_states_its_own_paint,
     test_every_text_states_its_own_font,
     test_a_middle_label_baseline_is_shifted_numerically,
+    test_the_bevel_arrows_are_their_own_group_after_the_angles,
 )
 
 result = {}
