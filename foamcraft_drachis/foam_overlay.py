@@ -134,12 +134,15 @@ class _OverlayCache:
 
     __slots__ = ("signature", "runs", "island_labels", "stretch_islands",
                  "align_ticks", "align_labels", "bevel_marks",
-                 "run_end_marks", "angle_font_mm")
+                 "run_end_marks", "angle_font_mm", "number_font_mm")
 
     def __init__(self):
         self.signature = None
         self.runs = []               # _RunMark, plain data only
-        self.island_labels = []      # (u, v, text)
+        # (u, v, text, key, size_mm): each piece name where and as big as
+        # the sheet prints it (`foam_layout.fit_piece_names`); size_mm 0
+        # means "the set size" (only when the model printed no name).
+        self.island_labels = []
         self.stretch_islands = set()  # island keys needing heat forming
         # Alignment (registration) ticks, exactly the ones the exported
         # sheet prints, mapped back into UV space. Plain floats only.
@@ -152,6 +155,9 @@ class _OverlayCache:
         # The sheet's full angle-label size in mm, which `_BevelMark.size_mm`
         # is measured against when drawing.
         self.angle_font_mm = 0.0
+        # The sheet's set Number Size in mm, which a cached name's size_mm
+        # is drawn against, as bevel labels are against angle_font_mm.
+        self.number_font_mm = 0.0
 
 
 _cache = _OverlayCache()
@@ -455,7 +461,8 @@ def _island_shown(islands, s, shown_islands):
     return [any(f.index in shown_faces for f in isl.faces) for isl in islands]
 
 
-def _laid_out_bevel_marks(sheet, parts, s, shown_ordinals, to_uv):
+def _laid_out_bevel_marks(sheet, parts, s, shown_ordinals, to_uv,
+                          names_out=None):
     """The bevel labels and leaders the sheet prints, mapped back to UV.
 
     Asks `foam_marks.marks_for_sheet` -- the export's own `Marks`, built on
@@ -469,12 +476,15 @@ def _laid_out_bevel_marks(sheet, parts, s, shown_ordinals, to_uv):
     and are not moved by the layout, so they are taken from the same build's
     `BevelMark`s, which name their island.
 
+    `names_out`, when a list, receives the printed piece names as
+    `foam_marks.marks_for_sheet` reports them: (ordinal, Label, how).
+
     Holds nothing past the call: plain floats and strings out.
     """
     from . import foam_marks as fm
     bevel_out = []
     marks = fm.marks_for_sheet(sheet, parts, s, _scale_length(s),
-                               bevel_out=bevel_out)
+                               bevel_out=bevel_out, names_out=names_out)
     leaders = {}
     for st in marks.strokes:
         if st.kind == 'leader' and st.anchor is not None:
@@ -559,6 +569,9 @@ def _rebuild(pairs, s):
     align_labels = []
     bevel_marks = []
     run_end_marks = []
+    # (text, key, ordinal, faces, uv_layer) per shown island. The BMFaces
+    # are read only within this call, for the fallback position below.
+    name_slots = []
 
     from . import foam_marks as fm
     # `_seam_chains` and the per-piece de-duplication key on vertex and edge
@@ -662,14 +675,19 @@ def _rebuild(pairs, s):
         # the sheet numbered.
         name_of_face = {f.index: isl.label
                         for isl in part.islands for f in isl.faces}
+        ordinal_of_face = {f.index: isl.ordinal
+                           for isl in part.islands for f in isl.faces}
         stretch = core.uv_stretch_map(bm, uv_layer)
 
         for index, faces in enumerate(islands):
             label = next((name_of_face[f.index] for f in faces
                           if f.index in name_of_face), str(index + 1))
-            centroid = _island_uv_centroid(faces, uv_layer)
+            ordinal = next((ordinal_of_face[f.index] for f in faces
+                            if f.index in ordinal_of_face), None)
             key = (obj.name, index)
-            labels.append((centroid.x, centroid.y, label, key))
+            # Placed and sized from the printed sheet once it is built,
+            # below; the ordinal finds this island's name there.
+            name_slots.append((label, key, ordinal, faces, uv_layer))
 
             # An island can be fine at its darted edges and still refuse to lie
             # flat through the middle. That is a heat-forming job, not a dart,
@@ -681,11 +699,27 @@ def _rebuild(pairs, s):
     # Bevel labels and leaders: the laid-out ones the export prints, for the
     # whole sheet at once -- the layout fits labels against every object's
     # marks together, so it cannot be asked one object at a time.
+    # Piece names too: sized by the model to fit their pieces, clear of
+    # the ticks and the outline, so screen and paper print the same name
+    # in the same place at the same size.
     to_uv = _sheet_to_uv(sheet)
-    if (s.show_brackets or s.show_heat_form) and to_uv is not None \
-            and any(part.islands for part in parts):
-        bevel_marks = _laid_out_bevel_marks(sheet, parts, s, shown_ordinals,
-                                            to_uv)
+    printed_names = []
+    if (s.show_brackets or s.show_heat_form or s.show_island_ids) \
+            and to_uv is not None and any(part.islands for part in parts):
+        laid = _laid_out_bevel_marks(sheet, parts, s, shown_ordinals, to_uv,
+                                     names_out=printed_names)
+        if s.show_brackets or s.show_heat_form:
+            bevel_marks = laid
+    name_at = {ordinal: tuple(to_uv(label.x, label.y)) + (float(label.size_mm),)
+               for ordinal, label, _how in printed_names}
+    for text, key, ordinal, faces, layer in name_slots:
+        if ordinal in name_at:
+            u, v, size_mm = name_at[ordinal]
+        else:
+            centroid = _island_uv_centroid(faces, layer)
+            u, v, size_mm = centroid.x, centroid.y, 0.0
+        labels.append((float(u), float(v), text, key, size_mm))
+    del name_slots
 
     _cache.runs = runs
     _cache.island_labels = labels
@@ -695,6 +729,9 @@ def _rebuild(pairs, s):
     _cache.angle_font_mm = (float(sheet.permille(s.angle_text_size,
                                                  s.overlay_scale))
                             if any(part.islands for part in parts) else 0.0)
+    _cache.number_font_mm = (float(sheet.permille(s.number_size,
+                                                  s.overlay_scale))
+                             if any(part.islands for part in parts) else 0.0)
     _cache.run_end_marks = run_end_marks
     # Heat forming is a property of a piece, not of a single cut: either some
     # seam on it is too steep to saw, or the piece will not lie flat at all.
@@ -824,18 +861,20 @@ def _ensure_cache(context, s):
     return True
 
 
-def _label_px(angle_px, size_mm, full_mm):
+def _label_px(angle_px, size_mm, full_mm, ceiling=400):
     """On-screen pixel size of a bevel label printed `size_mm` tall.
 
     The sheet's full angle size, `full_mm`, is drawn at `angle_px` (the
     overlay's existing mapping of `angle_text_size`); a label the layout
     shrank is drawn smaller by the same factor, so screen and paper keep
     the same proportions. `size_mm` 0 (unknown) draws at `angle_px`.
-    Clamped to the overlay's usual 6..400 px.
+    Clamped to the overlay's usual 6..`ceiling` px (piece names allow
+    500, as they always have). The same mapping draws a piece name at the
+    size the model fitted it to, against the set Number Size.
     """
     if size_mm <= 0.0 or full_mm <= 0.0:
         return angle_px
-    return max(6, min(int(round(angle_px * size_mm / full_mm)), 400))
+    return max(6, min(int(round(angle_px * size_mm / full_mm)), ceiling))
 
 
 def _draw_lines(segments_by_color, width):
@@ -945,15 +984,16 @@ def draw_callback():
         else:
             px, py = -dy / length, dx / length
 
-        if not s.show_dart_colors:
-            color = convex
-        else:
-            color = convex if run.angle_deg >= 0 else concave
-
-        # The bracket sits clear of the piece, in the margin, so it can never
-        # be mistaken for a cut line -- the way the hand-drafted sheets do it.
-        # It follows the edge's own shape: a run can span a curve, and a
-        # straight chord across it would not read as belonging to that edge.
+        # The run's outline offset into the margin. It is no longer DRAWN:
+        # it used to be, as a convex/concave-coloured "bracket" beside every
+        # run, and the sheet prints nothing there -- so the screen showed
+        # lines the paper did not, and they ran straight through outside
+        # labels and their leaders ("32, 17°" on HE P, 2026-11-17). What it
+        # said is all on the sheet's own marks now: where a run starts and
+        # ends (the run-end marks, below), and which way it folds (the
+        # bevel label's colour and blade arrow). The offset points are kept
+        # only to anchor the too-short-to-cut "!" warning, which is a
+        # screen-only craftability flag that sits in that margin.
         off = tick * 1.2
         bracket = []
         for u, v, nu, nv in run.outline:
@@ -972,20 +1012,8 @@ def draw_callback():
             bracket = [(ax + px * off, ay + py * off, ax, ay, px, py),
                        (bx + px * off, by + py * off, bx, by, px, py)]
 
-        bax, bay = bracket[0][0], bracket[0][1]
-        bbx, bby = bracket[-1][0], bracket[-1][1]
-
-        if s.show_brackets:
-            bucket = segments.setdefault(color, [])
-            # The offset outline, segment by segment, so it hugs the curve.
-            for (x0, y0, *_), (x1, y1, *_) in zip(bracket, bracket[1:]):
-                bucket.extend([(x0, y0), (x1, y1)])
-            # The ends used to be drawn as a T, a bar crossing the bracket
-            # both ways at every run end -- so at every corner of every
-            # piece, crossing its neighbour's. The maker: "There is no need
-            # for alignment marks at the corners." Where a run ends part way
-            # along a seam the sheet's own run-end mark is drawn instead
-            # (_cache.run_end_marks, below), and at a corner nothing is.
+        # (Its ends were once drawn as a T at every corner as well; the
+        # maker: "There is no need for alignment marks at the corners.")
 
         # Relief cuts are a different mark from the angle guide: they are the
         # cuts themselves. Drawn as a T lying on the boundary -- the bar runs
@@ -1030,7 +1058,6 @@ def draw_callback():
         # off while zooming and moved it between edges when the UVs were scaled
         # 10x or 0.1x -- reporting a property of the view as if it were a
         # property of the work.
-        run_px = ((bbx - bax) ** 2 + (bby - bay) ** 2) ** 0.5
         labelled = run.has_dihedral and abs(run.angle_deg) >= s.min_angle
         if labelled and run.length_3d < s.min_run_length:
             mid = len(bracket) // 2
@@ -1236,12 +1263,18 @@ def draw_callback():
             blf.disable(font_id, blf.ROTATION)
 
     if s.show_island_ids:
-        blf.size(font_id, max(6, min(number_px, 500)))
+        # Each name at the size the sheet prints it: the model shrank it to
+        # fit its piece clear of the outline and ticks. Drawing every name
+        # at the full Number Size instead ran neighbouring names into each
+        # other and over the bevel labels (2026-11-17).
+        number_px = max(6, min(number_px, 500))
         id_color = tuple(s.island_id_color)
-        for u, v, text, key in _cache.island_labels:
+        for u, v, text, key, size_mm in _cache.island_labels:
             x, y = view.view_to_region(u, v, clip=False)
             if not all(abs(c) < 1e6 for c in (x, y)):
                 continue
+            blf.size(font_id, _label_px(number_px, size_mm,
+                                        _cache.number_font_mm, 500))
             color = heat if (s.show_heat_form
                              and key in _cache.stretch_islands) else id_color
             width, height = blf.dimensions(font_id, text)

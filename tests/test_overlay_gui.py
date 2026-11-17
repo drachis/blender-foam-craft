@@ -269,7 +269,7 @@ def test_alignment_ticks_draw_into_the_uv_editor():
 
     The overlay stays on for both captures; only Alignment Ticks is
     toggled. So whatever differs between the two frames is the ticks -- the
-    brackets, angles and piece numbers are identical in both.
+    run-end marks, bevel labels and piece names are identical in both.
 
     Taken twice: once with the whole layout in view, and once zoomed in
     (view ratio 4.0, which measured about 1.4x the fitted view), because
@@ -479,11 +479,16 @@ def test_snapshot_dense_pieces_on_screen_and_on_paper():
     if area is None or region is None:
         return {"skipped": "no usable area", "checks": {"found_uv_area": False}}
     s = bpy.context.scene.foamcraft_drachis
-    saved = {k: getattr(s, k) for k in ("show_overlay", "only_selected")}
+    saved = {k: getattr(s, k) for k in ("show_overlay", "only_selected",
+                                        "show_darts")}
     out = {}
     try:
         s.show_overlay = True
         s.only_selected = False
+        # Relief marks are drawn in the fold colours too; off, so every
+        # fold-coloured line on screen is a leader (see below). The sheet
+        # follows the same toggle, so screen and paper still agree.
+        s.show_darts = False
 
         # The sheet the export prints, and its pieces M and P: their rings
         # and every label (and leader) belonging to them, in mm, then UV.
@@ -557,7 +562,21 @@ def test_snapshot_dense_pieces_on_screen_and_on_paper():
             _force_rebuild(area, region)
             cached = [m for m in overlay._cache.bevel_marks
                       if m.piece == owner]
-            on = _capture(area, region, "dense_%s_overlay_on" % tag)
+            # What the draw handler hands the GPU, by colour, for the last
+            # frame drawn: the screen's own account of its lines.
+            frames = []
+            real_draw_lines = overlay._draw_lines
+
+            def spy(segments_by_color, width):
+                frames.append({tuple(round(c, 4) for c in k): len(v)
+                               for k, v in segments_by_color.items()})
+                return real_draw_lines(segments_by_color, width)
+            overlay._draw_lines = spy
+            try:
+                on = _capture(area, region, "dense_%s_overlay_on" % tag)
+            finally:
+                overlay._draw_lines = real_draw_lines
+            row.update(_fold_coloured_lines(frames, s, region))
             row.update({
                 "screen": on, "screen_overlay_off": off,
                 "cached_labels": len(cached),
@@ -613,10 +632,54 @@ def test_snapshot_dense_pieces_on_screen_and_on_paper():
             r["changed_pixels"] is not None
             and 0 < r["changed_pixels"][0] < r["changed_pixels"][1]
             for r in rows),
+        # The overlay used to draw a fold-coloured "bracket" in the margin
+        # beside every run -- the paper prints nothing there, and it ran
+        # through outside labels. Now the only fold-coloured lines on
+        # screen are the leaders of drawn outside labels: exactly two
+        # points each, no more (a bracket) and no fewer (a lost leader).
+        "fold_colours_distinct": all(r["fold_colours_distinct"]
+                                     for r in rows),
+        "drew_a_frame": all(r["frames_drawn"] > 0 for r in rows),
+        "only_leaders_in_fold_colours": all(
+            r["fold_points_drawn"] == r["leader_points_expected"]
+            for r in rows),
         "export_finished": status == {'FINISHED'},
         "paper_crops_written": all(os.path.exists(r["paper"]) for r in rows),
     }
     return out
+
+
+def _fold_coloured_lines(frames, s, region):
+    """Of the last frame's lines, how many points were drawn in the convex
+    or concave colour, and how many the drawn leaders account for.
+
+    A leader takes its label's colour (convex, concave, or the neutral ink
+    when fold colours are off) and is drawn only with its label, which the
+    overlay hides where the run is shorter on screen than
+    `min_label_run_px` -- mirrored here, over the whole cache (a frame
+    draws every cached mark, not only the framed piece's).
+    """
+    convex = tuple(round(c, 4) for c in s.convex_color)
+    concave = tuple(round(c, 4) for c in s.concave_color)
+    ink = tuple(round(c, 4) for c in s.island_id_color)
+    neutral = convex if not s.show_dart_colors else ink
+    tone_colour = {'convex': convex, 'concave': concave, 'neutral': neutral}
+    view = region.view2d
+    expected = 0
+    for m in overlay._cache.bevel_marks:
+        if not m.leader or tone_colour.get(m.tone) not in (convex, concave):
+            continue
+        ax, ay = view.view_to_region(m.au, m.av, clip=False)
+        bx, by = view.view_to_region(m.bu, m.bv, clip=False)
+        if math.hypot(bx - ax, by - ay) < s.min_label_run_px:
+            continue
+        expected += 2
+    last = frames[-1] if frames else {}
+    drawn = sum(n for k, n in last.items() if k in (convex, concave))
+    return {"frames_drawn": len(frames),
+            "fold_points_drawn": drawn,
+            "leader_points_expected": expected,
+            "fold_colours_distinct": len({convex, concave, ink}) == 3}
 
 
 def _inside(pt, ring):

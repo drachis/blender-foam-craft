@@ -707,12 +707,13 @@ def test_a_piece_too_small_puts_its_labels_on_leaders():
     labels share one size.
 
     Piece numbers are OFF for the leader case and on for a second run that
-    pins what happens with them. Measured 2026-11-17: a piece number never
-    shrinks below a quarter of its full size (foam_marks.build_marks), so on
-    a 10 mm piece the number is ~40 mm tall and covers the piece's whole
-    outline; every leader would cross it, so with numbers on all 4 labels
-    are 'unplaced'. That is the layout honestly finding no clear spot; the
-    number's floor is a separate question for the maker.
+    pins what happens with them. First measured 2026-11-17: a piece number
+    then never shrank below a quarter of its full size, so on a 10 mm piece
+    it was ~40 mm tall, covered the piece's whole outline, and every leader
+    would have crossed it -- all 4 labels came back 'unplaced'. Since the
+    same day a name is fitted inside its own piece, down to Smallest Label
+    (`foam_layout.fit_piece_names`), so with numbers on the same 4 labels
+    go out on leaders exactly as with them off, and nothing is unplaced.
     """
     obj = _seamed_box()
     _shrink_top_island(obj, 0.005)
@@ -751,8 +752,10 @@ def test_a_piece_too_small_puts_its_labels_on_leaders():
                 _quad_in_rings(_quad(l), l.anchor.rings)
                 for l, _ld in tiny_labels),
             "whole_sheet_clean": _audit_clean(audit),
-            "numbers_on_exactly_the_four_unplaced":
-                with_numbers["how"].count("unplaced") == 4,
+            "numbers_on_none_unplaced":
+                with_numbers["how"].count("unplaced") == 0,
+            "numbers_on_the_same_four_leaders":
+                with_numbers["how"].count("leader") == 4,
         },
     }
 
@@ -1075,7 +1078,55 @@ def _render_and_crop(marks, names, wanted, dpi=150):
     return out
 
 
+def test_piece_names_fit_by_arithmetic():
+    """`foam_layout.fit_piece_names` on shapes with a known answer.
+
+    A name "AB" is 2 * 0.6 = 1.2 em wide by 1 em tall, padded 0.15 em all
+    round: 1.5 z by 1.3 z at size z. Centred in a 100 mm square with nothing
+    else on it, it fits while 1.5 z <= 100, so z = 66.67 mm exactly (the
+    width binds first). So:
+      * set 50 mm  -> 'full', 50;
+      * set 80 mm  -> 'shrunk', 66.67 (to the bisection's resolution);
+      * a tick from the left edge 30 mm in along the centre line leaves
+        50 - 30 = 20 mm to the half-width 0.75 z -> z = 26.67, 'shrunk';
+      * a 2 mm square with a 2.5 mm floor -> 'floor', at 2.5;
+      * a floor above the set size is the set size (set 2, floor 2.5,
+        square 100 -> 'full', 2).
+    The floor case is the one the maker's heads never reach (0 of 52,
+    tests/test_overlay_ticks.py), so it is pinned here.
+    """
+    sq = ((0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0))
+    tiny = ((0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0))
+    outline = fm.Stroke('outline', sq, True, 0.2, fm.BLACK)
+    tick = fm.Stroke('align', ((0.0, 50.0), (30.0, 50.0)), False, 0.2,
+                     fm.BLACK)
+    tiny_outline = fm.Stroke('outline', tiny, True, 0.2, fm.BLACK)
+    f = fl.fit_piece_names
+    full = f([("AB", 50.0, 50.0, (sq,))], [outline], [], 50.0, 2.5)[0]
+    shrunk = f([("AB", 50.0, 50.0, (sq,))], [outline], [], 80.0, 2.5)[0]
+    ticked = f([("AB", 50.0, 50.0, (sq,))], [outline, tick], [], 80.0,
+               2.5)[0]
+    floor = f([("AB", 1.0, 1.0, (tiny,))], [tiny_outline], [], 50.0,
+              2.5)[0]
+    capped = f([("AB", 50.0, 50.0, (sq,))], [outline], [], 2.0, 2.5)[0]
+    tol = 1e-3
+    return {
+        "full": full, "shrunk": shrunk, "ticked": ticked, "floor": floor,
+        "capped": capped,
+        "checks": {
+            "fits_whole": full == (50.0, 'full'),
+            "shrinks_to_the_width": shrunk[1] == 'shrunk'
+            and abs(shrunk[0] - 100.0 / 1.5) < tol,
+            "a_tick_is_an_obstacle": ticked[1] == 'shrunk'
+            and abs(ticked[0] - 20.0 / 0.75) < tol,
+            "too_small_keeps_the_floor": floor == (2.5, 'floor'),
+            "floor_never_above_set_size": capped == (2.0, 'full'),
+        },
+    }
+
+
 TESTS = (
+    test_piece_names_fit_by_arithmetic,
     test_cube_labels_turn_with_their_edges,
     test_a_turned_square_turns_its_labels_45,
     test_a_straight_cut_label_turns_with_no_glyph,

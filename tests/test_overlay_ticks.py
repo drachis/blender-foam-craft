@@ -654,6 +654,70 @@ def _world_height(obj):
     return (max(zs) - min(zs)) if zs else 0.0
 
 
+def _append_heads():
+    """Both heads and the snapshot's first scene, appended from a temp copy
+    (opening a file inside a bridge request replaces the session; the
+    git-ignored original is never touched, and nothing is saved), linked
+    into the current scene. (objs, snapshot scene, temp path), or
+    (None, None, reason) when the fixture is absent."""
+    import os
+    import shutil
+    import tempfile
+    if not os.path.exists(SNAPSHOT):
+        return None, None, ("fixture %s is absent (git-ignored, local only)"
+                            % SNAPSHOT)
+    _clear()
+    # An earlier test's appended heads, unlinked but still in bpy.data,
+    # would make these arrive renamed ".002" and the test skip (measured:
+    # the second snapshot test in this file skipped until this purge). The
+    # appended snapshot scene is what still uses them, so it goes first.
+    for sc in [sc for sc in bpy.data.scenes if sc != bpy.context.scene]:
+        bpy.data.scenes.remove(sc)
+    # Something else still holds them (users never reached 0, measured), so
+    # the old heads are removed by name, unlinked from wherever they are.
+    for name in HEADS:
+        old = bpy.data.objects.get(name)
+        if old is not None:
+            bpy.data.objects.remove(old, do_unlink=True)
+    tmp = os.path.join(tempfile.mkdtemp(prefix="foam_overlay_"), "copy.blend")
+    shutil.copyfile(SNAPSHOT, tmp)
+    with bpy.data.libraries.load(tmp, link=False) as (src, dst):
+        dst.objects = [n for n in src.objects if n in HEADS]
+        dst.scenes = list(src.scenes[:1])
+    objs = {o.name: o for o in dst.objects if o is not None}
+    if set(objs) != set(HEADS):
+        return None, None, "snapshot lacks %r; appended %r" % (
+            HEADS, sorted(objs))
+    for o in objs.values():
+        bpy.context.scene.collection.objects.link(o)
+    snap_scene = next((sc for sc in dst.scenes if sc is not None), None)
+    return objs, snap_scene, tmp
+
+
+def _operator_marks(path):
+    """The `Marks` the image export operator hands its renderer, captured
+    by wrapping the `render_marks` its execute() calls (looked up in the
+    module the registered class came from, which is not the freshly
+    imported one above). (status, marks or None, render info)."""
+    op_cls = bpy.types.FOAMCRAFT_DRACHIS_OT_export_pattern_image
+    g = op_cls.execute.__globals__
+    original = g["render_marks"]
+    seen = {}
+
+    def spy(marks, path, **kw):
+        seen["marks"] = marks
+        info = original(marks, path, **kw)
+        seen["info"] = info
+        return info
+    g["render_marks"] = spy
+    try:
+        status = bpy.ops.foamcraft_drachis.export_pattern_image(
+            filepath=path, file_format='PNG', resolution_mode='DPI', dpi=10)
+    finally:
+        g["render_marks"] = original
+    return status, seen.get("marks"), seen.get("info") or {}
+
+
 def test_snapshot_heads_overlay_is_the_printed_layout():
     """The maker's two heads in multi-object edit mode: the overlay's cached
     bevel labels and leaders equal, as multisets, the laid-out labels the
@@ -673,23 +737,9 @@ def test_snapshot_heads_overlay_is_the_printed_layout():
     scene's unit scale, and what size the sheet prints at.
     """
     import os
-    import shutil
-    import tempfile
-    if not os.path.exists(SNAPSHOT):
-        return {"skipped": "fixture %s is absent (git-ignored, local only)"
-                           % SNAPSHOT, "checks": {}}
-    _clear()
-    tmp = os.path.join(tempfile.mkdtemp(prefix="foam_overlay_"), "copy.blend")
-    shutil.copyfile(SNAPSHOT, tmp)
-    with bpy.data.libraries.load(tmp, link=False) as (src, dst):
-        dst.objects = [n for n in src.objects if n in HEADS]
-        dst.scenes = list(src.scenes[:1])
-    objs = {o.name: o for o in dst.objects if o is not None}
-    if set(objs) != set(HEADS):
-        return {"skipped": "snapshot lacks %r" % (HEADS,), "checks": {}}
-    for o in objs.values():
-        bpy.context.scene.collection.objects.link(o)
-    snap_scene = next((sc for sc in dst.scenes if sc is not None), None)
+    objs, snap_scene, tmp = _append_heads()
+    if objs is None:
+        return {"skipped": tmp, "checks": {}}
     s = bpy.context.scene.foamcraft_drachis
     file_unit_scale = None
     if snap_scene is not None:
@@ -746,26 +796,9 @@ def test_snapshot_heads_overlay_is_the_printed_layout():
     ov._rebuild(pairs, s)
     cached = list(ov._cache.bevel_marks)
 
-    # The image operator's own marks: wrap the `render_marks` its execute()
-    # calls (looked up in the module the registered class came from, which
-    # is not the freshly imported one above).
-    op_cls = bpy.types.FOAMCRAFT_DRACHIS_OT_export_pattern_image
-    g = op_cls.execute.__globals__
-    original = g["render_marks"]
-    seen = {}
-
-    def spy(marks, path, **kw):
-        seen["marks"] = marks
-        info = original(marks, path, **kw)
-        seen["info"] = info
-        return info
-    g["render_marks"] = spy
-    path = os.path.join(os.path.dirname(tmp), "heads.png")
-    try:
-        status = bpy.ops.foamcraft_drachis.export_pattern_image(
-            filepath=path, file_format='PNG', resolution_mode='DPI', dpi=10)
-    finally:
-        g["render_marks"] = original
+    # The image operator's own marks.
+    status, marks, info = _operator_marks(
+        os.path.join(os.path.dirname(tmp), "heads.png"))
     sheet, _parts = fm._layout_sheet(
         [fm.SheetItem(bm, uv, o.matrix_world.copy(),
                       fm.object_prefix(o.name, o.foamcraft_drachis_prefix),
@@ -775,7 +808,6 @@ def test_snapshot_heads_overlay_is_the_printed_layout():
     bpy.ops.object.mode_set(mode='OBJECT')
     s.only_selected = saved_only
 
-    marks = seen.get("marks")
     if marks is None:
         return {"status": list(status), "checks": {"operator_rendered": False}}
 
@@ -798,7 +830,6 @@ def test_snapshot_heads_overlay_is_the_printed_layout():
     overlaps = sum(1 for i in range(len(quads))
                    for j in range(i + 1, len(quads))
                    if fl._quads_overlap(quads[i], quads[j]))
-    info = seen.get("info") or {}
     scale_report.update({
         "sheet_mm": [round(marks.width_mm, 1), round(marks.height_mm, 1)],
         # World z extent at the file's unit scale, in mm. (The head lies
@@ -830,6 +861,337 @@ def test_snapshot_heads_overlay_is_the_printed_layout():
                 len(screen_leaders) == len(paper_leaders)
                 and lead_s == 0 and lead_p == 0,
             "no_label_label_overlap": overlaps == 0,
+        },
+    }
+
+
+# --- piece names and leaders on the maker's heads ----------------------------
+#
+# An independent model of a label's box, written out again rather than
+# imported from foam_layout so a wrong box there cannot agree with itself:
+# `len(text) * size * GLYPH_ADVANCE_EM` wide by `size` tall, centred on
+# (x, y) for a 'middle' label, turned `rotation_deg` counter-clockwise on
+# the page (y down). Piece names do not turn.
+
+# A piece name is never shrunk below the maker's Smallest Label
+# (`min_label_mm`), the legible floor the bevel labels already keep, nor
+# above the set Number Size. (It was a quarter of the set size: 5.9 mm on
+# this 1.35 m sheet, which left 12 of the 52 names -- "HE P" one of them --
+# still too big for their pieces and over the ticks, measured here.)
+#
+# "Clear" means clear by the layout's own margin, 0.15 of the text height
+# around the box (foam_layout.CLEAR_EM), so a name the model says fits and
+# one this audit passes are the same claim; with no margin, two names the
+# model put at the floor for touching a tick by a hair measured clear.
+NAME_CLEAR_EM = 0.15
+# The shortest leader that reads as a line rather than a dot, in text
+# heights of its own label -- the maker saw a ~1 mm stub at "32, 17°" on
+# piece HE P and took it for a stray mark (2026-11-17).
+MIN_LEADER_TEXT_HEIGHTS = 1.5
+
+
+def _box(x, y, size, text, rotation_deg=0.0, valign='middle', pad=0.0):
+    a = math.radians(rotation_deg or 0.0)
+    rx, ry = math.cos(a), -math.sin(a)
+    ux, uy = -math.sin(a), -math.cos(a)
+    hw = len(text) * size * fm.GLYPH_ADVANCE_EM / 2
+    hh = size / 2
+    if valign == 'baseline':
+        x, y = x + ux * hh, y + uy * hh
+    hw, hh = hw + pad, hh + pad
+    return tuple((x + sx * rx * hw + sy * ux * hh,
+                  y + sx * ry * hw + sy * uy * hh)
+                 for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)))
+
+
+def _lbox(label):
+    return _box(label.x, label.y, label.size_mm, label.text,
+                label.rotation_deg, label.valign)
+
+
+def _orient(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _seg_cross(p, q, r, s, eps=1e-9):
+    d1, d2 = _orient(r, s, p), _orient(r, s, q)
+    d3, d4 = _orient(p, q, r), _orient(p, q, s)
+    return (((d1 > eps and d2 < -eps) or (d1 < -eps and d2 > eps))
+            and ((d3 > eps and d4 < -eps) or (d3 < -eps and d4 > eps)))
+
+
+def _in_box(p, quad):
+    sg = [_orient(quad[i], quad[(i + 1) % 4], p) for i in range(4)]
+    return all(v > 1e-12 for v in sg) or all(v < -1e-12 for v in sg)
+
+
+def _seg_hits_box(p, q, quad):
+    return (_in_box(p, quad) or _in_box(q, quad)
+            or any(_seg_cross(p, q, quad[i], quad[(i + 1) % 4])
+                   for i in range(4)))
+
+
+def _boxes_overlap(a, b, eps=1e-6):
+    for quad in (a, b):
+        for i in range(4):
+            p, q = quad[i], quad[(i + 1) % 4]
+            ax, ay = q[1] - p[1], p[0] - q[0]
+            n = math.hypot(ax, ay) or 1.0
+            pa = [(ax * c[0] + ay * c[1]) / n for c in a]
+            pb = [(ax * c[0] + ay * c[1]) / n for c in b]
+            if max(pa) <= min(pb) + eps or max(pb) <= min(pa) + eps:
+                return False
+    return True
+
+
+def _pt_in_ring(pt, ring):
+    x, y = pt
+    inside = False
+    for i in range(len(ring)):
+        (x0, y0), (x1, y1) = ring[i], ring[(i + 1) % len(ring)]
+        if (y0 > y) != (y1 > y) and \
+                x < x0 + (y - y0) * (x1 - x0) / (y1 - y0):
+            inside = not inside
+    return inside
+
+
+def _pt_in_rings(pt, rings):
+    return sum(_pt_in_ring(pt, r) for r in rings) % 2 == 1
+
+
+def _segs_of(stroke):
+    pts = stroke.points
+    out = list(zip(pts, pts[1:]))
+    if stroke.closed and len(pts) > 2:
+        out.append((pts[-1], pts[0]))
+    return out
+
+
+def _seg_dist(p, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    l2 = dx * dx + dy * dy
+    t = 0.0 if l2 == 0 else max(0.0, min(1.0, ((p[0] - a[0]) * dx
+                                               + (p[1] - a[1]) * dy) / l2))
+    return math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy)
+
+
+def _name_audit(marks, set_mm, floor_mm):
+    """Every piece name on a printed sheet, against its own piece and every
+    other mark. Returns {text: [faults]} for the faulty ones, plus counts."""
+    rings_of = {}
+    for l in marks.labels:
+        if l.kind == 'angle' and l.anchor is not None:
+            rings_of.setdefault(l.anchor.piece, l.anchor.rings)
+    # A piece with no bevel label (every run under the minimum angle) has
+    # no anchor to carry its rings: its own are then the outline rings
+    # around the name, even-odd. (Two such names on the heads, measured.)
+    outline_rings = [tuple(st.points) for st in marks.strokes
+                     if st.kind == 'outline' and st.closed]
+    outline_segs = [sg for st in marks.strokes if st.kind == 'outline'
+                    for sg in _segs_of(st)]
+    tick_segs = [sg for st in marks.strokes if st.kind in ('align', 'bracket')
+                 for sg in _segs_of(st)]
+    other_segs = [sg for st in marks.strokes
+                  if st.kind not in ('align', 'bracket', 'outline', 'piece')
+                  for sg in _segs_of(st)]
+    names = [l for l in marks.labels if l.kind == 'number']
+    others = [l for l in marks.labels if l.kind != 'number' and l.text]
+    faults, owners = {}, {}
+    for n in names:
+        box = _lbox(n)
+        f = []
+        own = [p for p, r in rings_of.items() if _pt_in_rings((n.x, n.y), r)]
+        if len(own) > 1:
+            f.append("in_more_than_one_piece")
+        rings = rings_of[own[0]] if own else [
+            r for r in outline_rings if _pt_in_ring((n.x, n.y), r)]
+        if own:
+            owners[n.text] = own[0]
+        if not rings or not _pt_in_rings((n.x, n.y), rings):
+            f.append("in_no_piece")
+        elif not all(_pt_in_rings(c, rings) for c in box):
+            f.append("corner_outside_own_piece")
+        box = _box(n.x, n.y, n.size_mm, n.text,
+                   pad=NAME_CLEAR_EM * n.size_mm)
+        if any(_seg_hits_box(p, q, box) for p, q in outline_segs):
+            f.append("crosses_an_outline")
+        if any(_seg_hits_box(p, q, box) for p, q in tick_segs):
+            f.append("on_a_tick")
+        if any(_seg_hits_box(p, q, box) for p, q in other_segs):
+            f.append("on_another_stroke")
+        if any(_boxes_overlap(box, _lbox(o)) for o in others):
+            f.append("on_a_label")
+        if any(m is not n and _boxes_overlap(box, _lbox(m)) for m in names):
+            f.append("on_another_name")
+        if f:
+            faults[n.text] = f
+    return {
+        "names": len(names),
+        "pieces": len(rings_of),
+        "faults": faults,
+        "at_floor": sorted(n.text for n in names
+                           if n.size_mm <= floor_mm * (1 + 1e-6)),
+        "below_floor": [n.text for n in names
+                        if n.size_mm < floor_mm * (1 - 1e-6)],
+        "above_set_size": [n.text for n in names
+                           if n.size_mm > set_mm * (1 + 1e-6)],
+        "shrunk": sum(1 for n in names if n.size_mm < set_mm * (1 - 1e-6)),
+        "sizes_mm": sorted(round(n.size_mm, 2) for n in names),
+        "set_mm": set_mm, "floor_mm": floor_mm,
+    }
+
+
+def _leader_audit(marks):
+    """Every leader: at least MIN_LEADER_TEXT_HEIGHTS of its label's size
+    long, ending on its own run; and its label clear of every other mark
+    and of every piece."""
+    label_of = {l.anchor: l for l in marks.labels
+                if l.kind == 'angle' and l.anchor is not None}
+    rings = [st.points for st in marks.strokes
+             if st.kind == 'outline' and st.closed]
+    segs = [(st, sg) for st in marks.strokes if st.kind != 'piece'
+            for sg in _segs_of(st)]
+    short, off_run, label_hits = [], [], []
+    lengths = []
+    for st in marks.strokes:
+        if st.kind != 'leader':
+            continue
+        l = label_of.get(st.anchor)
+        if l is None:
+            off_run.append("orphan")
+            continue
+        start, end = st.points[0], st.points[-1]
+        length = math.dist(start, end)
+        lengths.append(round(length / l.size_mm, 2))
+        if length < MIN_LEADER_TEXT_HEIGHTS * l.size_mm - 1e-6:
+            short.append((l.text, round(length, 2), round(l.size_mm, 2)))
+        run = st.anchor.run
+        if min(_seg_dist(end, a, b) for a, b in zip(run, run[1:])) > 1e-6:
+            off_run.append(l.text)
+        box = _lbox(l)
+        hit = (any(other is not st and _seg_hits_box(p, q, box)
+                   for other, (p, q) in segs)
+               or any(o is not l and o.text
+                      and _boxes_overlap(box, _lbox(o))
+                      for o in marks.labels)
+               or any(_pt_in_rings(c, [r]) for r in rings for c in box))
+        if hit:
+            label_hits.append(l.text)
+    return {"leaders": len(lengths), "short": short, "off_run": off_run,
+            "label_not_clear": label_hits,
+            "length_in_text_heights": sorted(lengths)}
+
+
+def test_snapshot_heads_piece_names_and_leaders():
+    """The maker's two heads, as the image operator prints them and as the
+    overlay caches them (2026-11-17, three defects in the captures):
+
+    1. Piece names. Each is sized so its box fits inside its own piece,
+       clear of the outline, every alignment / run-end tick and every other
+       label -- never below a quarter of the set size. A name that does
+       not fit even there is kept at the floor and REPORTED: the faulty
+       names measured here must be exactly the ones the model reported
+       (`names_out`, how == 'floor'), and those must be at the floor.
+       On screen, the overlay's cached names equal the printed ones in
+       place, text and size.
+    2. (Margin brackets: tests/test_overlay_gui.py, which sees the draw.)
+    3. Leaders. Each is at least 1.5 text heights of its own label long,
+       ends on its own run, and its label is clear of every other mark and
+       off every piece.
+    """
+    import os
+    objs, snap_scene, tmp = _append_heads()
+    if objs is None:
+        return {"skipped": tmp, "checks": {}}
+    s = bpy.context.scene.foamcraft_drachis
+    if snap_scene is not None:
+        if getattr(snap_scene, "foamcraft_drachis", None):
+            _copy_settings(snap_scene.foamcraft_drachis, s)
+        bpy.context.scene.unit_settings.scale_length = \
+            snap_scene.unit_settings.scale_length
+    saved_only = s.only_selected
+    s.only_selected = False
+    bpy.context.view_layer.update()
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in objs.values():
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = objs[HEADS[0]]
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    scale_length = bpy.context.scene.unit_settings.scale_length
+    try:
+        pairs = ov._edit_meshes(bpy.context)
+        ov._rebuild(pairs, s)
+        cached = list(ov._cache.island_labels)
+        cached_full = float(getattr(ov._cache, "number_font_mm", 0.0))
+        status, marks, _info = _operator_marks(
+            os.path.join(os.path.dirname(tmp), "heads.png"))
+        sheet, parts = fm._layout_sheet(
+            [fm.SheetItem(bm, uv, o.matrix_world.copy(),
+                          fm.object_prefix(o.name,
+                                           o.foamcraft_drachis_prefix),
+                          o.name) for o, bm, uv in pairs], s, scale_length)
+        names_out = []
+        try:
+            fm.marks_for_sheet(sheet, parts, s, scale_length,
+                               names_out=names_out)
+        except TypeError:
+            names_out = None          # the model cannot report yet
+        n_islands = sum(len(part.islands) for part in parts)
+        del parts
+        set_mm = float(sheet.permille(s.number_size, s.overlay_scale))
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        s.only_selected = saved_only
+    if marks is None:
+        return {"status": list(status), "checks": {"operator_rendered": False}}
+
+    floor_mm = min(float(s.min_label_mm), set_mm)
+    names = _name_audit(marks, set_mm, floor_mm)
+    leaders = _leader_audit(marks)
+    reported_floor = sorted(lab.text for _o, lab, how in (names_out or [])
+                            if how == 'floor')
+    faulty = sorted(names["faults"])
+
+    def mm(u, v):
+        p = sheet.to_sheet(Vector((u, v)))
+        return (p.x, p.y)
+    screen = [mm(c[0], c[1]) + (float(c[4]) if len(c) > 4 else -1.0, c[2])
+              for c in cached]
+    paper = [(l.x, l.y, l.size_mm, l.text) for l in marks.labels
+             if l.kind == 'number']
+    tol = TOL_REL * max(marks.width_mm, marks.height_mm)
+    only_s, only_p = _unmatched(screen, paper, tol)
+
+    return {
+        "names": {k: v for k, v in names.items() if k != "faults"},
+        "faulty_names": names["faults"],
+        "names_reported_at_floor": reported_floor,
+        "leaders": leaders,
+        "screen_names": {"screen": len(screen), "paper": len(paper),
+                         "only_on_screen": only_s, "only_on_paper": only_p,
+                         "cached_set_mm": cached_full},
+        "checks": {
+            "operator_finished": status == {'FINISHED'},
+            # Both bounds on the count: one name per piece, none dropped.
+            "one_name_per_piece": names["names"] == n_islands > 0,
+            "none_below_the_floor": names["below_floor"] == [],
+            "none_above_the_set_size": names["above_set_size"] == [],
+            "model_reports_its_floor_names": names_out is not None,
+            # Every name that crosses or covers anything is one the model
+            # said could not fit, and every one it said so about does.
+            "faulty_names_are_exactly_the_reported_ones":
+                faulty == reported_floor,
+            "reported_names_are_at_the_floor":
+                set(reported_floor) <= set(names["at_floor"]),
+            "screen_names_equal_the_printed":
+                len(screen) == len(paper) and only_s == 0 and only_p == 0,
+            "screen_knows_the_set_size":
+                abs(cached_full - set_mm) <= 1e-6 * max(set_mm, 1e-9),
+            "there_are_leaders": leaders["leaders"] > 0,
+            "no_short_leader": leaders["short"] == [],
+            "every_leader_ends_on_its_run": leaders["off_run"] == [],
+            "every_leader_label_clear": leaders["label_not_clear"] == [],
         },
     }
 
@@ -867,6 +1229,7 @@ TESTS = (
     test_crowded_box_laid_out_labels_and_leaders_match_the_sheet,
     test_label_px_scales_with_printed_size,
     test_snapshot_heads_overlay_is_the_printed_layout,
+    test_snapshot_heads_piece_names_and_leaders,
 )
 
 result = {}

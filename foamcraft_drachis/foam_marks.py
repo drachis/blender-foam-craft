@@ -195,7 +195,8 @@ class Marks(NamedTuple):
     heat_color: Color = (0.0, 0.0, 0.0)
     # Added after the original contract, defaulted. Plain-language notes for
     # the maker about a sheet that is drawn but cannot be fully trusted --
-    # currently only unapplied non-uniform scale (see `scale_warnings`). A
+    # unapplied or non-uniform scale (`sheet_warnings`), and piece names
+    # that do not fit their pieces even at the smallest legible size. A
     # backend may show or log them; it must not alter the marks for them.
     warnings: Tuple[str, ...] = ()
 
@@ -1776,27 +1777,6 @@ def sheet_warnings(parts, sheet):
     return tuple(out)
 
 
-def _label_fit_size(text, room_mm, font_mm):
-    """The size a piece name prints at: as set, shrunk to fit its piece.
-
-    `room_mm` is the radius of the largest circle inside the piece (the
-    pole of inaccessibility's distance to the outline). The text's box --
-    `len * GLYPH_ADVANCE_EM` wide, 0.7 tall, both times the size -- fits in
-    that circle when its half-diagonal does. The number-only rule this
-    replaces, `1.2 * room`, is kept as a second ceiling: it is what one or
-    two digits always printed at, and "HR AB" is five characters wide, which
-    the old rule alone would have let spill over the cut line.
-
-    Never below a quarter of the set size, so a tiny piece gets a small name
-    rather than an invisible one (it may then overhang; that piece is too
-    small for any name).
-    """
-    room = max(room_mm, 0.0)
-    w = len(text) * GLYPH_ADVANCE_EM
-    fit = 2.0 * room / ((w * w + 0.7 * 0.7) ** 0.5)
-    return min(font_mm, max(min(room * 1.2, fit), font_mm * 0.25))
-
-
 def build_marks(bm, uv_layer, settings, scale_length=1.0, matrix=None,
                 prefix='', name='', layout=True):
     """Everything to draw for this mesh, as a `Marks`.
@@ -1838,7 +1818,7 @@ def build_marks_multi(items, settings, scale_length=1.0, layout=True):
 
 
 def marks_for_sheet(sheet, parts, settings, scale_length=1.0, layout=True,
-                    bevel_out=None):
+                    bevel_out=None, names_out=None):
     """`build_marks_multi` for a sheet `_layout_sheet` has already built.
 
     The overlay builds the sheet itself (it needs the parts to map marks
@@ -1847,8 +1827,14 @@ def marks_for_sheet(sheet, parts, settings, scale_length=1.0, layout=True,
     `bevel_out`, when a list, receives `(part_index, BevelMark)` for every
     bevel mark in emission order -- the overlay takes the heat-form notes
     from it, which carry no anchor to say whose piece they are on.
+    `names_out`, when a list, receives `(ordinal, Label, how)` for every
+    piece name -- the island's sheet-wide ordinal, the name as printed, and
+    how its size was found (`foam_layout.fit_piece_names`: 'full',
+    'shrunk', or 'floor' when it does not fit even there). The bevel
+    layout never moves a name, so these are the printed ones.
     """
-    marks = _sheet_marks(sheet, parts, settings, scale_length, bevel_out)
+    marks = _sheet_marks(sheet, parts, settings, scale_length, bevel_out,
+                         names_out)
     if layout:
         # Imported here: foam_layout imports this module.
         from .foam_layout import DEFAULT_MIN_LABEL_MM, layout_labels
@@ -1858,7 +1844,8 @@ def marks_for_sheet(sheet, parts, settings, scale_length=1.0, layout=True,
     return marks
 
 
-def _sheet_marks(sheet, parts, settings, scale_length, bevel_out=None):
+def _sheet_marks(sheet, parts, settings, scale_length, bevel_out=None,
+                 names_out=None):
     """The un-laid-out `Marks` for a built sheet (`marks_for_sheet`)."""
     total_width, total_height = sheet.width, sheet.height
     if settings.show_scale_ruler:
@@ -1892,6 +1879,8 @@ def _sheet_marks(sheet, parts, settings, scale_length, bevel_out=None):
     angle_labels, number_labels, heat_labels = [], [], []
     arrows = []
     align, align_labels = [], []
+    # (text, x, y, rings, ordinal) per piece name, sized after the loop.
+    name_slots = []
 
     for part_index, part in enumerate(parts):
         uv_layer = part.item.uv_layer
@@ -1950,21 +1939,18 @@ def _sheet_marks(sheet, parts, settings, scale_length, bevel_out=None):
                 # texture on the model, which is the main reason it is printed.
                 # The pole of inaccessibility is inside by construction, and sits
                 # in the piece's widest part so the digits have room.
-                (px, py), room = core.pole_of_inaccessibility(rings)
+                (px, py), _room = core.pole_of_inaccessibility(rings)
                 if px is not None:
-                    # Shrink a number that will not fit rather than letting
-                    # it spill over the cut lines of a small piece -- but never
-                    # below something a person can read. The floor used to be
-                    # 0.1 mm, which is not a smaller label, it is an invisible
-                    # one; three pieces on a test sphere printed their number at
-                    # that size and looked simply absent.
-                    # The name ("HR AB") is wider than the number it
-                    # replaced, so the fit is by its whole box now
-                    # (`_label_fit_size`), not by its height alone.
-                    size = _label_fit_size(isl.label, room, number_font_mm)
-                    number_labels.append(Label('number', px, py, size,
-                                               isl.label, BLACK,
-                                               'middle'))
+                    # Sized once every tick and outline is on the sheet
+                    # (`foam_layout.fit_piece_names`, below): the name's
+                    # whole box must fit inside the piece and clear of
+                    # them, not merely its height inside the largest circle
+                    # -- which is what let "HE P" run over its own outline
+                    # and alignment ticks (2026-11-17).
+                    name_slots.append((isl.label, px, py,
+                                       tuple(tuple(map(tuple, r))
+                                             for r in rings),
+                                       isl.ordinal))
 
             # --- ticks + darts: one per run-to-run corner, grouped by boundary
             # cycle so the wraparound (last run's end == first run's start)
@@ -2035,6 +2021,35 @@ def _sheet_marks(sheet, parts, settings, scale_length, bevel_out=None):
             align += part_align
             align_labels += part_labels
 
+    # --- piece names, sized to fit now that everything they must clear is
+    # placed -- and placed before the bevel-label layout, which then treats
+    # them as fixed obstacles. A name too big even at the floor is printed
+    # there and reported, never dropped.
+    warnings = sheet_warnings(parts, sheet)
+    if name_slots:
+        # Imported here: foam_layout imports this module.
+        from .foam_layout import DEFAULT_MIN_LABEL_MM, fit_piece_names
+        fitted = fit_piece_names(
+            [slot[:4] for slot in name_slots],
+            outlines + reliefs + brackets + align + arrows + heat_strokes,
+            align_labels + heat_labels, number_font_mm,
+            float(getattr(settings, 'min_label_mm', DEFAULT_MIN_LABEL_MM)))
+        crowded = []
+        for (text, px, py, _rings, ordinal), (size, how) in zip(name_slots,
+                                                                fitted):
+            label = Label('number', px, py, size, text, BLACK, 'middle')
+            number_labels.append(label)
+            if names_out is not None:
+                names_out.append((ordinal, label, how))
+            if how == 'floor':
+                crowded.append(text)
+        if crowded:
+            warnings = warnings + (
+                "%d piece name%s too big for %s piece even at Smallest "
+                "Label size, so it may run over its outline or marks: %s"
+                % (len(crowded), "" if len(crowded) == 1 else "s",
+                   "its" if len(crowded) == 1 else "their",
+                   ", ".join(crowded)),)
 
     ruler, ruler_labels = [], []
     if settings.show_scale_ruler:
@@ -2053,5 +2068,5 @@ def _sheet_marks(sheet, parts, settings, scale_length, bevel_out=None):
         convex_color=convex_rgb,
         concave_color=concave_rgb,
         heat_color=heat_rgb,
-        warnings=sheet_warnings(parts, sheet),
+        warnings=warnings,
     )

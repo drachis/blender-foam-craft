@@ -63,7 +63,12 @@ and goes out along the outward normal, or turned off it by
 `OUTSIDE_TURNS_DEG`, at `OUTSIDE_GAPS_EM` from the line, clear of every
 piece and inside the sheet; its glyph moves to the end nearest the line.
 The leader starts `LEADER_GAP_EM` off the box and ends on the cut line, at
-the point on the run the label was placed for.
+the point on the run the label was placed for, and is never shorter than
+`MIN_LEADER_EM` text heights, so it reads as a line, not a dot.
+
+Piece names are sized here too (`fit_piece_names`), before any of this
+runs: each as large as fits inside its own piece, clear of the outline and
+the ticks, and from then on a fixed obstacle like any other mark.
 
 A label that fits nowhere keeps its original place at `min_label_mm` at
 the least, and is reported as 'unplaced'. Nothing is dropped.
@@ -85,12 +90,24 @@ FRACTIONS = tuple(sorted((i / 16.0 for i in range(1, 16)),
 SIZE_STEPS = (1.0, 0.85, 0.7, 0.55, 0.4, 0.3, 0.2, 0.12)
 # Clear space kept around a label's box, in its own em.
 CLEAR_EM = 0.15
-# Outside: gap from the cut line to the label's box, in label em, and turns
-# off the outward normal, in degrees, tried in this order.
-OUTSIDE_GAPS_EM = (0.6, 1.2, 2.0, 3.5, 6.0)
-OUTSIDE_TURNS_DEG = (0.0, 35.0, -35.0, 70.0, -70.0)
 # A leader stops this far short of its text, so it does not run into it.
 LEADER_GAP_EM = 0.25
+# The shortest leader drawn, in text heights of its own label. Below about
+# a text height a leader reads as a dot or a stray nick, not a line: the
+# first layout put labels 0.6 em off the line, and its leaders came out at
+# 0.35 em -- under 1 mm at the 2.5 mm floor, which the maker took for a
+# speck beside "32, 17°" (2026-11-17). One and a half heights reads as a
+# pointer at every label size, because it scales with the label.
+MIN_LEADER_EM = 1.5
+# Outside: gap from the cut line to the label's box, in label em, and turns
+# off the outward normal, in degrees, tried in this order. Every gap leaves
+# room for at least a MIN_LEADER_EM leader plus its LEADER_GAP_EM stand-off
+# (the leader runs from the box edge to the line, and the box's nearest
+# point along the leader is the full gap away); further gaps step out from
+# there when nearer places are taken.
+OUTSIDE_GAPS_EM = tuple(MIN_LEADER_EM + LEADER_GAP_EM + extra
+                        for extra in (0.0, 0.5, 1.25, 2.75, 5.0))
+OUTSIDE_TURNS_DEG = (0.0, 35.0, -35.0, 70.0, -70.0)
 # A leader is a hairline: it points, it is not a cut.
 LEADER_WIDTH_OF_HAIRLINE = 0.6
 
@@ -397,6 +414,9 @@ def _place_outside(label, anchor, owner, grid, sheet, outline_rings, size):
                 # Stop a hair short of the run: the leader ends *on* its
                 # own cut line, which is not a crossing.
                 length = hypot(p[0] - start[0], p[1] - start[1])
+                if length < MIN_LEADER_EM * size:
+                    # Guaranteed by the gaps above; checked, not assumed.
+                    continue
                 trim = min(length * 0.5, 1e-3)
                 end_test = (p[0] - (p[0] - start[0]) / length * trim,
                             p[1] - (p[1] - start[1]) / length * trim)
@@ -405,6 +425,83 @@ def _place_outside(label, anchor, owner, grid, sheet, outline_rings, size):
                 return _Placed(centre[0], centre[1], size, rot, text,
                                (start, p), 'leader')
     return None
+
+
+# --- piece names ----------------------------------------------------------------
+
+# Steps of the size search. The fit is monotone in size -- the box grows
+# about a fixed centre, so whatever a size hits, every larger size hits --
+# so bisection finds the largest size that fits; 24 halvings of the range
+# is far finer than a printer can show.
+_NAME_BISECTIONS = 24
+
+
+def fit_piece_names(names, strokes, labels, set_mm, floor_mm):
+    """The size each piece name prints at, and how it got there.
+
+    `names` are (text, x, y, rings): the name, its anchor -- the pole of
+    inaccessibility, inside the piece by construction and in its widest
+    part -- and its piece's rings (outer first, even-odd), all sheet mm.
+    `strokes` and `labels` are every mark already on the sheet that the
+    name must keep clear of: outlines, alignment and run-end ticks, relief
+    cuts, heat-form lines, tick and heat labels. (Not the bevel labels:
+    they are laid out afterwards, around the names.)
+
+    Returns [(size_mm, how)] in `names` order, `how` being 'full' (the set
+    size fits), 'shrunk' (the largest size whose box, padded by
+    `CLEAR_EM`, lies inside its own piece and clear of every obstacle), or
+    'floor': not even `floor_mm` fits, so it is printed at that floor
+    anyway -- a tiny piece gets a small name, not none -- and the caller
+    reports it.
+
+    `floor_mm` is the smallest legible text: the caller passes the
+    maker's `min_label_mm`, the same floor the bevel labels keep (a
+    physical limit of their printer and eyes, not a tuning knob). It was a
+    quarter of the set size; on the maker's 1.35 m sheet that is 5.9 mm,
+    more than twice what they can read, and it left 12 of 52 names -- "HE
+    P" among them -- too big for their pieces and still over the ticks
+    (measured 2026-11-17, tests/test_overlay_ticks.py). On a small sheet a
+    quarter is also *below* legible. A floor above the set size is the set
+    size.
+
+    The box is the layout's own (`_quad`): `len(text) * GLYPH_ADVANCE_EM`
+    wide by 1 tall, times the size, unturned -- the same contract every
+    other overlap test here uses, so a name "clear" here is clear to the
+    bevel-label layout that follows. Names are not obstacles to each other:
+    each lies inside its own piece, and two pieces only share ground where
+    objects are drawn overlaid on purpose (Export UV Layout style).
+    Pure: reads nothing but its arguments.
+    """
+    floor_mm = min(floor_mm, set_mm)
+    grid = _Grid(max(set_mm * 2.0, 1.0))
+    for s in strokes:
+        for p, q in _stroke_segments(s.points, s.closed):
+            grid.add_seg(None, p, q)
+    for l in labels:
+        if l.text:
+            grid.add_quad(None, _label_quad(l, l.size_mm * CLEAR_EM))
+
+    out = []
+    for text, x, y, rings in names:
+        def fits(z):
+            if not all(_in_rings(c, rings) for c in _quad(x, y, z, text)):
+                return False
+            return grid.quad_clear(_quad(x, y, z, text, 0.0, z * CLEAR_EM),
+                                   None)
+        if fits(set_mm):
+            out.append((set_mm, 'full'))
+        elif not fits(floor_mm):
+            out.append((floor_mm, 'floor'))
+        else:
+            lo, hi = floor_mm, set_mm
+            for _ in range(_NAME_BISECTIONS):
+                mid = (lo + hi) / 2
+                if fits(mid):
+                    lo = mid
+                else:
+                    hi = mid
+            out.append((lo, 'shrunk'))
+    return out
 
 
 # --- the pass -----------------------------------------------------------------

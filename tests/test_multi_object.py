@@ -343,7 +343,13 @@ def test_different_uv_density_is_reported_once():
             "one_density_warning": len(density) == 1,
             "names_both_objects": bool(density) and "CubeA" in density[0]
             and "CubeB" in density[0],
-            "only_that_warning": len(uneven) == 1,
+            # Only that warning about scale. Since 2026-11-17 a piece name
+            # that does not fit clear of every outline is reported too, and
+            # here B's half-size pieces lie over A's, so two of B's names
+            # (CB G, CB J) cross A's cut lines even at Smallest Label --
+            # true of the printed sheet, and a different question.
+            "only_that_warning": len([w for w in uneven
+                                      if "piece name" not in w]) == 1,
             "none_when_equal": even == (),
         },
     }
