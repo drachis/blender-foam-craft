@@ -84,14 +84,22 @@ TEST_FILES = (
     "tests/test_export_svg.py",
     # The model the SVG and raster backends both draw from.
     "tests/test_marks_model.py",
+    # Bevel labels slid, shrunk or led out so none overlap (foam_layout).
+    "tests/test_label_layout.py",
     "tests/test_print_panel.py",
     # Pure arithmetic, no scene -- it also runs standalone with
     #     python tests/test_tile_svg.py
     "tests/test_tile_svg.py",
     "tests/test_export_raster.py",
+    # Several objects on one sheet (Export UV Layout's rule), piece names
+    # and seam numbers continuing across them.
+    "tests/test_multi_object.py",
     # The screen shows the registration ticks the sheet prints.
     "tests/test_overlay_ticks.py",
     "tests/test_overlay_gui.py",
+    # Every setting rebuilds the overlay when changed (the Convex/Concave
+    # Colour toggle did not).
+    "tests/test_settings_refresh.py",
 )
 
 
@@ -112,6 +120,10 @@ GUI_FILES = frozenset({
     # Compares a capture of the UV editor with the overlay on against one
     # with it off; there is nothing to compare without a window.
     "tests/test_overlay_gui.py",
+    # Toggles Convex/Concave Colour and runs the overlay's timer tick, which
+    # needs the live window's UV editor to rebuild for. Its other two cases
+    # are data-only and run either way.
+    "tests/test_settings_refresh.py",
     # NOT tests/test_export_raster.py, though it draws into a GPUOffScreen.
     # A background Blender refuses that at first -- and names the cure in the
     # refusal, gpu.init(). The file probes both and all of it passes headless
@@ -237,6 +249,13 @@ def report_on(path, report):
 
 
 def main():
+    # Labels carry U+2192/U+2190 arrows. Redirected to a file on Windows,
+    # stdout is the ANSI code page, which cannot encode them, and printing a
+    # report crashed the run. Replace rather than fail: a mangled arrow in
+    # a log line is harmless, a dead test run is not.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9885)
     parser.add_argument("--only", help="run just one file by substring")

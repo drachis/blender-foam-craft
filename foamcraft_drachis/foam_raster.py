@@ -74,6 +74,7 @@ longest edge is that many pixels and the dpi that results is reported.
 """
 
 import os
+from math import cos, radians, sin
 
 import bpy
 import bmesh
@@ -282,15 +283,34 @@ def _draw_labels(labels, canvas):
         blf.color(font, *_rgba(label.color))
         x, y = canvas.px(label.x, label.y)
         width, _ = blf.dimensions(font, label.text)
+        drop = 0.0
         if label.valign == 'middle':
             # Centre on the capital height, measured from the font rather
             # than taken as a fraction of the size, so digits and capitals --
             # which is what a pattern is labelled with -- sit with as much ink
             # above y as below it. Measuring the text itself would let a
             # comma or a descender shift a whole label.
-            y -= blf.dimensions(font, "X")[1] * 0.5
-        blf.position(font, x - width * 0.5, y, 0.0)
-        blf.draw(font, label.text)
+            drop = blf.dimensions(font, "X")[1] * 0.5
+        turn = getattr(label, 'rotation_deg', 0.0) or 0.0
+        if not turn:
+            blf.position(font, x - width * 0.5, y - drop, 0.0)
+            blf.draw(font, label.text)
+            continue
+        # A turned label (foam_marks: counter-clockwise on the page). The
+        # framebuffer is y-up, so blf's counter-clockwise rotation is the
+        # page's, and the pen starts half the width back along the reading
+        # direction and `drop` down along the text's own "down".
+        a = radians(turn)
+        ca, sa = cos(a), sin(a)
+        px = x - ca * width * 0.5 + sa * drop
+        py = y - sa * width * 0.5 - ca * drop
+        blf.enable(font, blf.ROTATION)
+        try:
+            blf.rotation(font, a)
+            blf.position(font, px, py, 0.0)
+            blf.draw(font, label.text)
+        finally:
+            blf.disable(font, blf.ROTATION)
 
 
 def _read_rows_top_down(fb, width, height):
@@ -468,43 +488,38 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
             layout.prop(self, "size")
 
     def execute(self, context):
-        obj = context.active_object
-        mesh = obj.data
         path = self.filepath
         if not path.lower().endswith(_FORMATS[self.file_format][1]):
             path = os.path.splitext(path)[0] + self.filename_ext
 
-        owns_bm = obj.mode != 'EDIT'
-        bm = bmesh.new() if owns_bm else bmesh.from_edit_mesh(mesh)
-        if owns_bm:
-            bm.from_mesh(mesh)
+        # Every object Export UV Layout would take, overlaid on one sheet
+        # (foam_export.export_objects has the rule and where it is from).
+        from . import foam_export
+        objects = foam_export.export_objects(context)
+        if not objects:
+            self.report({'ERROR'}, "No selected mesh has an active UV map. "
+                                   "Unwrap it first.")
+            return {'CANCELLED'}
+        with foam_export.SheetSource(objects) as items:
+            marks = foam_marks.build_marks_multi(
+                items, context.scene.foamcraft_drachis,
+                context.scene.unit_settings.scale_length)
         try:
-            uv_layer = bm.loops.layers.uv.active
-            if uv_layer is None:
-                self.report({'ERROR'},
-                            "This mesh has no active UV map. Unwrap it first.")
-                return {'CANCELLED'}
-            try:
-                info = render(
-                    bm, uv_layer, context.scene.foamcraft_drachis, path,
-                    size=self.size,
-                    scale_length=context.scene.unit_settings.scale_length,
-                    file_format=self.file_format,
-                    matrix=obj.matrix_world.copy(),
-                    dpi=self.dpi if self.resolution_mode == 'DPI' else None)
-            except (ValueError, OSError) as exc:
-                self.report({'ERROR'}, str(exc))
-                return {'CANCELLED'}
-        finally:
-            if owns_bm:
-                bm.free()
+            info = render_marks(
+                marks, path, size=self.size, file_format=self.file_format,
+                dpi=self.dpi if self.resolution_mode == 'DPI' else None)
+        except (ValueError, OSError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
 
         note = ""
         if info["clamped"]:
             note = (" (too large for the requested resolution; "
                     "print at the DPI shown)")
-        for note in info.get("warnings", ()):
-            self.report({'WARNING'}, note)
+        # Its own name: this loop used to reuse `note`, so a warning
+        # overwrote the clamp note above it in the final report.
+        for warning in info.get("warnings", ()):
+            self.report({'WARNING'}, warning)
         self.report({'INFO'}, "Wrote foam pattern image to %s: %d x %d px, "
                     "%.0f DPI%s" % (path, info["pixels"][0],
                                     info["pixels"][1], info["dpi"], note))

@@ -16,7 +16,7 @@ recomputed only when something that affects them actually changes.
 """
 
 import logging
-from math import acos, degrees
+from math import acos, cos, degrees, radians, sin
 from typing import NamedTuple
 
 import blf
@@ -109,6 +109,11 @@ class _BevelMark(NamedTuple):
     av: float
     bu: float
     bv: float
+    # Degrees counter-clockwise as seen (foam_marks.Label.rotation_deg):
+    # a bevel label is turned square to its cut line, its arrow glyph
+    # pointing the blade's way. The UV editor shows the page the right way
+    # up, so the page's angle is the screen's. Added 2026-11-17, defaulted.
+    rotation_deg: float = 0.0
 
 
 class _OverlayCache:
@@ -204,50 +209,52 @@ def _selection_fingerprint(bm):
     return (count, total)
 
 
+# Settings the overlay never reads, and so need not rebuild for. Everything
+# else on the settings group is in the signature -- walked from RNA rather
+# than listed, because a hand-kept list is how Convex/Concave Colour and the
+# colours came to be missing from it. tests/test_settings_refresh.py checks
+# both directions: each name here exists, and changing any other setting
+# changes the signature.
+_SIGNATURE_EXEMPT = frozenset({
+    # Objects the grease-pencil bake and the numbering operator use.
+    "pattern_source", "gp_object", "origin_object",
+    # Where the log is written; draws nothing.
+    "log_level",
+})
+
+
+def _settings_key(s):
+    """Every overlay-relevant setting's value, as plain hashable data."""
+    out = []
+    for prop in s.bl_rna.properties:
+        name = prop.identifier
+        if name in ("rna_type", "name") or name in _SIGNATURE_EXEMPT:
+            continue
+        value = getattr(s, name)
+        if prop.type == 'FLOAT':
+            value = (tuple(round(v, 6) for v in value)
+                     if getattr(prop, "array_length", 0) else round(value, 6))
+        elif prop.type in {'INT', 'BOOLEAN'} and \
+                getattr(prop, "array_length", 0):
+            value = tuple(value)
+        elif prop.type == 'POINTER':
+            value = getattr(value, "name", None)
+        out.append((name, value))
+    return tuple(out)
+
+
 def _signature(pairs, s):
     per_object = tuple(
         (obj.name, len(bm.verts), len(bm.edges), len(bm.faces),
          _uv_fingerprint(bm, uv_layer),
-         _selection_fingerprint(bm) if s.only_selected else 0)
+         _selection_fingerprint(bm) if s.only_selected else 0,
+         # The piece names it prints, and where it sits: a shared sheet's
+         # scale and the mirror warning both follow the world matrix.
+         getattr(obj, "foamcraft_drachis_prefix", ""),
+         tuple(round(v, 6) for row in obj.matrix_world for v in row))
         for obj, bm, uv_layer in pairs
     )
-    return (
-        per_object,
-        round(s.max_chord_deviation, 6),
-        round(s.max_angle_variation_deg, 4),
-        round(s.foam_thickness, 6),
-        round(s.max_tilt_deg, 4),
-        round(s.stretch_tolerance, 4),
-        round(s.corner_angle_deg, 4),
-        round(s.dart_wedge_deg, 4),
-        s.max_darts_per_run,
-        round(s.min_angle, 4),
-        s.show_darts,
-        s.allow_gores,
-        s.only_selected,
-        # Everything that decides where an alignment tick goes or how long
-        # it is. The ticks are cached, so a change to any of these has to
-        # read as a different signature or the screen keeps the old marks.
-        s.show_align_ticks,
-        s.tick_mode,
-        s.ticks_per_run,
-        round(s.tick_spacing, 6),
-        round(s.tick_length, 6),
-        s.tick_numbers,
-        round(_scale_length(s), 6),
-        # Everything that decides a cached bevel label: whether it exists,
-        # what it says, which way its arrow points, how far in it sits
-        # (placement is in multiples of the angle font) and its colour tone.
-        s.show_brackets,
-        s.show_heat_form,
-        s.show_dart_colors,
-        s.show_seam_numbers,
-        s.pattern_surface,
-        s.decimals,
-        s.angle_text_size,
-        s.mark_size,
-        round(s.overlay_scale, 6),
-    )
+    return (per_object, round(_scale_length(s), 6), _settings_key(s))
 
 
 def _scale_length(s):
@@ -296,46 +303,27 @@ class _Model:
     timer's rebuild, never from a draw handler.
     """
 
-    def __init__(self, obj, bm, uv_layer, s, shown_islands, shown_runs):
+    def __init__(self, part, sheet, s, shown_islands):
         from . import foam_marks as fm
         self.fm = fm
-        self.obj, self.uv_layer, self.s = obj, uv_layer, s
+        self.uv_layer, self.s = part.item.uv_layer, s
+        self.matrix = part.item.matrix
         self.shown_islands = shown_islands
-
-        # `_seam_chains` and the per-piece de-duplication key on vertex and
-        # edge indices, which the export path refreshes before it builds
-        # its marks.
-        bm.verts.index_update()
-        bm.edges.index_update()
-        bm.faces.index_update()
-
         self.scale_length = _scale_length(s)
-        if s.only_selected:
-            islands_faces = core.uv_islands(bm, uv_layer, only_selected=False)
-            all_runs = list(core.iter_boundary_dart_segments(
-                bm, uv_layer, s.max_chord_deviation,
-                s.max_angle_variation_deg,
-                islands=islands_faces,
-                corner_angle_deg=s.corner_angle_deg,
-                matrix=obj.matrix_world,
-                dart_wedge_deg=s.dart_wedge_deg,
-                max_darts_per_run=s.max_darts_per_run))
-        else:
-            # Already exactly what build_marks asks for; do not pay twice.
-            islands_faces, all_runs = shown_islands, shown_runs
-        self.ok = bool(islands_faces)
+
+        # One sheet for every object being edited, exactly as the export
+        # builds it (`foam_marks._layout_sheet`): its scale comes from all
+        # of them, and so do the seam numbers and piece names, which carry
+        # on from one object to the next. A sheet per object, as this used
+        # to build, sized each object's labels and ticks by its own scale
+        # and numbered every object from 1 -- island 8 on each of two
+        # objects both read "8" on a shared UV editor.
+        self.sheet = sheet
+        self.islands = part.islands
+        self.runs_by_island = part.runs_by_island
+        self.ok = bool(self.islands)
         if not self.ok:
             return
-
-        # The object's world matrix, as build_marks passes it: sheet scale
-        # and By Distance spacing are both measured through it.
-        self.sheet = fm._Sheet(islands_faces, uv_layer, self.scale_length,
-                               obj.matrix_world)
-        self.islands = [fm._Island(i, faces, uv_layer, self.sheet)
-                        for i, faces in enumerate(islands_faces)]
-        self.runs_by_island = [[] for _ in self.islands]
-        for run in all_runs:
-            self.runs_by_island[run.island_index].append(run)
 
         self.angle_font_mm = self.sheet.permille(s.angle_text_size,
                                                  s.overlay_scale)
@@ -359,10 +347,10 @@ class _Model:
         # Which of the model's islands (always whole-mesh) are on screen.
         if s.only_selected:
             shown_faces = {f.index for faces in shown_islands for f in faces}
-            self.island_shown = [any(f.index in shown_faces for f in faces)
-                                 for faces in islands_faces]
+            self.island_shown = [any(f.index in shown_faces for f in isl.faces)
+                                 for isl in self.islands]
         else:
-            self.island_shown = [True] * len(islands_faces)
+            self.island_shown = [True] * len(self.islands)
 
     def run_end_marks(self):
         """The sheet's run-end marks, as ((u0, v0, u1, v1), ...).
@@ -405,7 +393,7 @@ class _Model:
             self.islands, uv_layer, self.runs_by_island, s,
             s.tick_length * self.scale_length * 1000.0,
             self.angle_font_mm * 0.7, self.stroke_mm * 0.9,
-            self.obj.matrix_world)
+            self.matrix)
 
         ticks = []
         for stroke in strokes:
@@ -456,7 +444,8 @@ class _Model:
             (ax, ay), (bx, by) = mark.run_ends
             out.append(_BevelMark(
                 *to_uv(label.x, label.y), str(label.text), tone,
-                label.valign, arrow, *to_uv(ax, ay), *to_uv(bx, by)))
+                label.valign, arrow, *to_uv(ax, ay), *to_uv(bx, by),
+                float(getattr(label, 'rotation_deg', 0.0) or 0.0)))
         return out
 
 
@@ -506,7 +495,27 @@ def _rebuild(pairs, s):
     bevel_marks = []
     run_end_marks = []
 
+    from . import foam_marks as fm
+    # `_seam_chains` and the per-piece de-duplication key on vertex and edge
+    # indices, which the export path has fresh; refreshed here at the
+    # timer's safe point, never from a draw.
+    for _obj, bm, _uv in pairs:
+        bm.verts.index_update()
+        bm.edges.index_update()
+        bm.faces.index_update()
+    # The sheet the export would print for these same objects: one
+    # transform, pieces and seams numbered on from one object to the next.
+    sheet, parts = fm._layout_sheet(
+        [fm.SheetItem(bm, uv_layer, obj.matrix_world.copy(),
+                      fm.object_prefix(
+                          obj.name,
+                          getattr(obj, "foamcraft_drachis_prefix", "")),
+                      obj.name)
+         for obj, bm, uv_layer in pairs], s, _scale_length(s))
+    part_of = {part.item.name: part for part in parts}
+
     for obj, bm, uv_layer in pairs:
+        part = part_of[obj.name]
         islands = core.uv_islands(bm, uv_layer, s.only_selected)
 
         # Kept as a list, not consumed as a generator: the alignment ticks
@@ -521,7 +530,7 @@ def _rebuild(pairs, s):
 
         # What the sheet prints, asked of the model once per object.
         if s.show_align_ticks or s.show_brackets or s.show_heat_form:
-            model = _Model(obj, bm, uv_layer, s, islands, object_runs)
+            model = _Model(part, sheet, s, islands)
             if s.show_align_ticks:
                 ticks, tick_labels = model.align_ticks()
                 align_ticks.extend(ticks)
@@ -575,22 +584,21 @@ def _rebuild(pairs, s):
                 run.mean_angle_deg, per_side, run.has_dihedral, heat, ox, oy,
                 outline, darts, run.length_3d))
 
-        # Piece numbers come from the numbering operator's attribute when it
-        # has been run; otherwise fall back to island order so the overlay
-        # still reads on an un-numbered mesh.
-        id_layer = bm.faces.layers.int.get("foam_island_id")
+        # Piece names are the sheet's own (`_layout_sheet`): the numbering
+        # operator's attribute when it has been run, else island order, in
+        # either case continued from the objects before this one. Found by
+        # face, since Only Selected shows a subset of the whole-mesh islands
+        # the sheet numbered.
+        name_of_face = {f.index: isl.label
+                        for isl in part.islands for f in isl.faces}
         stretch = core.uv_stretch_map(bm, uv_layer)
 
         for index, faces in enumerate(islands):
-            label = index + 1
-            if id_layer is not None:
-                for face in faces:
-                    if face[id_layer] > 0:
-                        label = face[id_layer]
-                        break
+            label = next((name_of_face[f.index] for f in faces
+                          if f.index in name_of_face), str(index + 1))
             centroid = _island_uv_centroid(faces, uv_layer)
             key = (obj.name, index)
-            labels.append((centroid.x, centroid.y, str(label), key))
+            labels.append((centroid.x, centroid.y, label, key))
 
             # An island can be fine at its darted edges and still refuse to lie
             # flat through the middle. That is a heat-forming job, not a dart,
@@ -1056,7 +1064,8 @@ def draw_callback():
         if ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 < s.min_label_run_px:
             continue
         color = tones.get(mark.tone, neutral)
-        labels.append((x, y, mark.text, color, mark.valign))
+        labels.append((x, y, mark.text, color, mark.valign,
+                       mark.rotation_deg))
         if mark.arrow:
             pts = [view.view_to_region(u, v, clip=False)
                    for u, v in mark.arrow]
@@ -1091,14 +1100,29 @@ def draw_callback():
             blf.draw(font_id, "!")
         blf.size(font_id, angle_px)
 
-    for x, y, text, color, valign in labels:
+    for x, y, text, color, valign, turn in labels:
         width, height = blf.dimensions(font_id, text)
         # Where the sheet prints it. 'middle' centres the text on the point;
         # 'baseline' (the heat-form note) sits its baseline there.
         drop = height / 2 if valign == 'middle' else 0.0
-        blf.position(font_id, x - width / 2, y - drop, 0)
         blf.color(font_id, *color)
-        blf.draw(font_id, text)
+        if not turn:
+            blf.position(font_id, x - width / 2, y - drop, 0)
+            blf.draw(font_id, text)
+            continue
+        # Turned as the sheet turns it, about its own centre: the pen starts
+        # half the width back along the reading direction and `drop` down
+        # along the text's own "down". Plain cached floats; nothing read.
+        a = radians(turn)
+        ca, sa = cos(a), sin(a)
+        blf.enable(font_id, blf.ROTATION)
+        try:
+            blf.rotation(font_id, a)
+            blf.position(font_id, x - ca * width / 2 + sa * drop,
+                         y - sa * width / 2 - ca * drop, 0)
+            blf.draw(font_id, text)
+        finally:
+            blf.disable(font_id, blf.ROTATION)
 
     if s.show_island_ids:
         blf.size(font_id, max(6, min(number_px, 500)))
@@ -1377,6 +1401,23 @@ class IMAGE_PT_foamcraft_drachis_export(bpy.types.Panel):
         box.label(text="Bevels")
         box.prop(s, "show_seam_numbers")
         box.prop(s, "pattern_surface")
+        box.prop(s, "min_label_mm")
+
+        box = layout.box()
+        box.label(text="Pieces")
+        box.prop(s, "piece_label_style")
+        obj = context.active_object
+        if obj is not None and obj.type == 'MESH':
+            row = box.row()
+            row.enabled = s.piece_label_style == 'NAME'
+            row.prop(obj, "foamcraft_drachis_prefix")
+            if not obj.foamcraft_drachis_prefix:
+                # Say what an empty field prints, rather than leave the
+                # maker to discover it on paper.
+                from . import foam_marks as fm
+                note = box.row()
+                note.enabled = False
+                note.label(text="Uses %s" % fm.object_prefix(obj.name, ""))
 
         box = layout.box()
         box.label(text="Sheet")

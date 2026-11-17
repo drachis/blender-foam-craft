@@ -30,6 +30,9 @@ EXPORT_PROPS = (
     # The bevel labels (2026-11-17): what each one says, and which face of
     # the foam the pattern is traced on, which decides the arrows.
     "show_seam_numbers", "pattern_surface",
+    # The smallest printed label (2026-11-17): the floor foam_layout
+    # shrinks a crowded bevel label to before it moves it onto a leader.
+    "min_label_mm",
 )
 TICK_DETAIL = ("tick_mode", "ticks_per_run", "tick_spacing",
                "tick_length", "tick_numbers")
@@ -63,6 +66,12 @@ class FakeLayout:
 
     def prop(self, data, name, **kw):
         self._log["props"].append((name, self._eff()))
+        # Which struct it was drawn from (2026-11-17): the piece prefix is
+        # the active object's, not the scene settings', so "exists" has to
+        # be asked of the owner rather than of the settings group.
+        self._log.setdefault("owned", []).append(
+            (name, name in data.bl_rna.properties.keys(),
+             type(data).__name__))
 
     def operator(self, idname, **kw):
         self._log["ops"].append((idname, kw.get("text"), self._eff()))
@@ -120,8 +129,18 @@ def test_panel_registered_and_props_exist():
                 cls.bl_category == bpy.types.IMAGE_PT_foamcraft_drachis.bl_category,
             # Both bounds: nothing drawn is missing from RNA, and the drawn
             # set is not empty.
-            "every_drawn_prop_exists": bool(drawn) and drawn <= rna,
+            # Asked of whichever struct the panel drew it from (the prefix
+            # lives on the Object); every settings-group one still in `rna`.
+            "every_drawn_prop_exists": bool(drawn)
+            and all(ok for _n, ok, _t in log.get("owned", ()))
+            and {n for n, _ok, t in log.get("owned", ())
+                 if t != "Object"} <= rna,
             "something_was_drawn": len(drawn) > 0,
+            # 2.5 mm: the smallest text the maker can print and read. A
+            # physical limit (CLAUDE.md), so its default is pinned here.
+            "min_label_default_2_5_mm":
+                "min_label_mm" in rna and abs(
+                    s.bl_rna.properties["min_label_mm"].default - 2.5) < 1e-6,
         },
     }
 
@@ -140,7 +159,7 @@ def test_per_run_mode():
             "all_other_export_props":
                 {"show_align_ticks", "tick_mode", "tick_length", "tick_numbers",
                  "island_fill", "show_scale_ruler", "show_seam_numbers",
-                 "pattern_surface"} <= names,
+                 "pattern_surface", "min_label_mm"} <= names,
         },
     }
 
@@ -176,7 +195,8 @@ def test_ticks_off_disables_detail():
                 {"island_fill", "show_scale_ruler"} <= enabled,
             # Bevel labels do not depend on the ticks.
             "bevel_props_still_enabled":
-                {"show_seam_numbers", "pattern_surface"} <= enabled,
+                {"show_seam_numbers", "pattern_surface",
+                 "min_label_mm"} <= enabled,
         },
     }
 
@@ -223,8 +243,35 @@ def test_export_buttons_and_missing_operator_guard():
     }
 
 
+def test_piece_prefix_is_drawn_for_the_active_mesh():
+    """The active mesh's piece prefix and the label style are on the panel;
+    with no active object there is no prefix field (nothing to edit), and
+    the style still is. An empty prefix also says what it falls back to."""
+    import sandbox_guard
+    sandbox_guard.clear_scene()
+    without = _all_names(_draw(bpy.context))
+    bpy.ops.mesh.primitive_cube_add()
+    obj = bpy.context.object
+    obj.name = "horn"
+    obj.foamcraft_drachis_prefix = ""
+    log = _draw(bpy.context)
+    with_ = _all_names(log)
+    labels = [t for t, _ in log["labels"] if t]
+    return {
+        "labels": labels,
+        "checks": {
+            "style_drawn": "piece_label_style" in with_
+            and "piece_label_style" in without,
+            "prefix_drawn_with_a_mesh": "foamcraft_drachis_prefix" in with_,
+            "no_prefix_without_one": "foamcraft_drachis_prefix" not in without,
+            "says_the_default": "Uses HO" in labels,
+        },
+    }
+
+
 TESTS = (
     test_panel_registered_and_props_exist,
+    test_piece_prefix_is_drawn_for_the_active_mesh,
     test_per_run_mode,
     test_by_distance_mode,
     test_ticks_off_disables_detail,

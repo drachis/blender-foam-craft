@@ -274,7 +274,28 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
              "goes outward. Every arrow flips"),
         ],
         default='OUTER')
+    min_label_mm: bpy.props.FloatProperty(
+        name="Smallest Label (mm)", default=2.5, min=0.5, max=20.0,
+        precision=2,
+        description="The smallest printed text the maker's printer and eyes "
+                    "can read, in millimetres on the sheet. Where a bevel "
+                    "label does not fit, it slides along its cut line and "
+                    "shrinks -- never below this -- and failing that goes "
+                    "outside the piece on a leader line. A physical limit: "
+                    "set it from a test print, not to make labels fit")
     show_island_ids: bpy.props.BoolProperty(name="Piece Numbers", default=True)
+    piece_label_style: bpy.props.EnumProperty(
+        name="Piece Labels",
+        description="What each piece is labelled with on the sheet and on "
+                    "screen",
+        items=[
+            ('NAME', "Name",
+             "The object's abbreviation and a letter, as on hand-drawn "
+             "sheets: HR A, HR B ... HR Z, HR AA. Letters continue from one "
+             "object to the next on a shared sheet"),
+            ('NUMBER', "Number", "A plain piece number, 1, 2, 3"),
+        ],
+        default='NAME')
     island_fill: bpy.props.BoolProperty(
         name="Colour Pieces", default=True,
         description="Fill each piece with its own colour, the way a UV "
@@ -429,6 +450,69 @@ class FOAMCRAFT_DRACHIS_OT_estimate_tolerances(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _overlay_changed(self, context):
+    """Tell the overlay a setting moved, so it rebuilds and redraws.
+
+    Measured live (tests/test_settings_refresh.py): changing a property of
+    this group fires no `depsgraph_update_post` at all -- a scene's custom
+    property group is not depsgraph data -- so the overlay's only other
+    trigger never saw it. Toggling Convex/Concave Colour from the panel left
+    the cached labels coloured until something else touched the mesh. A
+    property `update=` callback is Blender's own idiom for exactly this.
+
+    Looked up through sys.modules rather than imported: foam_overlay imports
+    this module, and it may not be loaded (or may be a stale copy after a
+    reload) -- in which case there is nothing to tell.
+    """
+    import sys
+    overlay = sys.modules.get(__package__ + ".foam_overlay")
+    if overlay is not None and hasattr(overlay, "mark_dirty"):
+        overlay.mark_dirty()
+
+
+def _chained(own):
+    """`own`, then `_overlay_changed`. A closure rather than a default
+    argument: Blender counts an update callback's parameters and refuses
+    any but two (measured: "expected a function taking 2 arguments")."""
+    def update(self, context):
+        own(self, context)
+        _overlay_changed(self, context)
+    return update
+
+
+def _with_overlay_update(cls):
+    """Give every property of `cls` the `_overlay_changed` update, chained
+    after any update it already has (Log Detail's).
+
+    Done once over the class rather than written on each declaration, so a
+    setting added later cannot forget it -- the omission this fixes.
+    `bpy.props` returns a deferred definition carrying its `function` and
+    `keywords`; it is rebuilt with one more keyword.
+    """
+    for name, deferred in list(cls.__annotations__.items()):
+        function = getattr(deferred, "function", None)
+        keywords = getattr(deferred, "keywords", None)
+        if function is None or keywords is None:
+            continue
+        own = keywords.get("update")
+        update = _overlay_changed if own is None else _chained(own)
+        cls.__annotations__[name] = function(**dict(keywords, update=update))
+    return cls
+
+
+_with_overlay_update(FOAMCRAFT_DRACHIS_PG_panel_settings)
+
+
+def _prefix_changed(self, context):
+    """Keep the abbreviation upper case as it is typed, then redraw."""
+    value = self.foamcraft_drachis_prefix
+    if value != value.upper():
+        # Assigning re-enters this callback once, with nothing left to do.
+        self.foamcraft_drachis_prefix = value.upper()
+        return
+    _overlay_changed(self, context)
+
+
 _classes = (FOAMCRAFT_DRACHIS_PG_panel_settings, FOAMCRAFT_DRACHIS_OT_estimate_tolerances)
 
 
@@ -436,9 +520,22 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.foamcraft_drachis = bpy.props.PointerProperty(type=FOAMCRAFT_DRACHIS_PG_panel_settings)
+    # Per object, because a sheet can carry several objects and each names
+    # its own pieces ("HR A", "JW A").
+    bpy.types.Object.foamcraft_drachis_prefix = bpy.props.StringProperty(
+        name="Piece Prefix",
+        description="Short abbreviation printed before each piece's letter "
+                    "(HR for horn, ST for skull top, JW for jaw), at most 3 "
+                    "characters, upper case. Left empty, the first two "
+                    "letters of the object's name are used",
+        # Characters, not bytes with a terminator: maxlen=4 kept "ABCD"
+        # (measured, tests/test_multi_object.py).
+        maxlen=3,
+        update=_prefix_changed)
 
 
 def unregister():
+    del bpy.types.Object.foamcraft_drachis_prefix
     del bpy.types.Scene.foamcraft_drachis
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

@@ -469,7 +469,11 @@ def test_every_piece_number_lands_inside_its_piece():
 
         # Island index by piece id, so each number is tested against its OWN
         # piece rather than against any of them.
-        by_piece = {str(isl.piece_id): rings_per_island[i]
+        # Updated 2026-11-17: a piece is labelled with its name ("A", or
+        # "HR A" with an object prefix -- none here), not its bare number,
+        # unless the Piece Labels setting asks for numbers.
+        style = getattr(settings, "piece_label_style", "NAME")
+        by_piece = {fx.piece_name("", isl.piece_id, style): rings_per_island[i]
                     for i, isl in enumerate(islands)}
 
         own_piece, sizes = 0, []
@@ -1198,14 +1202,26 @@ def _sheet_run_labels(svg):
 
 
 def _export_run_count(obj, matrix):
-    """Runs on the exported sheet, by their labels (`_sheet_run_labels`)."""
+    """Runs on the exported sheet, by their labels.
+
+    Changed 2026-11-17: this counted SVG labels (`_sheet_run_labels`), one
+    per run. Since the maker asked for one bevel label per seam segment a
+    run lies on, a run spanning k seams carries k labels -- on the octagonal
+    prism the strip's two rim runs each span 8 seams, so the label count at
+    35 degrees became 34 for 20 runs. So the sheet's runs are now counted
+    from the model the SVG is drawn from: one per bevel label that is the
+    first portion of its run (`BevelAnchor.portion[0] == 0`), plus every
+    heat-form note (one per run, no anchor). Same sheet, same settings.
+    """
     bm = _bmesh_of(obj)
     try:
-        svg = fx.generate_svg(bm, bm.loops.layers.uv.active, _settings(),
-                              1.0, matrix)
+        marks = fx.build_marks(bm, bm.loops.layers.uv.active, _settings(),
+                               1.0, matrix)
     finally:
         bm.free()
-    return _sheet_run_labels(svg)
+    return sum(1 for l in marks.labels
+               if (l.kind == 'angle' and l.anchor is not None
+                   and l.anchor.portion[0] == 0) or l.kind == 'heat')
 
 
 def _seamed_prism():
@@ -1337,8 +1353,12 @@ def test_unapplied_scale_gives_the_sheet_the_screens_run_angles():
 
     body = re.search(r'<g id="angles".*?</g>', svg, re.S)
     # A label reads "<seam>, <deg>°" now; the degrees are its last word.
-    sheet_angles = sorted(re.findall(r'>(?:\d+, )?([\d.]+)'
-                                     + '\N{DEGREE SIGN}<',
+    # Since 2026-11-17 an arrow glyph (U+2192 or U+2190) and a space sit
+    # at one end of it, the end nearest the cut line.
+    glyph = '[\N{LEFTWARDS ARROW}\N{RIGHTWARDS ARROW}]'
+    sheet_angles = sorted(re.findall(r'>(?:' + glyph + r' )?(?:\d+, )?'
+                                     r'([\d.]+)' + '\N{DEGREE SIGN}'
+                                     r'(?: ' + glyph + r')?<',
                                      body.group(0) if body else ""))
     sheet_runs = _sheet_run_labels(svg)
     first_diff = next(((a, b) for a, b in zip(sheet_angles, screen_angles)
@@ -1512,38 +1532,40 @@ def test_a_middle_label_baseline_is_shifted_numerically():
 
 
 def test_the_bevel_arrows_are_their_own_group_after_the_angles():
-    """The blade-tilt arrows reach the file, in their own group.
+    """The blade direction reaches the file, and the groups keep their order.
 
-    Known answer on the seamed cube: 24 runs, every one a +90 fold, so 24
-    arrows, each one open <polyline> of five points (tail, tip, barb, tip,
-    barb), all in <g id="arrows">, which sits right after "angles". The
-    other groups keep the order they always had -- a reader that relied on
-    it (or a diff of two sheets) must not see them move.
+    Until 2026-11-17 this asserted 24 drawn arrows, each one open
+    <polyline> of five points, in <g id="arrows"> right after "angles". The
+    maker then asked for text arrows ("for ease of reading"): the arrow is
+    now a glyph, U+2192 or U+2190, inside each turned bevel label, and
+    build_marks emits no 'bevel_arrow' strokes. So, on the seamed cube (24
+    runs, every one a +90 fold): 24 <text> elements in "angles", each
+    carrying exactly one glyph; no "arrows" group at all, since it is
+    written only when something is in it (a leader from the layout pass);
+    and every other group in the order it always had -- a reader that
+    relied on it, or a diff of two sheets, must not see them move.
     """
     import xml.etree.ElementTree as ET
     svg, marks = _svg_and_marks_for_cube()
     root = ET.fromstring(svg)
     order = [g.get("id") for g in root.iter(_SVG_NS + "g")]
-    arrows = [g for g in root.iter(_SVG_NS + "g") if g.get("id") == "arrows"]
-    kids = list(arrows[0]) if arrows else []
-    points = [len(e.get("points", "").split()) for e in kids]
+    angles = [g for g in root.iter(_SVG_NS + "g") if g.get("id") == "angles"]
+    texts = [e.text or "" for e in (list(angles[0]) if angles else [])]
+    glyphs = [sum(t.count(c) for c in "\N{LEFTWARDS ARROW}\N{RIGHTWARDS ARROW}")
+              for t in texts]
     model = sum(1 for s in marks.strokes if s.kind == 'bevel_arrow')
     return {
         "group_order": order,
-        "arrow_elements": len(kids),
-        "points_per_arrow": sorted(set(points)),
+        "angle_texts": texts[:4],
         "checks": {
-            "group_order_unchanged_with_arrows_after_angles": order == [
+            "group_order_unchanged_without_arrows": order == [
                 "fills", "outlines", "darts", "ticks", "align",
-                "alignlabels", "angles", "arrows", "numbers", "heatform",
-                "ruler"],
-            "twenty_four_polylines": len(kids) == 24 and all(
-                e.tag == _SVG_NS + "polyline" for e in kids),
-            "as_many_as_the_model_has": model == len(kids),
-            "five_points_each": points == [5] * 24,
+                "alignlabels", "angles", "numbers", "heatform", "ruler"],
+            "twenty_four_angle_texts": len(texts) == 24,
+            "one_glyph_in_each": glyphs == [1] * 24,
+            "no_drawn_arrows_in_the_model": model == 0,
         },
     }
-
 
 TESTS = (
     test_the_cube_fixture_is_what_we_think,

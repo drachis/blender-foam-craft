@@ -21,7 +21,8 @@ import bpy
 import bmesh
 
 from . import foam_angle_core as core  # noqa: F401  (kept for importers)
-from .foam_marks import build_marks, scale_warnings
+from .foam_marks import (build_marks, build_marks_multi, scale_warnings,
+                         SheetItem, object_prefix)
 
 # What to draw is decided in foam_marks.build_marks; this module only writes
 # it out. The helpers that used to live here moved with that decision, and
@@ -33,7 +34,7 @@ from .foam_marks import (  # noqa: F401  (re-exports)
     _face_uv_area, _polygon_centroid, _Island, _Sheet, _run_polyline,
     _boundary_tangent, _inward_normal, _boundary_angle_deg,
     _edge_canonical_start, _run_tick_params, _remember_tick, _seam_chains,
-    _seam_tick_params, chain_direction_start, _shared_vert,
+    _seam_tick_params, chain_direction_start, _shared_vert, piece_name,
 )
 
 
@@ -93,11 +94,20 @@ def _text(label):
     y = label.y
     if label.valign == 'middle':
         y += MIDDLE_BASELINE_SHIFT * label.size_mm
+    # A turned label (a bevel label, square to its cut line) is rotated
+    # about its own (x, y). `rotation_deg` is counter-clockwise on the page;
+    # SVG's rotate() is clockwise on screen because y grows downward, so it
+    # is written negated. The middle-baseline shift above is applied before
+    # the turn and so turns with the text. "→"/"←" are U+2192/U+2190, which
+    # Arial (the first family named) has.
+    turn = getattr(label, 'rotation_deg', 0.0) or 0.0
+    transform = (f' transform="rotate({_fmt(-turn)} {_fmt(label.x)} '
+                 f'{_fmt(label.y)})"' if turn else '')
     return (f'<text x="{_fmt(label.x)}" y="{_fmt(y)}" '
             f'font-size="{_fmt(label.size_mm)}" '
             f'font-family="{FONT_FAMILY}" '
             f'fill="{_rgb_to_hex(*label.color)}" '
-            f'text-anchor="middle">{label.text}</text>')
+            f'text-anchor="middle"{transform}>{label.text}</text>')
 
 
 def _rect(stroke):
@@ -163,6 +173,10 @@ def svg_from_marks(marks):
         f'{_stroke_attrs(s)} stroke-linejoin="round" '
         f'stroke-linecap="round"/>'
         for s in strokes_of('bevel_arrow')]
+    # A label placed outside its piece (foam_layout) is joined to its cut
+    # line by a leader: it belongs with the arrow it leads to, so it goes in
+    # the same group, after the arrows.
+    arrow_els += [_line(s) for s in strokes_of('leader')]
     number_els = [_text(l) for l in labels_of('number')]
 
     # Each heat-form run is a polyline followed by its note.
@@ -207,7 +221,11 @@ def svg_from_marks(marks):
         group("align", align_els),
         group("alignlabels", align_label_els),
         group("angles", angle_els),
-        group("arrows", arrow_els),
+        # Drawn arrows are retired (the glyph is in the label, 2026-11-17),
+        # so this group exists only when there is something in it -- a
+        # leader from foam_layout, or an arrow a caller built by hand. It
+        # stays in its place after "angles"; the others keep their order.
+        *([group("arrows", arrow_els)] if arrow_els else []),
         group("numbers", number_els),
         group("heatform", heat_els),
         group("ruler", ruler_els),
@@ -224,6 +242,65 @@ def generate_svg(bm, uv_layer, settings, scale_length=1.0, matrix=None):
     `svg_from_marks` writes it down."""
     return svg_from_marks(build_marks(bm, uv_layer, settings,
                                       scale_length, matrix))
+
+
+def export_objects(context):
+    """The objects a pattern export takes, by Export UV Layout's own rule.
+
+    `{*context.selected_objects, context.active_object}`, keeping meshes
+    with an active UV map -- copied from
+    scripts/addons_core/io_mesh_uv_layout/__init__.py:198-206
+    (`iter_objects_to_export`). In edit mode that is every object being
+    edited together, since they are selected. Returned in name order, which
+    the built-in does not need (it only draws) and this does (it numbers).
+    """
+    candidates = {*context.selected_objects, context.active_object}
+    out = [obj for obj in candidates
+           if obj is not None and obj.type == 'MESH'
+           and obj.data.uv_layers.active is not None]
+    return sorted(out, key=lambda obj: obj.name)
+
+
+class SheetSource:
+    """`SheetItem`s for `objects`, and the BMeshes behind them, freed on exit.
+
+    Export UV Layout leaves edit mode so the mesh data is current
+    (`__init__.py:141-143`, and back at 184-185). The same data is read here
+    without the round trip: an object whose mesh is in edit mode is read
+    through `bmesh.from_edit_mesh` -- the live edit mesh, which is what the
+    mode switch would have flushed -- and any other through a fresh BMesh.
+    """
+
+    def __init__(self, objects):
+        self.objects = objects
+        self.items = []
+        self._owned = []
+
+    def __enter__(self):
+        for obj in self.objects:
+            mesh = obj.data
+            if mesh.is_editmode:
+                bm = bmesh.from_edit_mesh(mesh)
+            else:
+                bm = bmesh.new()
+                bm.from_mesh(mesh)
+                self._owned.append(bm)
+            uv_layer = bm.loops.layers.uv.active
+            if uv_layer is None:
+                continue
+            self.items.append(SheetItem(
+                bm, uv_layer, obj.matrix_world.copy(),
+                object_prefix(obj.name,
+                              getattr(obj, "foamcraft_drachis_prefix", "")),
+                obj.name))
+        return self.items
+
+    def __exit__(self, *exc):
+        for bm in self._owned:
+            bm.free()
+        self._owned = []
+        self.items = []
+        return False
 
 
 def _rgba_to_hex(rgba):
@@ -251,30 +328,24 @@ class FOAMCRAFT_DRACHIS_OT_export_panel_pattern(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
-        obj = context.active_object
-        mesh = obj.data
-        owns_bm = obj.mode != 'EDIT'
-        bm = bmesh.new() if owns_bm else bmesh.from_edit_mesh(mesh)
-        if owns_bm:
-            bm.from_mesh(mesh)
-        try:
-            uv_layer = bm.loops.layers.uv.active
-            if uv_layer is None:
-                self.report({'ERROR'}, "This mesh has no active UV map. Unwrap it first.")
-                return {'CANCELLED'}
-
-            settings = context.scene.foamcraft_drachis
-            # Through the world matrix, as the overlay measures, so an
+        # Every object Export UV Layout would take, overlaid on one sheet --
+        # not just the active one, which is what a maker editing two objects
+        # together got before.
+        objects = export_objects(context)
+        if not objects:
+            self.report({'ERROR'}, "No selected mesh has an active UV map. "
+                                   "Unwrap it first.")
+            return {'CANCELLED'}
+        settings = context.scene.foamcraft_drachis
+        with SheetSource(objects) as items:
+            # Through each world matrix, as the overlay measures, so an
             # object with unapplied scale gets the same angles on paper as
             # on screen.
-            for note in scale_warnings(obj.matrix_world):
-                self.report({'WARNING'}, note)
-            svg_text = generate_svg(bm, uv_layer, settings,
-                                    context.scene.unit_settings.scale_length,
-                                    obj.matrix_world)
-        finally:
-            if owns_bm:
-                bm.free()
+            marks = build_marks_multi(
+                items, settings, context.scene.unit_settings.scale_length)
+        for note in marks.warnings:
+            self.report({'WARNING'}, note)
+        svg_text = svg_from_marks(marks)
 
         path = self.filepath
         if not path.lower().endswith(".svg"):

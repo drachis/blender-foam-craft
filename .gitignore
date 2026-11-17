@@ -21,3 +21,7 @@ screenshots/
 
 # Release build output
 dist/
+
+# Snapshots of the maker's own prop files, used by measurement tests.
+# Personal assets: kept local, never committed.
+tests/fixtures/*.blend

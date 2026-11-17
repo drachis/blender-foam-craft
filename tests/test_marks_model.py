@@ -171,7 +171,7 @@ def test_cube_marks_have_the_known_counts():
             # the blade tilt for this one piece, half the fold -- 45 on a
             # cube -- after the seam number ("<n>, 45°"), as the screen does.
             "twenty_four_angles_all_45_per_side": len(angles) == 24 and all(
-                l.text.endswith(", 45\u00b0") for l in angles),
+                _body(l.text).endswith(", 45\u00b0") for l in angles),
         },
     }
 
@@ -201,19 +201,70 @@ def test_marks_hold_no_bmesh_and_no_vectors():
         "checks": {
             "no_foreign_values": foreign == [],
             # Both bounds: an empty Marks would pass the check above.
+            # 'bevel_arrow' left this list 2026-11-17: the drawn arrow is
+            # retired, the glyph is in the 'angle' label -- so it is now
+            # asserted absent.
             "every_optional_kind_was_produced": set(kinds) >= {
                 'piece', 'outline', 'bracket', 'align', 'ruler',
-                'number', 'angle', 'bevel_arrow'},
+                'number', 'angle'},
+            "no_drawn_bevel_arrows": 'bevel_arrow' not in kinds,
         },
     }
 
 
+# The blade-direction glyphs a bevel label carries since 2026-11-17, when
+# the drawn 'bevel_arrow' strokes were retired at the maker's request.
+_RIGHT, _LEFT = "\u2192", "\u2190"
+
+
+def _body(text):
+    """A bevel label's text without its arrow glyph."""
+    return text.replace(_RIGHT, "").replace(_LEFT, "").strip()
+
+
+def _label_corners(label):
+    """A label's box as four corners, turned by its `rotation_deg`
+    (counter-clockwise on the page; sheet y is down, so it reads along
+    (cos r, -sin r))."""
+    a = _math.radians(getattr(label, "rotation_deg", 0.0) or 0.0)
+    rx, ry = _math.cos(a), -_math.sin(a)
+    ux, uy = -_math.sin(a), -_math.cos(a)
+    hw = len(label.text) * label.size_mm * fm.GLYPH_ADVANCE_EM / 2
+    hh = label.size_mm / 2
+    return [(label.x + sx * rx * hw + sy * ux * hh,
+             label.y + sx * ry * hw + sy * uy * hh)
+            for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+
+
 def _label_box(label):
-    """A label's box, from the same upper bound the model places it with."""
-    half_w = len(label.text) * label.size_mm * fm.GLYPH_ADVANCE_EM / 2
-    half_h = label.size_mm / 2
-    return (label.x - half_w, label.y - half_h,
-            label.x + half_w, label.y + half_h)
+    """The axis-aligned bound of a label's (possibly turned) box."""
+    pts = _label_corners(label)
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _glyph_arrow(label):
+    """(glyph end point, unit pointing direction) of a bevel label's arrow
+    glyph, or None. The glyph is the first or last character; it points
+    along the reading direction for the right arrow, against it for the
+    left."""
+    a = _math.radians(getattr(label, "rotation_deg", 0.0) or 0.0)
+    rx, ry = _math.cos(a), -_math.sin(a)
+    hw = len(label.text) * label.size_mm * fm.GLYPH_ADVANCE_EM / 2
+    t = label.text
+    if t[:1] in (_RIGHT, _LEFT):
+        at, g = (label.x - rx * hw, label.y - ry * hw), t[0]
+    elif t[-1:] in (_RIGHT, _LEFT):
+        at, g = (label.x + rx * hw, label.y + ry * hw), t[-1]
+    else:
+        return None
+    sign = 1.0 if g == _RIGHT else -1.0
+    return at, (rx * sign, ry * sign)
+
+
+def _glyph_count(marks):
+    return sum(1 for l in marks.labels
+               if l.kind == 'angle' and _glyph_arrow(l) is not None)
 
 
 def _boxes_overlap(a, b):
@@ -234,7 +285,9 @@ def test_every_angle_is_written_inside_its_own_piece():
     Updated 2026-11-17: a label now reads "<seam>, 45°" and has a blade-tilt
     arrow between it and the cut line, so the arrows are held to the same
     rule -- all 24 wholly inside one piece -- and must not run into any
-    label's box.
+    label's box. Updated again the same day: the arrow is now a glyph in
+    the label and the label is turned square to its line, so the box is
+    the turned one (`_label_corners`) and there are 0 drawn arrows.
     """
     marks, _ = _marks_of(_seamed_cube(), show_brackets=True)
     outlines = [s for s in marks.strokes if s.kind == 'outline']
@@ -258,10 +311,8 @@ def test_every_angle_is_written_inside_its_own_piece():
                    if _boxes_overlap(boxes[i], boxes[j]))
     # Whole box inside the piece: all four corners, not just the anchor.
     corners_inside = sum(
-        1 for box, own in zip(boxes, owners) if len(own) == 1 and all(
-            _inside(c, outlines[own[0]].points)
-            for c in ((box[0], box[1]), (box[2], box[1]),
-                      (box[2], box[3]), (box[0], box[3]))))
+        1 for l, own in zip(angles, owners) if len(own) == 1 and all(
+            _inside(c, outlines[own[0]].points) for c in _label_corners(l)))
     return {
         "angle_labels": len(angles),
         "per_piece": per_piece,
@@ -274,11 +325,8 @@ def test_every_angle_is_written_inside_its_own_piece():
             "each_piece_has_exactly_4": per_piece == [4] * 6,
             "no_two_labels_overlap": overlaps == 0,
             "every_box_is_wholly_inside_its_piece": corners_inside == 24,
-            "24_arrows_wholly_inside_one_piece":
-                len(arrows) == 24 and arrows_inside == 24,
-            "no_arrow_runs_into_a_label": not any(
-                _boxes_overlap(arrow_box(a), b) for a in arrows
-                for b in boxes),
+            "no_drawn_arrows": len(arrows) == 0 and arrows_inside == 0,
+            "24_glyph_arrows": _glyph_count(marks) == 24,
         },
     }
 
@@ -767,8 +815,8 @@ def test_relief_cuts_follow_the_relief_cuts_toggle():
             "relief_strokes": sum(1 for st in marks.strokes
                                   if st.kind == 'relief'),
             "relief_fills": sum(1 for f in marks.fills if f.kind == 'relief'),
-            "arrows": sum(1 for st in marks.strokes
-                          if st.kind == 'bevel_arrow'),
+            # Glyph arrows in the labels since 2026-11-17.
+            "arrows": _glyph_count(marks),
         }
     out = dict(rows)
     out["checks"] = {
@@ -901,33 +949,33 @@ def _sheet_ulp(marks):
 
 
 def _arrow_report(marks):
-    """Each arrow: its owner piece, and whether it points into it.
+    """Each blade arrow: its owner piece, and whether it points into it.
 
-    Into the piece means the tip is further from the cut line than the
-    tail -- the arrow heads away from the line. Out of it: closer, so it
-    points at the line and through it. Every point of the arrow must be
-    inside one piece, or it has no owner. Also how square it is to the
-    nearest outline edge (|cos|).
+    Since 2026-11-17 the arrow is a glyph at the line end of a turned bevel
+    label (`_glyph_arrow`), no longer a drawn stroke. Into the piece means
+    a step from the glyph along its pointing direction moves away from the
+    cut line; out of it, towards it. The owner is the one outline holding
+    the label's centre.
     """
     outlines = [s for s in marks.strokes if s.kind == 'outline']
-    arrows = [s for s in marks.strokes if s.kind == 'bevel_arrow']
     rows = []
-    for a in arrows:
-        own = _owners(a.points, outlines)
+    for l in marks.labels:
+        if l.kind != 'angle':
+            continue
+        g = _glyph_arrow(l)
+        if g is None:
+            continue
+        own = _owners([(l.x, l.y)], outlines)
         if len(own) != 1:
             rows.append({"owner": None})
             continue
         ring = outlines[own[0]].points
-        tail, tip = a.points[0], a.points[1]
-        d_tail, d_tip = _dist_to_ring(tail, ring), _dist_to_ring(tip, ring)
-        mid = ((tail[0] + tip[0]) / 2, (tail[1] + tip[1]) / 2)
-        ea, eb = min(_ring_edges(ring), key=lambda e: _seg_dist(mid, *e))
-        ex, ey = eb[0] - ea[0], eb[1] - ea[1]
-        ax, ay = tip[0] - tail[0], tip[1] - tail[1]
-        dot = abs(ex * ax + ey * ay) / (_math.hypot(ex, ey)
-                                       * _math.hypot(ax, ay))
-        rows.append({"owner": own[0], "inward": d_tip > d_tail,
-                     "outward": d_tip < d_tail, "dot": dot})
+        at, (dx, dy) = g
+        step = l.size_mm * 0.1
+        ahead = (at[0] + dx * step, at[1] + dy * step)
+        d_at, d_ahead = _dist_to_ring(at, ring), _dist_to_ring(ahead, ring)
+        rows.append({"owner": own[0], "inward": d_ahead > d_at,
+                     "outward": d_ahead < d_at})
     return rows
 
 
@@ -1076,7 +1124,8 @@ def _parse(text):
     (None, '<deg>'). The comma is asserted where it matters, not
     stripped silently: see the cube's label check."""
     n = deg = None
-    for part in text.replace(",", " ").split():
+    # The arrow glyph (2026-11-17) is not part of the reading.
+    for part in _body(text).replace(",", " ").split():
         if part.endswith("\u00b0"):
             deg = part[:-1]
         else:
@@ -1124,7 +1173,7 @@ def test_cube_seams_are_numbered_once_and_shared_by_both_pieces():
             # "<n>, 45°": the comma is the maker's, so "4 3°" is not
             # read as "43°" (2026-11-17).
             "twenty_four_labels_reading_n_comma_45": len(angles) == 24
-            and all(l.text == "%d, 45\u00b0" % n
+            and all(_body(l.text) == "%d, 45\u00b0" % n
                     for l, (n, deg) in zip(angles, parsed) if n is not None)
             and all(n is not None for n, _d in parsed),
             "twenty_four_arrows_all_into_their_piece": counts == {
@@ -1181,14 +1230,15 @@ def test_a_straight_cut_gets_a_number_and_no_arrow():
     """
     flat = _bevel_marks_of(_flat_pair())
     flat_labels = sorted(l.text for l in flat.labels if l.kind == 'angle')
-    flat_arrows = sum(1 for s in flat.strokes if s.kind == 'bevel_arrow')
+    flat_arrows = _glyph_count(flat)
     cube = _seamed_cube()
     steep = _bevel_marks_of(cube, min_angle=91.0)
     steep_labels = [l.text for l in steep.labels if l.kind == 'angle']
-    steep_arrows = sum(1 for s in steep.strokes if s.kind == 'bevel_arrow')
+    steep_arrows = _glyph_count(steep)
     plain = _bevel_marks_of(cube, show_seam_numbers=False)
-    plain_labels = [l.text for l in plain.labels if l.kind == 'angle']
-    plain_arrows = sum(1 for s in plain.strokes if s.kind == 'bevel_arrow')
+    # The glyph is part of the text since 2026-11-17; "45°" is its body.
+    plain_labels = [_body(l.text) for l in plain.labels if l.kind == 'angle']
+    plain_arrows = _glyph_count(plain)
     return {
         "flat_labels": flat_labels, "flat_arrows": flat_arrows,
         "min_angle_91_labels": sorted(set(steep_labels)),
@@ -1268,31 +1318,125 @@ def test_a_cut_run_can_span_two_seams():
     The gore sphere, by contrast: every seam runs pole to pole and every
     run ends at a pole or part way along one seam, so none spans two.
 
-    What the label then says: the seam its midpoint lies on
-    (foam_marks._run_midpoint_frame). So on the split-top cube the other
-    seam's number appears on its top piece only, never on the side it
-    glues to -- 2 numbers written once instead of twice. Pinned here so
-    that changing it shows up as a change.
+    What the label then says. Until 2026-11-17 it was one label per run,
+    with the seam its midpoint lies on, so on the split-top cube 2 seam
+    numbers were written on one piece only (seams 4 and 13 in that
+    numbering) -- the old assertion here was `len(singles) == 2`. The
+    maker: "if a run can cover two seams on a long piece then the run
+    should have 2 numbers on the longer seam to remove ambiguity." So now
+    (2026-11-17), the property the maker wants:
+
+      * every seam number appears on exactly 2 labels, on 2 different
+        pieces, and those are the two pieces either side of that seam
+        (read from the mesh, `_seam_table`);
+      * each spanning run carries exactly 2 labels -- found as two labels
+        on one piece whose run portions meet end to start;
+      * each of those labels lies within its own seam's portion: its
+        arrow's near end is the arrow gap (0.3 em) from its own portion
+        and further than that from the other portion; and its portion's
+        share of the run matches its seam's share of the 3D edge (the top
+        edge is split 0.3 / 0.7, so the shares are 0.3 and 0.7 -- the
+        unwrap of one flat quad is a similarity, so the ratio survives).
     """
     gore = _run_spans(_gore_sphere())
     split = _split_top_cube()
     split_spans = _run_spans(split)
     marks = _bevel_marks_of(split)
-    numbers = [_parse(l.text)[0] for l in marks.labels if l.kind == 'angle']
-    singles = sorted(n for n in set(numbers) if numbers.count(n) == 1)
+    table = _seam_table(split)
+    angles = [l for l in marks.labels if l.kind == 'angle']
+    numbers = [_parse(l.text)[0] for l in angles]
+
+    by_number = {}
+    for l, n in zip(angles, numbers):
+        by_number.setdefault(n, []).append(l.anchor.piece
+                                           if l.anchor else None)
+    on_both_pieces = bool(by_number) and all(
+        n is not None and len(pieces) == 2 and len(set(pieces)) == 2
+        and frozenset(pieces) == table.get(n, (None,))[0]
+        for n, pieces in by_number.items())
+
+    def length(pts):
+        return sum(_math.hypot(b[0] - a[0], b[1] - a[1])
+                   for a, b in zip(pts, pts[1:]))
+
+    def dist_to(p, pts):
+        return min(_seg_dist(p, a, b) for a, b in zip(pts, pts[1:]))
+
+    def seam_len(n):
+        coords = table[n][1]
+        return max(_math.dist(a, b) for a in coords for b in coords)
+
+    def straight_on(a, b):
+        # a's last segment and b's first point the same way: one straight
+        # line through the joint. Consecutive *runs* on a piece meet at a
+        # corner (90 degrees on a cube) and are not one run's portions.
+        (p, q), (r, t) = a[-2:], b[:2]
+        u, v = (q[0] - p[0], q[1] - p[1]), (t[0] - r[0], t[1] - r[1])
+        cross = u[0] * v[1] - u[1] * v[0]
+        dot = u[0] * v[0] + u[1] * v[1]
+        return dot > 0 and abs(cross) <= 1e-3 * _math.hypot(*u) * _math.hypot(*v)
+
+    # Pairs of labels on one piece whose portions continue each other in a
+    # straight line, end to start: the two halves of one spanning run.
+    pairs = []
+    for i, a in enumerate(angles):
+        for j, b in enumerate(angles):
+            if (i != j and a.anchor and b.anchor
+                    and a.anchor.piece == b.anchor.piece
+                    and _math.dist(a.anchor.run[-1], b.anchor.run[0]) < 1e-6
+                    and straight_on(a.anchor.run, b.anchor.run)):
+                pairs.append((i, j))
+    spanning_pieces = sorted(angles[i].anchor.piece for i, _j in pairs)
+
+    within = []
+    for i, j in pairs:
+        for me, other in ((i, j), (j, i)):
+            lab, oth = angles[me], angles[other]
+            # The glyph end of the label: 0.3 em (the arrow gap) inside
+            # its line, at the middle of its own portion (2026-11-17: the
+            # drawn arrow's near end used to be measured here).
+            glyph = _glyph_arrow(lab)
+            gap = lab.size_mm * fm.BEVEL_ARROW_GAP_EM
+            if glyph is None:
+                within.append(None)
+                continue
+            near = glyph[0]
+            d_own = dist_to(near, lab.anchor.run)
+            d_other = dist_to(near, oth.anchor.run)
+            share = length(lab.anchor.run) / (length(lab.anchor.run)
+                                              + length(oth.anchor.run))
+            n_me, n_other = numbers[me], numbers[other]
+            want = seam_len(n_me) / (seam_len(n_me) + seam_len(n_other))
+            within.append({
+                "seam": n_me, "d_own": round(d_own, 4),
+                "d_other": round(d_other, 4), "gap": round(gap, 4),
+                "share": round(share, 4), "want_share": round(want, 4),
+                "ok": abs(d_own - gap) < 1e-3 * max(gap, 1.0)
+                and d_other > gap * 2 and abs(share - want) < 0.02})
     return {
         "gore_runs": len(gore),
         "gore_max_span": max(gore) if gore else None,
         "split_runs": len(split_spans),
         "split_spans": sorted(split_spans),
-        "split_seams": len(set(numbers)),
-        "split_numbers_written_once": singles,
+        "split_seams": len(by_number),
+        "labels": len(angles),
+        "spanning_pairs": len(pairs),
+        "spanning_pieces": spanning_pieces,
+        "within": within,
         "checks": {
             "gore_has_runs": len(gore) > 0,
             "gore_no_run_spans_two": bool(gore) and max(gore) == 1,
             "split_exactly_two_runs_span_two":
                 sorted(split_spans).count(2) == 2 and max(split_spans) == 2,
-            "split_two_numbers_written_once": len(singles) == 2,
+            "mesh_seams_all_labelled":
+                sorted(by_number) == sorted(table),
+            "every_number_on_its_two_pieces": on_both_pieces,
+            # One (end, start) pair per spanning run -- a pair is only
+            # found in run order -- so 2 runs -> 2 pairs on 2 pieces.
+            "two_spanning_runs_with_two_labels_each":
+                len(pairs) == 2 and len(set(spanning_pieces)) == 2,
+            "each_label_within_its_own_portion":
+                len(within) == 4 and all(w and w["ok"] for w in within),
         },
     }
 

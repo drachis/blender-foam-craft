@@ -446,16 +446,21 @@ def _bevel_measure(obj, **overrides):
             return (p.x, p.y)
 
         screen_labels = [mm(m.u, m.v) + (m.text,) for m in cached]
-        screen_arrows = [sum((mm(u, v) for u, v in m.arrow), ())
-                         for m in cached if m.arrow]
+        # The blade arrow is a glyph in the label since 2026-11-17 (the
+        # drawn 'bevel_arrow' stroke is retired), so "arrows" now compares
+        # every glyph-bearing label's place and turn, screen against paper.
+        glyphs = ("\u2192", "\u2190")
+        screen_arrows = [mm(m.u, m.v) + (m.rotation_deg,) for m in cached
+                         if any(g in m.text for g in glyphs)]
         screen_ends = [mm(u0, v0) + mm(u1, v1)
                        for u0, v0, u1, v1 in cached_ends]
         marks = fm.build_marks(bm, uv_layer, s, scale_length,
                                obj.matrix_world)
         paper_labels = [(l.x, l.y, l.text) for l in marks.labels
                         if l.kind in ('angle', 'heat')]
-        paper_arrows = [sum(st.points, ()) for st in marks.strokes
-                        if st.kind == 'bevel_arrow']
+        paper_arrows = [(l.x, l.y, l.rotation_deg) for l in marks.labels
+                        if l.kind == 'angle'
+                        and any(g in l.text for g in glyphs)]
         paper_ends = [st.points[0] + st.points[-1] for st in marks.strokes
                       if st.kind == 'bracket']
         plain = all(
@@ -511,7 +516,9 @@ def test_cube_bevel_labels_match_the_sheet():
     """Cube: 24 labels "<n>, 45\u00b0" and 24 arrows on screen, exactly where and
     as the sheet prints them, and no run-end mark at all -- every run end
     on a cube is a corner, where the maker wants nothing drawn. (The screen
-    used to draw a T-bar at both ends of every run's bracket.)"""
+    used to draw a T-bar at both ends of every run's bracket.) Since
+    2026-11-17 the 24 arrows are the glyphs in the 24 turned labels, and
+    the screen's turn must equal the sheet's."""
     report = _bevel_parity(_seamed_cube, want_ends=False)
     report["checks"]["twenty_four_of_each"] = \
         report["labels"]["screen"] == 24 and report["arrows"]["screen"] == 24
