@@ -1038,8 +1038,10 @@ def test_a_letter_page_file_is_2550_by_3300_at_300_dpi():
     checks = {
         "whole_sheet_still_written": os.path.exists(path),
         "two_pages": len(files) == 2,
+        # Chess-board names, row 1 at the top (2026-11-17; was
+        # sheet_pages_p01_r1c1.png before pages were labelled).
         "names": [os.path.basename(f) for f in files]
-        == ["sheet_pages_p01_r1c1.png", "sheet_pages_p02_r1c2.png"],
+        == ["sheet_pages_A1.png", "sheet_pages_B1.png"],
     }
     dark = lambda a: a.astype(np.int32).sum(axis=-1) < 128 * 3
     rows = _load(files[0])
@@ -1051,8 +1053,15 @@ def test_a_letter_page_file_is_2550_by_3300_at_300_dpi():
         dark(rows[m, m:m + 59]).all()) and not dark(rows[m, m + 70:m + 90]).any()
     checks["vertical_tick_runs_5mm"] = bool(
         dark(rows[m:m + 59, m]).all()) and not dark(rows[m + 70:m + 90, m]).any()
-    checks["nothing_in_the_margin_outside_the_tick"] = not dark(
-        rows[:m, :]).any() and not dark(rows[:, :m]).any()
+    # Since pages carry labels (2026-11-17) the margins are not blank: A1
+    # prints its name at the top-left, so the top margin is clear only past
+    # 15 mm (177 px); A1 has no left neighbour, so its left margin is clear.
+    top_ink, left_ink = dark(rows[:m, m + 177:]), dark(rows[:, :m])
+    out["margin_ink_top_left"] = [
+        _ink_box(top_ink) if top_ink.any() else None,
+        _ink_box(left_ink) if left_ink.any() else None]
+    checks["nothing_in_the_margin_outside_the_tick"] = not top_ink.any() \
+        and not left_ink.any()
     checks["bottom_right_tick"] = bool(dark(rows[3300 - m - 1, 2550 - m - 59:2550 - m]).all())
     if fr.oiio is not None:
         for f in files:
@@ -1100,6 +1109,15 @@ def test_a_red_mark_lands_on_the_pages_that_contain_it():
            "page1_red_px": int(r1.sum()), "page2_red_px": int(r2.sum())}
     expect1 = sheet_red[0:3000, 0:2400]
     expect2 = sheet_red[0:3000, x0b:3000]
+    # Page B1 draws the dashed inner edge of its overlap band at sheet
+    # x = 2400 (page x = 75 + 118 = 193), 0.25 mm = 3 px wide, over square
+    # A's last pixel column. Grey is not red, so those columns are left out
+    # of the comparison on both sides; everything else must match exactly.
+    keep = np.ones_like(r2)
+    keep[:, m + 118 - 3:m + 118 + 4] = False
+    r2 = r2 & keep
+    expect2 = expect2.copy()
+    expect2[:, 118 - 3:118 + 4] = False
     checks = {
         "sheet_has_both_squares": int(sheet_red.sum()) > 2 * 90 * 90 // 2,
         "page1_has_exactly_the_cropped_red":
@@ -1113,6 +1131,345 @@ def test_a_red_mark_lands_on_the_pages_that_contain_it():
         "square_a_on_both": bool(r1.any() and r2.any()),
         "page_1_red_ends_at_the_crop_edge": int(np.nonzero(r1)[1].max()) == m + 2397,
     }
+    out["checks"] = checks
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Page labels, joins and registration targets (2026-11-17)
+#
+# The maker: "the page split needs page numbers or reg marks to indicate how
+# it aligns", then "use the edge label system on the margin / paper edges",
+# "no arrow just #", and "like a chess board A1, B2, C3 being a diagonal".
+#
+# The fixture: a 500 x 650 mm sheet at 150 dpi is 2953 x 3839 px. Letter at
+# 150 dpi is 1275 x 1650 px, margin round(37.5) = 38, overlap
+# round(59.06) = 59, so the printable area is 1199 x 1574 and a page advances
+# 1140 / 1515. Columns: ceil((2953 - 1199) / 1140) + 1 = 3; rows:
+# ceil((3839 - 1574) / 1515) + 1 = 3. A 3 x 3 grid has 2 x 3 + 3 x 2 = 12
+# shared edges.
+
+PAGE_DPI = 150
+PAGE_M = 38
+PX_PER_MM_150 = 150 / 25.4
+
+
+def _three_by_three():
+    return fr.page_grid(2953, 3839, PAGE_DPI)
+
+
+def _target_mask(page, bare, x0, y0, x1, y1):
+    """Pixels the page decorations changed that are target grey, inside the
+    printable window [x0, x1) x [y0, y1) (the margins hold black labels).
+
+    `bare` is the same page without decorations (`fr.compose_page`), so
+    "darkened" separates the decorations from the pattern under them --
+    whose black lines have grey anti-aliased edges of their own. Target
+    grey: neutral (channels within 6) and no lighter than 175, which a fully
+    covered 0.5 target pixel (128) is and the 0.8 band line (204) is not.
+    """
+    p, q = page.astype(np.int32), bare.astype(np.int32)
+    # DARKENED, not merely changed: the light band line crossing a black
+    # outline lifts it to a neutral grey too, and that is not a target.
+    darker = (q - p).max(axis=2) > 8
+    neutral = (p.max(axis=2) - p.min(axis=2)) <= 6
+    mask = darker & neutral & (p.max(axis=2) <= 175)
+    keep = np.zeros_like(mask)
+    keep[y0:y1, x0:x1] = True
+    return mask & keep
+
+
+def test_page_names_and_joins_are_arithmetic():
+    """Names, join numbers and target positions for the 3 x 3 grid, from
+    `page_marks` alone -- no drawing.
+
+      names    A1 B1 C1 / A2 B2 C2 / A3 B3 C3 in reading order: column
+               letter, row number, row 1 at the top. Unique.
+      joins    12 = shared edges; numbered 1..12, each printed exactly
+               twice (once on each page that shares it), as a plain number
+               -- no glyph, no comma, no degrees.
+      per page centre B2 has 4 joins, corner A1 has 2, edge B1 has 3.
+      turned   a join on a left/right edge reads across it (rotation 0), one
+               on a top/bottom edge is turned 90 -- bevel_label_frame's
+               square-to-the-line rule, never upside down.
+      margin   each join label sits in the margin on its edge's side.
+      targets  2 per join on each of its two pages, 4 x 12 = 48 drawn; the
+               two pages' copies map back to the SAME sheet pixel (page
+               px - margin + crop origin) within 1 px; and that sheet point
+               lies inside both crops and inside the overlap band.
+    """
+    grid = _three_by_three()
+    out, checks = {}, {}
+    checks["grid_is_3_by_3"] = len(grid) == 9 and \
+        max(g[0] for g in grid) == 2 and max(g[1] for g in grid) == 2
+    names = [fr.page_name(g[0], g[1]) for g in grid]
+    out["names"] = names
+    checks["chess_names_row_1_on_top"] = names == [
+        "A1", "B1", "C1", "A2", "B2", "C2", "A3", "B3", "C3"]
+    checks["names_unique"] = len(set(names)) == 9
+    checks["letters_carry_on_past_z"] = fr.page_name(0, 25) == "Z1" \
+        and fr.page_name(4, 26) == "AA5"
+    joins = fr.page_joins(grid)
+    out["joins"] = [(n, names[a], names[b], ax) for n, a, b, ax in joins]
+    checks["twelve_joins_numbered_1_to_12"] = \
+        [j[0] for j in joins] == list(range(1, 13))
+    mm = 25.4 / PAGE_DPI
+    W, H, M = 1275 * mm, 1650 * mm, PAGE_M * mm
+    seen, per_page = {}, {}
+    wrong_side, wrong_turn, bad_text = [], [], []
+    target_sheet = {}       # join number -> {page name: [sheet points]}
+    for i, g in enumerate(grid):
+        marks = fr.page_marks(grid, i, PAGE_DPI, sheet_name="t")
+        jl = [l for l in marks.labels if l.kind == 'page_join']
+        per_page[names[i]] = len(jl)
+        for l in jl:
+            if not l.text.isdigit():
+                bad_text.append(l.text)
+                continue
+            seen.setdefault(int(l.text), []).append(names[i])
+            side = ("left" if l.x < M else "right" if l.x > W - M else
+                    "top" if l.y < M else "bottom" if l.y > H - M else None)
+            if side is None:
+                wrong_side.append((names[i], l.text, l.x, l.y))
+            want = 0.0 if side in ("left", "right") else 90.0
+            if abs(l.rotation_deg - want) > 1e-6:
+                wrong_turn.append((names[i], l.text, side, l.rotation_deg))
+        name_labels = [l.text for l in marks.labels if l.kind == 'page_name']
+        checks["name_printed_twice_on_" + names[i]] = \
+            name_labels == [names[i], names[i]]
+        # The grid's size in the squares' own terms: last square is C3.
+        info = [l.text for l in marks.labels if l.kind == 'page_info']
+        checks["info_line_on_" + names[i]] = \
+            info == ["t  page %s of A1-C3" % names[i]]
+        # Target centres: a circle's points average to its centre.
+        circles = [s for s in marks.strokes
+                   if s.kind == 'page_target' and s.closed]
+        nums = [l for l in marks.labels if l.kind == 'page_target']
+        x0, y0 = g[2], g[3]
+        for circ, num in zip(circles, nums):
+            cx = sum(p[0] for p in circ.points) / len(circ.points)
+            cy = sum(p[1] for p in circ.points) / len(circ.points)
+            sheet = (cx / mm - PAGE_M + x0, cy / mm - PAGE_M + y0)
+            target_sheet.setdefault(int(num.text), {}).setdefault(
+                names[i], []).append(sheet)
+    out["joins_per_page"] = per_page
+    checks["centre_B2_has_4_corner_A1_2_edge_B1_3"] = \
+        per_page["B2"] == 4 and per_page["A1"] == 2 and per_page["B1"] == 3
+    checks["every_join_printed_exactly_twice"] = sorted(seen) == list(
+        range(1, 13)) and all(len(v) == 2 for v in seen.values())
+    checks["each_join_on_the_two_pages_that_share_it"] = all(
+        sorted(seen.get(n, [])) == sorted([names[a], names[b]])
+        for n, a, b, _ax in joins)
+    checks["plain_numbers_only"] = bad_text == []
+    checks["join_labels_in_their_margin"] = wrong_side == []
+    checks["square_to_the_edge"] = wrong_turn == []
+    out["wrong"] = {"side": wrong_side, "turn": wrong_turn, "text": bad_text}
+    total = sum(len(p) for t in target_sheet.values() for p in t.values())
+    checks["48_targets_drawn"] = total == 48
+    agree, inside, worst = True, True, 0.0
+    for n, a, b, axis in joins:
+        pages = target_sheet.get(n, {})
+        if sorted(pages) != sorted([names[a], names[b]]) or any(
+                len(v) != 2 for v in pages.values()):
+            agree = False
+            continue
+        ga, gb = grid[a], grid[b]
+        for (ax_, ay_), (bx_, by_) in zip(pages[names[a]], pages[names[b]]):
+            worst = max(worst, abs(ax_ - bx_), abs(ay_ - by_))
+            for gg in (ga, gb):
+                inside = inside and gg[2] <= ax_ < gg[4] \
+                    and gg[3] <= ay_ < gg[5]
+            if axis == 'H':
+                inside = inside and gb[2] <= ax_ < ga[4]
+            else:
+                inside = inside and gb[3] <= ay_ < ga[5]
+    out["worst_target_disagreement_px"] = worst
+    checks["two_targets_per_join_per_page"] = agree
+    checks["both_copies_on_the_same_sheet_pixel_within_1px"] = agree \
+        and worst <= 1.0
+    checks["targets_inside_both_crops_and_the_band"] = inside
+    out["checks"] = checks
+    return out
+
+
+@_needs_gpu
+def test_page_decorations_in_the_files():
+    """The 3 x 3 sheet written through `render_marks`, read back from the
+    files.
+
+      files    sheet3_A1.png .. sheet3_C3.png, reading order.
+      targets  on each page that shares a join, target-grey ink centred on
+               the expected page pixel within 1 px (centroid in a window
+               just wider than the cross, which the cross and circle fill
+               symmetrically); the two pages' centroids map back to the same
+               sheet pixel within 1 px. The ink is GREY, not black and not
+               white: its median value is 100..165 (0.5 grey is 128).
+      only own every target-grey pixel the decorations added inside the
+               printable area is within 9 mm of one of that page's own
+               targets (cross, circle and number) -- so no page carries
+               another join's target.
+      labels   ink in the margin at each join label and each page name.
+      turned   join 10 (C2|C3, bottom edge of C2) is taller than wide; join
+               12 (B3|C3, right edge of B3) is wider than tall.
+      sheet    the whole-sheet file is pixel for pixel the pattern drawn
+               alone: no decorations reach it.
+    """
+    pale = fm.Fill('piece', (_rect(20, 20, 480, 630),), (0.85, 0.9, 1.0))
+    outline = fm.Stroke('outline', _rect(20, 20, 480, 630), True, 0.5, BLACK)
+    marks = _marks(500, 650, fills=[pale], strokes=[outline])
+    path = _path("sheet3.png")
+    info = fr.render_marks(marks, path, dpi=PAGE_DPI, pages='LETTER')
+    files = info["page_files"]
+    grid = _three_by_three()
+    names = [fr.page_name(g[0], g[1]) for g in grid]
+    out = {"files": [os.path.basename(f) for f in files],
+           "sheet_px": info["pixels"]}
+    checks = {
+        "sheet_is_2953_by_3839": info["pixels"] == [2953, 3839],
+        "nine_files_named_by_square": [os.path.basename(f) for f in files]
+        == ["sheet3_%s.png" % n for n in names],
+    }
+    sheet = _load(path)
+    alone = fr._draw_marks(marks, 2953, 3839, (1.0, 1.0, 1.0, 1.0))
+    checks["whole_sheet_is_the_pattern_alone"] = \
+        sheet.shape == alone.shape and bool((sheet == alone).all())
+    pages = [_load(f) for f in files]
+    marked = []
+    for i, g in enumerate(grid):
+        bare = fr.compose_page(sheet, g, PAGE_DPI)
+        marked.append(_target_mask(pages[i], bare, PAGE_M, PAGE_M,
+                                  PAGE_M + g[4] - g[2], PAGE_M + g[5] - g[3]))
+    tones = []
+    px = PX_PER_MM_150
+    win = int(round((fr.PAGE_TARGET_ARM_MM + 0.3) * px))
+    reach = int(round(9.0 * px))
+    centroid_err, map_err, found = 0.0, 0.0, True
+    own = {i: [] for i in range(9)}
+    for join in fr.page_joins(grid):
+        _n, a, b, _axis = join
+        for sx, sy in fr.join_targets(grid, join):
+            back = []
+            for i in (a, b):
+                g = grid[i]
+                ex, ey = PAGE_M + sx - g[2], PAGE_M + sy - g[3]
+                own[i].append((ex, ey))
+                x0, y0 = int(round(ex)) - win, int(round(ey)) - win
+                box = marked[i][y0:y0 + 2 * win + 1, x0:x0 + 2 * win + 1]
+                ys, xs = np.nonzero(box)
+                if len(xs) < 20:
+                    found = False
+                    continue
+                tones.append(float(np.median(pages[i][y0 + ys, x0 + xs])))
+                # Pixel centres are at +0.5 on the grid the expected point
+                # is a coordinate of.
+                cx, cy = x0 + xs.mean() + 0.5, y0 + ys.mean() + 0.5
+                centroid_err = max(centroid_err, abs(cx - ex), abs(cy - ey))
+                back.append((cx - PAGE_M + g[2], cy - PAGE_M + g[3]))
+            if len(back) == 2:
+                map_err = max(map_err, abs(back[0][0] - back[1][0]),
+                              abs(back[0][1] - back[1][1]))
+    out["target_centroid_err_px"] = round(centroid_err, 3)
+    out["target_pair_disagreement_px"] = round(map_err, 3)
+    out["target_median_tone_range"] = [min(tones), max(tones)] if tones \
+        else None
+    checks["every_target_has_ink"] = found
+    checks["target_ink_is_grey_not_black_or_white"] = bool(tones) and \
+        all(100 <= t <= 165 for t in tones)
+    checks["target_on_its_expected_pixel_within_1px"] = found and \
+        centroid_err <= 1.0
+    checks["pair_on_the_same_sheet_pixel_within_1px"] = found and \
+        map_err <= 1.0
+    strays = {}
+    for i in range(9):
+        ys, xs = np.nonzero(marked[i])
+        near = np.zeros(len(xs), dtype=bool)
+        for ex, ey in own[i]:
+            near |= (np.abs(xs - ex) <= reach) & (np.abs(ys - ey) <= reach)
+        strays[names[i]] = int((~near).sum())
+    out["target_grey_far_from_own_targets"] = strays
+    checks["no_target_grey_except_at_own_targets"] = all(
+        v == 0 for v in strays.values())
+    checks["corner_A1_has_4_targets_centre_B2_8"] = len(own[0]) == 4 \
+        and len(own[4]) == 8
+    # Labels: ink around each margin label, found from the Labels.
+    missing, boxes = [], {}
+    for i in range(9):
+        lm = fr.page_marks(grid, i, PAGE_DPI, sheet_name="sheet3")
+        ink = _ink(pages[i])
+        for l in lm.labels:
+            if l.kind not in ('page_join', 'page_name'):
+                continue
+            x, y = int(round(l.x * px)), int(round(l.y * px))
+            r = int(round(3.0 * px))
+            sub = ink[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1]
+            if int(sub.sum()) < 10:
+                missing.append((names[i], l.kind, l.text))
+            if l.kind == 'page_join':
+                ys, xs = np.nonzero(sub)
+                if len(xs):
+                    boxes[(names[i], l.text)] = (int(xs.max() - xs.min() + 1),
+                                                 int(ys.max() - ys.min() + 1))
+    out["labels_without_ink"] = missing
+    checks["every_join_and_name_label_has_ink"] = missing == []
+    tall = boxes.get(("C2", "10"))
+    wide = boxes.get(("B3", "12"))
+    out["join_10_on_C2_wh"], out["join_12_on_B3_wh"] = tall, wide
+    checks["bottom_edge_join_is_turned"] = bool(tall) and tall[1] > tall[0]
+    checks["right_edge_join_reads_across"] = bool(wide) and wide[0] > wide[1]
+    keep = shot.next_path("pages_3x3_B2_centre")
+    import shutil
+    shutil.copyfile(files[4], keep)
+    out["looked_at"] = keep
+    out["checks"] = checks
+    return out
+
+
+@_needs_gpu
+def test_page_layer_composites_like_drawing_it_in_place():
+    """The decorations are drawn on a transparent layer and laid over the
+    page in numpy (`_composite`, which assumes Blender's 'ALPHA' blend leaves
+    premultiplied colour, and coverage in alpha). The reference is the same
+    page drawn in ONE GPU pass -- a red fill where the tile is, then the
+    decorations -- so the blending is the GPU's own.
+
+    Sheet 300 x 200 mm all red at 100 dpi: 1181 x 787 px; Letter at 100 dpi
+    is 850 x 1100, margin 25, overlap 39, printable 800 x 1050, so two
+    columns, one row, one join. Every pixel agrees within 3 levels except
+    the four corner-tick squares (drawn in numpy, in neither layer).
+    """
+    red = fm.Fill('piece', (_rect(0, 0, 300, 200),), RED)
+    marks = _marks(300, 200, fills=[red])
+    path = _path("redpages_composite.png")
+    info = fr.render_marks(marks, path, dpi=100, pages='LETTER')
+    grid = fr.page_grid(info["pixels"][0], info["pixels"][1], 100)
+    out = {"pixels": info["pixels"], "pages": len(info["page_files"])}
+    checks = {"two_pages": len(grid) == 2 and len(info["page_files"]) == 2}
+    worst, aa = 0, 0
+    mm = 25.4 / 100
+    for i, f in enumerate(info["page_files"]):
+        page = _load(f).astype(np.int32)
+        deco = fr.page_marks(grid, i, 100, sheet_name="redpages_composite")
+        x0, y0, x1, y1 = grid[i][2:]
+        tile = fm.Fill('piece', (_rect(25 * mm, 25 * mm, (25 + x1 - x0) * mm,
+                                       (25 + y1 - y0) * mm),), RED)
+        ref_marks = fm.Marks(deco.width_mm, deco.height_mm, (tile,),
+                             deco.strokes, deco.labels)
+        ref = fr._draw_marks(ref_marks, 850, 1100,
+                             (1.0, 1.0, 1.0, 1.0)).astype(np.int32)
+        diff = np.abs(page - ref).max(axis=2)
+        for cx in (25, 825):
+            for cy in (25, 1075):
+                diff[cy - 25:cy + 25, cx - 25:cx + 25] = 0
+        worst = max(worst, int(diff.max()))
+        # Edge pixels: grey partly covering red, neither colour -- the
+        # place a wrong alpha rule would show. (Full grey has r == g.)
+        aa += int(((page[..., 0] < 250) & (page[..., 0] > page[..., 1] + 20)
+                   & (page[..., 1] > 20)
+                   & (np.abs(page[..., 1] - page[..., 2]) <= 3)).sum())
+    out["worst_level_difference"] = worst
+    out["partly_covered_pixels"] = aa
+    checks["composite_matches_one_pass_within_3"] = worst <= 3
+    checks["there_are_blended_edge_pixels_to_compare"] = aa > 50
     out["checks"] = checks
     return out
 
@@ -1180,8 +1537,9 @@ def test_snapshot_heads_as_letter_pages():
     status = bpy.ops.foamcraft_drachis.export_pattern_image(
         filepath=path, file_format='PNG', resolution_mode='DPI', dpi=150,
         pages='LETTER')
+    import re
     pages = sorted(f for f in os.listdir(_TMP)
-                   if f.startswith("heads_p") and f.endswith(".png"))
+                   if re.fullmatch(r"heads_[A-Z]+\d+\.png", f))
     full = _load(path) if os.path.exists(path) else None
     out = {"status": sorted(status), "pages": pages,
            "sheet_px": list(full.shape[:2][::-1]) if full is not None else None}
@@ -1193,11 +1551,20 @@ def test_snapshot_heads_as_letter_pages():
         checks["page_is_1275_by_1650"] = first.shape == (1650, 1275, 3)
         out["first_page_ink_px"] = int(_ink(first).sum())
         checks["first_page_has_ink"] = out["first_page_ink_px"] > 100
-        # Left where it can be looked at.
-        keep = shot.next_path("pattern_page_p01")
+        checks["page_count_is_still_42"] = len(pages) == 42
+        rows_n = max(g[0] for g in grid) + 1
+        cols_n = max(g[1] for g in grid) + 1
+        out["grid_cols_rows"] = [cols_n, rows_n]
+        checks["names_are_the_grids_squares"] = sorted(pages) == sorted(
+            "heads_%s.png" % fr.page_name(g[0], g[1]) for g in grid)
+        # Left where they can be looked at: A1 and the middle square.
         import shutil
-        shutil.copyfile(os.path.join(_TMP, pages[0]), keep)
-        out["looked_at"] = keep
+        centre = fr.page_name(rows_n // 2, cols_n // 2)
+        out["looked_at"] = []
+        for label in ("A1", centre):
+            keep = shot.next_path("pattern_page_%s" % label)
+            shutil.copyfile(os.path.join(_TMP, "heads_%s.png" % label), keep)
+            out["looked_at"].append(keep)
     out["checks"] = checks
     return out
 
@@ -1225,6 +1592,9 @@ TESTS = (
     test_page_grid_is_arithmetic,
     test_a_letter_page_file_is_2550_by_3300_at_300_dpi,
     test_a_red_mark_lands_on_the_pages_that_contain_it,
+    test_page_names_and_joins_are_arithmetic,
+    test_page_decorations_in_the_files,
+    test_page_layer_composites_like_drawing_it_in_place,
     test_snapshot_heads_as_letter_pages,
 )
 

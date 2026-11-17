@@ -79,9 +79,34 @@ cuts the rendered sheet into paper-sized files, 1:1, at the same dpi. This is
 deliberately light: the pieces are not re-packed, the sheet is simply cropped.
 The arithmetic -- page sizes, a 6.35 mm margin, a 10 mm overlap to tape on --
 is tools/tile_svg.py's, copied here because `tools/` is stripped from releases.
-Each page file is white paper with its tile inside the margins, thin corner
-ticks at the printable area's corners, and its place in the grid in the
-FILENAME (`name_p03_r1c3.png`); no text is drawn into the page itself.
+Each page file is white paper with its tile inside the margins and thin
+corner ticks at the printable area's corners.
+
+Pages are labelled the way the pattern is (the maker: "use the edge label
+system on the margin / paper edges so the same idea is used across"):
+
+  * a page is named like a chess board square -- column letter (the pieces'
+    own `foam_marks.piece_letters`, so Z is followed by AA) then row number,
+    row 1 at the TOP because the sheet reads top-down: A1 B1 C1 / A2 B2 C2.
+    The name is printed in the top-left and bottom-right margin corners and
+    is the file's suffix (`name_C1.png`);
+  * every shared page edge is a JOIN with a plain number, printed on both
+    pages at the middle of that edge in the margin, turned square to the
+    paper edge by the bevel labels' own rule (`bevel_label_frame`, never
+    upside down) -- matching numbers go together, as matching seam numbers
+    glue together. No glyph: a join is not a cut and has no blade;
+  * two registration targets per join (circle and cross in mid grey,
+    labelled with the join number) sit on the overlap band's centreline at 1/4 and 3/4 of the
+    shared edge, at the SAME sheet coordinates on both pages, so laying one
+    page over the other and matching targets aligns them;
+  * a dashed light grey line marks the inner edge of each overlap band, as
+    tools/tile_svg.py shades its band.
+
+These are a `foam_marks.Marks` per page (`page_marks`), drawn by the same
+`_draw_*` functions as the pattern -- same font, same turned-label code --
+onto a transparent offscreen of the page's size, and composited over the
+paper and tile in numpy (`_composite`). The whole-sheet file never gets any
+of it.
 """
 
 import os
@@ -125,6 +150,22 @@ PAGE_MARGIN_MM = 6.35
 PAGE_OVERLAP_MM = 10.0
 PAGE_CROP_MM = 5.0
 PAGE_MARK_MM = 0.25
+# tools/tile_svg.py's LABEL_FONT_MM: the most a 6.35 mm margin holds.
+PAGE_FONT_MM = 3.5
+# Printable edge to the near end of a margin label. Small, because the far
+# end must stay clear of the paper edge the printer cannot reach.
+PAGE_LABEL_GAP_MM = 0.4
+# Registration targets: inside the 10 mm band with room to spare.
+PAGE_TARGET_RADIUS_MM = 3.0
+PAGE_TARGET_ARM_MM = 4.5
+PAGE_TARGET_FONT_MM = 2.5
+# Mid grey, because the maker prints in black and white ("just make the
+# reg marks grey tones"): told from black cut lines by tone and by shape
+# (circle and cross), not by hue. The pattern itself draws no grey -- its
+# lines and text are black or coloured and its fills pale tints -- and the
+# band line below is a lighter grey, so this tone is the targets' alone.
+PAGE_TARGET_COLOR = (0.5, 0.5, 0.5)
+PAGE_BAND_COLOR = (0.8, 0.8, 0.8)
 
 _FORMATS = {
     # file_format: (OIIO format name, extensions accepted, extension written)
@@ -335,17 +376,62 @@ def _draw_labels(labels, canvas):
             blf.disable(font, blf.ROTATION)
 
 
-def _read_rows_top_down(fb, width, height):
+def _read_rows_top_down(fb, width, height, alpha=False):
     """The framebuffer as a (height, width, 3) uint8 array, top row first.
 
     `read_color` returns the bottom row first. Alpha is dropped: the sheet is
     opaque white paper, and blending text over an opaque clear can leave
     alpha below one at glyph edges that a viewer would then show as grey.
+    `alpha=True` keeps it, as (height, width, 4), for a layer drawn over a
+    transparent clear (`_composite`).
     """
     pixels = fb.read_color(0, 0, width, height, 4, 0, 'UBYTE')
     pixels.dimensions = width * height * 4
     rows = np.array(pixels, dtype=np.uint8).reshape(height, width, 4)
-    return np.ascontiguousarray(rows[::-1, :, :3])
+    return np.ascontiguousarray(rows[::-1, :, :4 if alpha else 3])
+
+
+def _draw_marks(marks, width_px, height_px, clear, alpha=False):
+    """Draw `marks` into a fresh offscreen of this size; return its rows.
+
+    Fills, then strokes, then labels. The one drawing path: the sheet and
+    every page's decorations both come through here.
+    """
+    canvas = _Canvas(width_px, height_px, marks.width_mm, marks.height_mm)
+    _ensure_gpu()
+    offscreen = gpu.types.GPUOffScreen(width_px, height_px)
+    offscreen.bind()
+    try:
+        fb = gpu.state.active_framebuffer_get()
+        fb.clear(color=clear)
+        gpu.state.blend_set('ALPHA')
+        with gpu.matrix.push_pop(), gpu.matrix.push_pop_projection():
+            gpu.matrix.load_matrix(Matrix.Identity(4))
+            gpu.matrix.load_projection_matrix(canvas.projection())
+            _draw_fills(marks.fills, canvas)
+            _draw_strokes(marks.strokes, canvas)
+            _draw_labels(marks.labels, canvas)
+        gpu.state.blend_set('NONE')
+        return _read_rows_top_down(fb, width_px, height_px, alpha)
+    finally:
+        offscreen.unbind()
+        offscreen.free()
+
+
+def _composite(under, layer):
+    """`layer` (RGBA, drawn over a transparent clear) laid over `under`.
+
+    Blender's 'ALPHA' blend multiplies colour by source alpha and keeps
+    alpha as coverage (src_alpha ONE, dst ONE_MINUS_SRC_ALPHA), so a layer
+    drawn on (0,0,0,0) holds premultiplied colour: over = under*(1-a) + rgb.
+    tests/test_export_raster.py checks this against the same marks drawn
+    straight onto the pattern in one pass.
+    """
+    a = layer[..., 3:4].astype(np.float32) / 255.0
+    if not a.any():
+        return under
+    out = under.astype(np.float32) * (1.0 - a) + layer[..., :3]
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
 
 def _save(filepath, rows, file_format, dpi):
@@ -454,18 +540,171 @@ def compose_page(rows, crop, dpi, page='LETTER', landscape=False,
     return out
 
 
+def page_name(row, col):
+    """A page's chess-board name from its 0-based grid place: column letters
+    (`foam_marks.piece_letters`, Z then AA), then the row, row 1 at the top.
+    page_name(0, 2) == "C1"."""
+    return "%s%d" % (foam_marks.piece_letters(col + 1), row + 1)
+
+
+def page_joins(grid):
+    """Every shared page edge, numbered: [(number, a, b, axis)].
+
+    `a`, `b` index `grid`. axis 'H': b is right of a (a vertical overlap
+    band); 'V': b is below a. Numbered 1.. in the reading order of `a`, its
+    right-hand join before the one below it -- so a page's joins carry
+    neighbouring numbers and the count is the number of shared edges.
+    """
+    at = {(g[0], g[1]): i for i, g in enumerate(grid)}
+    joins = []
+    for i, g in enumerate(grid):
+        for axis, key in (('H', (g[0], g[1] + 1)), ('V', (g[0] + 1, g[1]))):
+            j = at.get(key)
+            if j is not None:
+                joins.append((len(joins) + 1, i, j, axis))
+    return joins
+
+
+def join_targets(grid, join):
+    """Sheet-pixel centres [(x, y), (x, y)] of a join's two registration
+    targets: on the overlap band's centreline, at 1/4 and 3/4 of the shared
+    edge. Both pages draw them here, so they coincide when overlaid."""
+    _n, a, b, axis = join
+    ca, cb = grid[a], grid[b]
+    if axis == 'H':
+        x = 0.5 * (cb[2] + ca[4])
+        return [(x, ca[3] + f * (ca[5] - ca[3])) for f in (0.25, 0.75)]
+    y = 0.5 * (cb[3] + ca[5])
+    return [(ca[2] + f * (ca[4] - ca[2]), y) for f in (0.25, 0.75)]
+
+
+def _circle_mm(cx, cy, r, n=48):
+    return tuple((cx + r * cos(2.0 * 3.141592653589793 * i / n),
+                  cy + r * sin(2.0 * 3.141592653589793 * i / n))
+                 for i in range(n))
+
+
+def page_marks(grid, index, dpi, page='LETTER', landscape=False,
+               sheet_name='', margin_mm=PAGE_MARGIN_MM):
+    """One page's decorations as a `foam_marks.Marks` in page mm, y down.
+
+    Labels: 'page_name' (top-left and bottom-right margin corners),
+    'page_info' (sheet name and grid, bottom-left, dropped when there is
+    no room), 'page_join' (one per shared edge, middle of that edge, in the
+    margin, turned by `bevel_label_frame`), 'page_target' (a target's join
+    number). Strokes: 'page_target' (circle and cross), 'page_band' (dashed
+    inner edge of each overlap band).
+    """
+    r, c, x0, y0, x1, y1 = grid[index]
+    page_w, page_h, margin = page_geometry(dpi, page, landscape, margin_mm)
+    mm = MM_PER_INCH / dpi
+    w_mm, h_mm, m = page_w * mm, page_h * mm, margin * mm
+    cw, ch = (x1 - x0) * mm, (y1 - y0) * mm
+    f, gap = PAGE_FONT_MM, PAGE_LABEL_GAP_MM
+    adv = foam_marks.GLYPH_ADVANCE_EM
+    black = (0.0, 0.0, 0.0)
+    labels, strokes = [], []
+
+    def on_page(sx, sy):
+        return ((margin + sx - x0) * mm, (margin + sy - y0) * mm)
+
+    def margin_label(text, mid, out):
+        # Reads along the edge's normal, as a bevel label reads along its
+        # cut line's: near end `gap` outside the printable edge.
+        rot, _reading, _text = foam_marks.bevel_label_frame(
+            (-out[0], -out[1]), None, text)
+        d = gap + 0.5 * len(text) * f * adv
+        labels.append(foam_marks.Label(
+            'page_join', mid[0] + out[0] * d, mid[1] + out[1] * d, f, text,
+            black, 'middle', rotation_deg=rot))
+
+    name = page_name(r, c)
+    name_w = len(name) * f * adv
+    across = gap + 0.5 * f              # margin label centre, off the edge
+    # In from the corner: the advance estimate is short for a wide capital,
+    # and a name started exactly at the corner put ink in the side margin.
+    inset = 1.0
+    labels.append(foam_marks.Label('page_name', m + inset + 0.5 * name_w,
+                                   m - across, f, name, black))
+    labels.append(foam_marks.Label('page_name',
+                                   w_mm - m - inset - 0.5 * name_w,
+                                   h_mm - m + across, f, name, black))
+    rows = max(g[0] for g in grid) + 1
+    cols = max(g[1] for g in grid) + 1
+    # "heads  page D4 of A1-G6": the range says the grid's size in the
+    # same squares the pages are named by.
+    span = "%s of A1-%s" % (name, page_name(rows - 1, cols - 1))
+    info = "%s  page %s" % (sheet_name, span)
+    room = int((0.5 * cw - 2.0 * f) / (f * adv))
+    if len(info) > room:
+        info = "page " + span
+    if len(info) <= room:
+        labels.append(foam_marks.Label(
+            'page_info', m + inset + 0.5 * len(info) * f * adv,
+            h_mm - m + across,
+            f, info, black))
+
+    for join in page_joins(grid):
+        n, a, b, axis = join
+        if index not in (a, b):
+            continue
+        first = index == a
+        other = grid[b] if first else grid[a]
+        text = str(n)
+        if axis == 'H':
+            edge_x = m + cw if first else m
+            margin_label(text, (edge_x, m + 0.5 * ch), (1.0 if first else -1.0, 0.0))
+            band_x = on_page(other[2] if first else other[4], 0)[0]
+            strokes.append(foam_marks.Stroke(
+                'page_band', ((band_x, m), (band_x, m + ch)), False,
+                PAGE_MARK_MM, PAGE_BAND_COLOR, (2.0, 2.0)))
+        else:
+            edge_y = m + ch if first else m
+            margin_label(text, (m + 0.5 * cw, edge_y), (0.0, 1.0 if first else -1.0))
+            band_y = on_page(0, other[3] if first else other[5])[1]
+            strokes.append(foam_marks.Stroke(
+                'page_band', ((m, band_y), (m + cw, band_y)), False,
+                PAGE_MARK_MM, PAGE_BAND_COLOR, (2.0, 2.0)))
+        for sx, sy in join_targets(grid, join):
+            px, py = on_page(sx, sy)
+            arm, rad = PAGE_TARGET_ARM_MM, PAGE_TARGET_RADIUS_MM
+            for pts, closed in ((_circle_mm(px, py, rad), True),
+                                (((px - arm, py), (px + arm, py)), False),
+                                (((px, py - arm), (px, py + arm)), False)):
+                strokes.append(foam_marks.Stroke(
+                    'page_target', pts, closed, PAGE_MARK_MM,
+                    PAGE_TARGET_COLOR))
+            ft = PAGE_TARGET_FONT_MM
+            if axis == 'H':      # a tall band: the number below the cross
+                lx, ly = px, py + arm + 0.5 + 0.5 * ft
+            else:                # a wide band: beside it
+                lx, ly = px + arm + 0.5 + 0.5 * len(text) * ft * adv, py
+            labels.append(foam_marks.Label('page_target', lx, ly, ft, text,
+                                           PAGE_TARGET_COLOR))
+    return foam_marks.Marks(w_mm, h_mm, (), tuple(strokes), tuple(labels))
+
+
 def write_pages(rows, filepath, file_format, dpi, page='LETTER',
                 landscape=False):
     """Write every page of the sheet next to `filepath`. Returns the paths,
-    named `<stem>_p01_r1c1.<ext>` in reading order."""
+    named `<stem>_<page name>.<ext>` (`heads_C1.png`), in reading order.
+
+    Each page: paper and tile and corner ticks (`compose_page`), then its
+    `page_marks` drawn by the sheet's own renderer onto a transparent layer
+    and laid over it."""
     height_px, width_px = rows.shape[0], rows.shape[1]
     grid = page_grid(width_px, height_px, dpi, page, landscape)
     stem, ext = os.path.splitext(filepath)
+    sheet_name = os.path.basename(stem)
     paths = []
-    for n, crop in enumerate(grid, 1):
-        path = "%s_p%02d_r%dc%d%s" % (stem, n, crop[0] + 1, crop[1] + 1, ext)
-        _save(path, compose_page(rows, crop, dpi, page, landscape),
-              file_format, dpi)
+    for i, crop in enumerate(grid):
+        path = "%s_%s%s" % (stem, page_name(crop[0], crop[1]), ext)
+        out = compose_page(rows, crop, dpi, page, landscape)
+        layer = _draw_marks(page_marks(grid, i, dpi, page, landscape,
+                                       sheet_name),
+                            out.shape[1], out.shape[0], (0.0, 0.0, 0.0, 0.0),
+                            alpha=True)
+        _save(path, _composite(out, layer), file_format, dpi)
         paths.append(path)
     return paths
 
@@ -502,26 +741,7 @@ def render_marks(marks, filepath, size=2048, file_format='PNG', dpi=None,
     if pages != 'NONE' and clamped:
         raise ValueError("The sheet is too large for %d DPI, so pages would "
                          "not be true to scale. Lower the DPI." % dpi)
-    canvas = _Canvas(width_px, height_px, marks.width_mm, marks.height_mm)
-
-    _ensure_gpu()
-    offscreen = gpu.types.GPUOffScreen(width_px, height_px)
-    offscreen.bind()
-    try:
-        fb = gpu.state.active_framebuffer_get()
-        fb.clear(color=(1.0, 1.0, 1.0, 1.0))
-        gpu.state.blend_set('ALPHA')
-        with gpu.matrix.push_pop(), gpu.matrix.push_pop_projection():
-            gpu.matrix.load_matrix(Matrix.Identity(4))
-            gpu.matrix.load_projection_matrix(canvas.projection())
-            _draw_fills(marks.fills, canvas)
-            _draw_strokes(marks.strokes, canvas)
-            _draw_labels(marks.labels, canvas)
-        gpu.state.blend_set('NONE')
-        rows = _read_rows_top_down(fb, width_px, height_px)
-    finally:
-        offscreen.unbind()
-        offscreen.free()
+    rows = _draw_marks(marks, width_px, height_px, (1.0, 1.0, 1.0, 1.0))
 
     writer = _save(filepath, rows, file_format, effective_dpi)
     page_files = (write_pages(rows, filepath, file_format, effective_dpi,
@@ -588,7 +808,9 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
         items=(('NONE', "Whole sheet only", "One image"),
                ('LETTER', "US Letter pages",
                 "Also write the sheet cut into Letter pages (needs DPI "
-                "mode), 1:1, with a 10 mm overlap to tape and corner marks"),
+                "mode), 1:1, named A1, B1.. like a chess board (row 1 at "
+                "the top), with a 10 mm overlap to tape, numbered joins and "
+                "registration targets"),
                ('A4', "A4 pages", "As Letter, on A4")),
         default='NONE')
     size: bpy.props.IntProperty(

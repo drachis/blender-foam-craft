@@ -135,11 +135,32 @@ SVG** button is the SVG route, described below.
 
 **Pages.** No big printer? Set **Pages** to *US Letter* (or *A4*) in the file
 browser's side panel, in DPI mode only. Besides the whole sheet, the export
-writes one file per page (`name_p03_r1c3.png`: page 3, row 1, column 3), each a
-full sheet of paper at the export DPI, with the pattern inside a quarter-inch
-margin, corner marks at the printable area, and a 10 mm overlap with its
-neighbours to tape along. It is a plain crop of the sheet, nothing is re-packed.
-Print at actual size, then check the scale ruler.
+writes one file per page, each a full sheet of paper at the export DPI, with the
+pattern inside a quarter-inch margin, corner marks at the printable area, and a
+10 mm overlap with its neighbours to tape along. It is a plain crop of the
+sheet, nothing is re-packed. Print at actual size, then check the scale ruler.
+
+Pages are named like squares on a chess board: a column letter, then a row
+number, with **row 1 at the top** (the sheet reads top-down), so `C1` is the
+third page along the top row and `A1`, `B2`, `C3` run down a diagonal. The name
+is printed in the top-left and bottom-right corners of the margin and is in the
+file name (`name_C1.png`); the bottom margin also says how big the grid is
+(`page C1 of A1-G6`). Pages are labelled the way pieces are:
+
+- **Join numbers.** Every edge two pages share has a plain number, printed in
+  the margin at the middle of that edge on *both* pages, turned square to the
+  edge like a bevel label. Matching numbers go together, as matching seam
+  numbers glue together.
+- **Registration targets.** Two circle-and-cross targets per join sit in the
+  10 mm overlap band (at a quarter and three quarters of the shared edge),
+  labelled with the join number. They are at the same place on the pattern on
+  both pages. They are mid grey, so they print on a black-and-white printer
+  and are told from the black cut lines by tone and by their shape. A dashed
+  light grey line marks the inner edge of each overlap band.
+
+To assemble: lay the pages out by name, trim the margin off one page of a pair
+along the side that overlaps, lay it over its neighbour with the same join
+number, slide it until both targets sit exactly on top of each other, and tape.
 
 **Format.** PNG is lossless and keeps lines and numbers sharpest. Use JPEG only
 when a print service asks for it.
