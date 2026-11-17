@@ -952,6 +952,256 @@ def test_a_stretched_object_is_reported_and_a_gore_sphere_is_drawn():
     return dict(out, checks=checks)
 
 
+# ---------------------------------------------------------------------------
+# Paper pages (the lightweight "slice into Letter sheets" option)
+#
+# At 300 dpi, US Letter is exactly 2550 x 3300 px (8.5 x 11 in). The margin
+# is round(6.35 mm = 0.25 in = 75 px) = 75, so the printable area is
+# 2400 x 3150, and the overlap is round(10 mm = 118.11 px) = 118. Source of
+# the numbers: tools/tile_svg.py (6.35 mm, 10 mm), and inches * dpi.
+
+
+def test_page_grid_is_arithmetic():
+    """Page counts, overlap and coverage of `page_grid`, pure arithmetic."""
+    dpi = 300
+    uw, uh, ov = 2400, 3150, 118
+    g = fr.page_grid
+    exact = g(uw, uh, dpi)
+    wide = g(uw + 1, uh, dpi)
+    tall = g(uw, uh + 1, dpi)
+    two_by_two = g(uw + 1, uh + 1, dpi)
+    # 5000 x 7000: columns need ceil((5000-2400)/2282)+1 = 3, rows
+    # ceil((7000-3150)/3032)+1 = 3.
+    big = g(5000, 7000, dpi)
+    out = {"exact": exact, "wide_cols": sorted({c[1] for c in wide})}
+    checks = {
+        "exactly_one_printable_area_is_one_page": len(exact) == 1
+        and exact[0] == (0, 0, 0, 0, uw, uh),
+        "one_pixel_wider_is_two_columns_one_row":
+            len(wide) == 2 and {c[1] for c in wide} == {0, 1}
+            and {c[0] for c in wide} == {0},
+        "one_pixel_taller_is_two_rows": len(tall) == 2
+        and {c[0] for c in tall} == {0, 1},
+        "one_pixel_both_is_four": len(two_by_two) == 4,
+        "big_is_three_by_three": len(big) == 9
+        and max(c[0] for c in big) == 2 and max(c[1] for c in big) == 2,
+        "reading_order": [(c[0], c[1]) for c in big]
+        == [(r, c) for r in range(3) for c in range(3)],
+    }
+    # Neighbours share exactly the overlap (the last column is clipped at
+    # the sheet edge, which does not change where it starts).
+    shares = []
+    for r in range(3):
+        row = [c for c in big if c[0] == r]
+        shares += [row[i][4] - row[i + 1][2] for i in range(2)]
+    col0 = [c for c in big if c[1] == 0]
+    shares += [col0[i][5] - col0[i + 1][3] for i in range(2)]
+    out["shares"] = shares
+    checks["neighbours_share_the_overlap_within_1px"] = all(
+        abs(x - ov) <= 1 for x in shares) and len(shares) == 8
+    checks["overlap_is_118_exactly"] = set(shares) == {118}
+    # Coverage and bounds.
+    cover = np.zeros((7000, 5000), dtype=np.uint8)
+    inside = True
+    for _r, _c, x0, y0, x1, y1 in big:
+        cover[y0:y1, x0:x1] += 1
+        inside = inside and 0 <= x0 < x1 <= 5000 and 0 <= y0 < y1 <= 7000 \
+            and (x1 - x0) <= uw and (y1 - y0) <= uh
+    checks["every_pixel_covered"] = bool(cover.min() >= 1)
+    checks["no_crop_exceeds_sheet_or_printable_area"] = inside
+    checks["overlap_bands_are_covered_twice"] = int(cover.max()) == 4
+    # Page sizes: Letter exact; A4 per tile_svg's 210 x 297 mm.
+    checks["letter_is_2550_by_3300"] = fr.page_geometry(300)[:2] == (2550, 3300)
+    checks["letter_margin_is_75"] = fr.page_geometry(300)[2] == 75
+    checks["a4_is_2480_by_3508"] = fr.page_geometry(300, 'A4')[:2] == (2480, 3508)
+    checks["landscape_swaps"] = fr.page_geometry(300, 'LETTER', True)[:2] \
+        == (3300, 2550)
+    try:
+        fr.page_geometry(300, 'TABLOID')
+        checks["unknown_page_is_an_error"] = False
+    except ValueError:
+        checks["unknown_page_is_an_error"] = True
+    out["checks"] = checks
+    return out
+
+
+@_needs_gpu
+def test_a_letter_page_file_is_2550_by_3300_at_300_dpi():
+    """Each written page is a whole sheet of paper, with the dpi in the file,
+    and corner ticks at the printable corners (75 px in, 5 mm = 59 px long)."""
+    marks = _marks(254, 254)          # 3000 x 3000 px at 300 dpi: 2 pages
+    path = _path("sheet_pages.png")
+    info = fr.render_marks(marks, path, dpi=300, pages='LETTER')
+    files = info["page_files"]
+    out = {"files": [os.path.basename(f) for f in files],
+           "pixels": info["pixels"]}
+    checks = {
+        "whole_sheet_still_written": os.path.exists(path),
+        "two_pages": len(files) == 2,
+        "names": [os.path.basename(f) for f in files]
+        == ["sheet_pages_p01_r1c1.png", "sheet_pages_p02_r1c2.png"],
+    }
+    dark = lambda a: a.astype(np.int32).sum(axis=-1) < 128 * 3
+    rows = _load(files[0])
+    out["shape"] = list(rows.shape)
+    checks["page_is_2550_by_3300"] = rows.shape == (3300, 2550, 3)
+    m = 75
+    checks["tick_at_top_left_corner"] = bool(dark(rows[m, m]))
+    checks["horizontal_tick_runs_5mm"] = bool(
+        dark(rows[m, m:m + 59]).all()) and not dark(rows[m, m + 70:m + 90]).any()
+    checks["vertical_tick_runs_5mm"] = bool(
+        dark(rows[m:m + 59, m]).all()) and not dark(rows[m + 70:m + 90, m]).any()
+    checks["nothing_in_the_margin_outside_the_tick"] = not dark(
+        rows[:m, :]).any() and not dark(rows[:, :m]).any()
+    checks["bottom_right_tick"] = bool(dark(rows[3300 - m - 1, 2550 - m - 59:2550 - m]).all())
+    if fr.oiio is not None:
+        for f in files:
+            src = fr.oiio.ImageInput.open(f)
+            spec = src.spec()
+            xres = spec.getattribute("XResolution")
+            src.close()
+            out.setdefault("xres", []).append(xres)
+            checks["dpi_300_in_" + os.path.basename(f)] = \
+                xres is not None and abs(xres - 300) < 0.01
+    # Pixel mode refuses pages.
+    try:
+        fr.render_marks(marks, _path("nopages.png"), size=512, pages='LETTER')
+        checks["pixel_mode_refuses_pages"] = False
+    except ValueError as exc:
+        checks["pixel_mode_refuses_pages"] = "DPI" in str(exc)
+    out["checks"] = checks
+    return out
+
+
+@_needs_gpu
+def test_a_red_mark_lands_on_the_pages_that_contain_it():
+    """Red squares at known sheet positions appear on exactly the pages whose
+    crop contains them, offset by the margin and the crop origin.
+
+    Sheet 254 mm square at 300 dpi = 3000 x 3000 px, so two columns (crops
+    x 0..2400 and 2282..3000, overlap 118). Square A, mm 195..203 (px 2303 to
+    2398), sits in the overlap and so on both pages; square B, mm 240..250
+    (px 2835 to 2953), is right of page 1's crop and on page 2 only.
+    """
+    red = fm.Fill('piece', (_rect(195, 40, 203, 48),), RED)
+    blue_far = fm.Fill('piece', (_rect(240, 40, 250, 50),), RED)
+    marks = _marks(254, 254, fills=[red, blue_far])
+    path = _path("redpages.png")
+    info = fr.render_marks(marks, path, dpi=300, pages='LETTER')
+    sheet = _load(path)
+    is_red = lambda a: (a[..., 0] > 200) & (a[..., 1] < 60) & (a[..., 2] < 60)
+    sheet_red = is_red(sheet)
+    p1, p2 = (_load(f) for f in info["page_files"])
+    m, x0b = 75, 2282
+    r1, r2 = is_red(p1), is_red(p2)
+    ys, xs = np.nonzero(sheet_red)
+    out = {"sheet_red_px": int(sheet_red.sum()),
+           "sheet_red_x_range": [int(xs.min()), int(xs.max())],
+           "page1_red_px": int(r1.sum()), "page2_red_px": int(r2.sum())}
+    expect1 = sheet_red[0:3000, 0:2400]
+    expect2 = sheet_red[0:3000, x0b:3000]
+    checks = {
+        "sheet_has_both_squares": int(sheet_red.sum()) > 2 * 90 * 90 // 2,
+        "page1_has_exactly_the_cropped_red":
+            int(r1.sum()) == int(expect1.sum()) > 0,
+        "page2_has_exactly_the_cropped_red":
+            int(r2.sum()) == int(expect2.sum()) > 0,
+        "page1_position": bool((r1[m:m + 3000, m:m + 2400] == expect1).all()),
+        "page2_position": bool((r2[m:m + 3000, m:m + 718] == expect2).all()),
+        # B is only on page 2: nothing red on page 1 beyond x = 2400.
+        "square_b_not_on_page_1": not r1[:, m + 2400:].any(),
+        "square_a_on_both": bool(r1.any() and r2.any()),
+        "page_1_red_ends_at_the_crop_edge": int(np.nonzero(r1)[1].max()) == m + 2397,
+    }
+    out["checks"] = checks
+    return out
+
+
+def _append_snapshot_heads():
+    """Both heads of the git-ignored snapshot, linked into the scene, with
+    the snapshot scene's settings and unit scale. None when it is absent.
+    (The same load tests/test_overlay_ticks.py does, trimmed.)"""
+    import shutil
+    snap = r"O:\Work\BlenderPlugin\FoamCraft\tests\fixtures\beast_skull_snapshot.blend"
+    names = ("head_simplified", "head_simplified.001")
+    if not os.path.exists(snap):
+        return None
+    sandbox_guard.clear_scene()
+    for sc in [sc for sc in bpy.data.scenes if sc != bpy.context.scene]:
+        bpy.data.scenes.remove(sc)
+    for n in names:
+        old = bpy.data.objects.get(n)
+        if old is not None:
+            bpy.data.objects.remove(old, do_unlink=True)
+    tmp = os.path.join(tempfile.mkdtemp(prefix="foam_pages_"), "copy.blend")
+    shutil.copyfile(snap, tmp)
+    with bpy.data.libraries.load(tmp, link=False) as (src, dst):
+        dst.objects = [n for n in src.objects if n in names]
+        dst.scenes = list(src.scenes[:1])
+    objs = [o for o in dst.objects if o is not None]
+    if len(objs) != 2:
+        return None
+    for o in objs:
+        bpy.context.scene.collection.objects.link(o)
+    snap_scene = next((sc for sc in dst.scenes if sc is not None), None)
+    s = bpy.context.scene.foamcraft_drachis
+    if snap_scene is not None:
+        bpy.context.scene.unit_settings.scale_length = \
+            snap_scene.unit_settings.scale_length
+        src_s = getattr(snap_scene, "foamcraft_drachis", None)
+        if src_s:
+            for prop in src_s.bl_rna.properties:
+                if prop.identifier in ("rna_type", "name") or prop.is_readonly \
+                        or prop.type == 'POINTER':
+                    continue
+                try:
+                    setattr(s, prop.identifier, getattr(src_s, prop.identifier))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+    s.only_selected = False
+    bpy.context.view_layer.update()
+    return objs
+
+
+@_needs_gpu
+def test_snapshot_heads_as_letter_pages():
+    """The maker's two heads, 150 dpi, Letter pages, through the operator.
+    Reports the page count; asserts the pages tile the sheet (count equals
+    the grid's for the sheet's own pixel size) and each is 1275 x 1650."""
+    objs = _append_snapshot_heads()
+    if objs is None:
+        return {"skipped": "tests/fixtures/beast_skull_snapshot.blend absent "
+                           "(git-ignored, local only)", "checks": {}}
+    bpy.ops.object.select_all(action='DESELECT')
+    for o in objs:
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = objs[0]
+    path = _path("heads.png")
+    status = bpy.ops.foamcraft_drachis.export_pattern_image(
+        filepath=path, file_format='PNG', resolution_mode='DPI', dpi=150,
+        pages='LETTER')
+    pages = sorted(f for f in os.listdir(_TMP)
+                   if f.startswith("heads_p") and f.endswith(".png"))
+    full = _load(path) if os.path.exists(path) else None
+    out = {"status": sorted(status), "pages": pages,
+           "sheet_px": list(full.shape[:2][::-1]) if full is not None else None}
+    checks = {"finished": status == {'FINISHED'}, "page_files_written": len(pages) > 0}
+    if full is not None and pages:
+        grid = fr.page_grid(full.shape[1], full.shape[0], 150)
+        checks["page_count_is_the_grids"] = len(pages) == len(grid)
+        first = _load(os.path.join(_TMP, pages[0]))
+        checks["page_is_1275_by_1650"] = first.shape == (1650, 1275, 3)
+        out["first_page_ink_px"] = int(_ink(first).sum())
+        checks["first_page_has_ink"] = out["first_page_ink_px"] > 100
+        # Left where it can be looked at.
+        keep = shot.next_path("pattern_page_p01")
+        import shutil
+        shutil.copyfile(os.path.join(_TMP, pages[0]), keep)
+        out["looked_at"] = keep
+    out["checks"] = checks
+    return out
+
+
 TESTS = (
     test_a_stretched_object_is_reported_and_a_gore_sphere_is_drawn,
     test_gpu_context_probe,
@@ -972,6 +1222,10 @@ TESTS = (
     test_a_seamed_cube_through_render,
     test_the_operator_writes_a_file,
     test_example_sheet_for_looking_at,
+    test_page_grid_is_arithmetic,
+    test_a_letter_page_file_is_2550_by_3300_at_300_dpi,
+    test_a_red_mark_lands_on_the_pages_that_contain_it,
+    test_snapshot_heads_as_letter_pages,
 )
 
 result = {}

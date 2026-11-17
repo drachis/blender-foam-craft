@@ -71,6 +71,17 @@ Given `dpi`, the image is the sheet's millimetres at that many pixels per
 inch, and the figure is written into the file (`XResolution`), so a program
 that honours it prints at 1:1 without being asked. Given `size` instead, the
 longest edge is that many pixels and the dpi that results is reported.
+
+PAGES
+
+No home printer takes a metre-wide sheet, so `pages='LETTER'` (or 'A4') also
+cuts the rendered sheet into paper-sized files, 1:1, at the same dpi. This is
+deliberately light: the pieces are not re-packed, the sheet is simply cropped.
+The arithmetic -- page sizes, a 6.35 mm margin, a 10 mm overlap to tape on --
+is tools/tile_svg.py's, copied here because `tools/` is stripped from releases.
+Each page file is white paper with its tile inside the margins, thin corner
+ticks at the printable area's corners, and its place in the grid in the
+FILENAME (`name_p03_r1c3.png`); no text is drawn into the page itself.
 """
 
 import os
@@ -103,6 +114,17 @@ _log = foam_log.get_logger()
 MAX_PIXELS = 16384
 MM_PER_INCH = 25.4
 JPEG_QUALITY = 95
+
+# Page arithmetic copied from tools/tile_svg.py (PAGE_SIZES, DEFAULT_MARGIN_MM,
+# DEFAULT_OVERLAP_MM, CROP_MM); keep the two in step.
+PAGE_SIZES_MM = {
+    'LETTER': (8.5 * MM_PER_INCH, 11.0 * MM_PER_INCH),
+    'A4': (210.0, 297.0),
+}
+PAGE_MARGIN_MM = 6.35
+PAGE_OVERLAP_MM = 10.0
+PAGE_CROP_MM = 5.0
+PAGE_MARK_MM = 0.25
 
 _FORMATS = {
     # file_format: (OIIO format name, extensions accepted, extension written)
@@ -367,24 +389,119 @@ def _save(filepath, rows, file_format, dpi):
     return "bpy"
 
 
+def page_geometry(dpi, page='LETTER', landscape=False,
+                  margin_mm=PAGE_MARGIN_MM):
+    """(page_w_px, page_h_px, margin_px) of one sheet of paper at `dpi`."""
+    if page not in PAGE_SIZES_MM:
+        raise ValueError("unknown page size %r; known: %s"
+                         % (page, ", ".join(sorted(PAGE_SIZES_MM))))
+    w_mm, h_mm = PAGE_SIZES_MM[page]
+    if landscape:
+        w_mm, h_mm = h_mm, w_mm
+    px = dpi / MM_PER_INCH
+    return round(w_mm * px), round(h_mm * px), round(margin_mm * px)
+
+
+def _starts(length, usable, step):
+    """Offsets of the crops along one axis: as few as cover `length`."""
+    if length <= usable:
+        return [0]
+    count = -(-(length - usable) // step) + 1
+    return [i * step for i in range(count)]
+
+
+def page_grid(width_px, height_px, dpi, page='LETTER', landscape=False,
+              margin_mm=PAGE_MARGIN_MM, overlap_mm=PAGE_OVERLAP_MM):
+    """Crop rectangles that cover a sheet, as [(row, col, x0, y0, x1, y1)].
+
+    Pixels, top-left origin, x1/y1 exclusive, reading order, rows and columns
+    counted from 0. A crop is at most one page's printable area (the page
+    less its margins); neighbours share `overlap_mm` of pixels to tape along.
+    """
+    page_w, page_h, margin = page_geometry(dpi, page, landscape, margin_mm)
+    usable_w, usable_h = page_w - 2 * margin, page_h - 2 * margin
+    overlap = round(overlap_mm / MM_PER_INCH * dpi)
+    if usable_w <= overlap or usable_h <= overlap:
+        raise ValueError("margins and overlap leave no usable page area")
+    xs = _starts(width_px, usable_w, usable_w - overlap)
+    ys = _starts(height_px, usable_h, usable_h - overlap)
+    return [(r, c, x, y, min(x + usable_w, width_px),
+             min(y + usable_h, height_px))
+            for r, y in enumerate(ys) for c, x in enumerate(xs)]
+
+
+def compose_page(rows, crop, dpi, page='LETTER', landscape=False,
+                 margin_mm=PAGE_MARGIN_MM):
+    """One page's pixels: white paper, the crop inside the margins, and
+    black ticks at the printable area's corners pointing inward (as
+    tools/tile_svg.py draws them)."""
+    _r, _c, x0, y0, x1, y1 = crop
+    page_w, page_h, margin = page_geometry(dpi, page, landscape, margin_mm)
+    out = np.full((page_h, page_w, 3), 255, dtype=np.uint8)
+    out[margin:margin + (y1 - y0), margin:margin + (x1 - x0)] = \
+        rows[y0:y1, x0:x1]
+    arm = max(1, round(PAGE_CROP_MM / MM_PER_INCH * dpi))
+    thick = max(1, round(PAGE_MARK_MM / MM_PER_INCH * dpi))
+    right, bottom = page_w - margin, page_h - margin
+    for cx, sx in ((margin, 1), (right, -1)):
+        for cy, sy in ((margin, 1), (bottom, -1)):
+            xa, xb = sorted((cx, cx + sx * arm))
+            ya, yb = sorted((cy, cy + sy * arm))
+            hy = slice(cy, cy + thick) if sy > 0 else slice(cy - thick, cy)
+            vx = slice(cx, cx + thick) if sx > 0 else slice(cx - thick, cx)
+            out[hy, xa:xb] = 0
+            out[ya:yb, vx] = 0
+    return out
+
+
+def write_pages(rows, filepath, file_format, dpi, page='LETTER',
+                landscape=False):
+    """Write every page of the sheet next to `filepath`. Returns the paths,
+    named `<stem>_p01_r1c1.<ext>` in reading order."""
+    height_px, width_px = rows.shape[0], rows.shape[1]
+    grid = page_grid(width_px, height_px, dpi, page, landscape)
+    stem, ext = os.path.splitext(filepath)
+    paths = []
+    for n, crop in enumerate(grid, 1):
+        path = "%s_p%02d_r%dc%d%s" % (stem, n, crop[0] + 1, crop[1] + 1, ext)
+        _save(path, compose_page(rows, crop, dpi, page, landscape),
+              file_format, dpi)
+        paths.append(path)
+    return paths
+
+
 def _ensure_gpu():
     """Give a background Blender the GPU context a windowed one already has."""
     if bpy.app.background and hasattr(gpu, "init"):
         gpu.init()
 
 
-def render_marks(marks, filepath, size=2048, file_format='PNG', dpi=None):
+def render_marks(marks, filepath, size=2048, file_format='PNG', dpi=None,
+                 pages='NONE'):
     """Draw `marks` and write the image. Returns a dict of what was done.
 
     `size` is the longest edge in pixels, as Export UV Layout's own `size`
     is. `dpi`, when given, replaces it: the image is then the sheet's
     millimetres at that resolution, true to scale when printed at it.
+    `pages` ('LETTER'/'A4') also writes the sheet as paper-sized files, which
+    needs `dpi`: pages only mean anything at a known scale.
     """
+    if pages != 'NONE':
+        if not dpi:
+            raise ValueError("Pages need DPI mode: they are only true to "
+                             "scale at a known resolution. Use DPI, not "
+                             "Pixels.")
+        if pages not in PAGE_SIZES_MM:
+            raise ValueError("pages must be 'NONE', 'LETTER' or 'A4', not %r"
+                             % (pages,))
     if file_format not in _FORMATS:
         raise ValueError("file_format must be 'PNG' or 'JPEG', not %r"
                          % (file_format,))
     width_px, height_px, effective_dpi, clamped = pixel_size(
         marks.width_mm, marks.height_mm, size, dpi)
+    if pages != 'NONE' and clamped:
+        raise ValueError("The sheet is too large for %d DPI, so pages would "
+                         "not be true to scale. Lower the DPI." % dpi)
     canvas = _Canvas(width_px, height_px, marks.width_mm, marks.height_mm)
 
     _ensure_gpu()
@@ -407,6 +524,8 @@ def render_marks(marks, filepath, size=2048, file_format='PNG', dpi=None):
         offscreen.free()
 
     writer = _save(filepath, rows, file_format, effective_dpi)
+    page_files = (write_pages(rows, filepath, file_format, effective_dpi,
+                              pages) if pages != 'NONE' else [])
 
     info = {
         "path": filepath,
@@ -416,6 +535,7 @@ def render_marks(marks, filepath, size=2048, file_format='PNG', dpi=None):
         "sheet_mm": [round(marks.width_mm, 2), round(marks.height_mm, 2)],
         "dpi": round(effective_dpi, 2),
         "clamped": clamped,
+        "page_files": page_files,
         "fills": len(marks.fills),
         "strokes": len(marks.strokes),
         "labels": len(marks.labels),
@@ -424,17 +544,18 @@ def render_marks(marks, filepath, size=2048, file_format='PNG', dpi=None):
         "warnings": list(marks.warnings),
     }
     _log.info(foam_log.summary("raster_export", **{
-        k: v for k, v in info.items() if k != "path"}))
+        k: v for k, v in info.items() if k not in ("path", "page_files")},
+        pages=len(page_files)))
     return info
 
 
 def render(bm, uv_layer, settings, filepath, size=2048, scale_length=1.0,
-           file_format='PNG', matrix=None, dpi=None):
+           file_format='PNG', matrix=None, dpi=None, pages='NONE'):
     """Build the marks for this mesh and draw them to `filepath`."""
     marks = foam_marks.build_marks(bm, uv_layer, settings, scale_length,
                                    matrix)
     return render_marks(marks, filepath, size=size, file_format=file_format,
-                        dpi=dpi)
+                        dpi=dpi, pages=pages)
 
 
 class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
@@ -462,6 +583,14 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
     dpi: bpy.props.IntProperty(
         name="DPI", description="Pixels per inch of pattern",
         default=300, min=10, max=2400)
+    pages: bpy.props.EnumProperty(
+        name="Pages",
+        items=(('NONE', "Whole sheet only", "One image"),
+               ('LETTER', "US Letter pages",
+                "Also write the sheet cut into Letter pages (needs DPI "
+                "mode), 1:1, with a 10 mm overlap to tape and corner marks"),
+               ('A4', "A4 pages", "As Letter, on A4")),
+        default='NONE')
     size: bpy.props.IntProperty(
         name="Size", description="Longest edge of the image",
         default=4096, min=64, max=MAX_PIXELS, subtype='PIXEL')
@@ -486,8 +615,13 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
             layout.prop(self, "dpi")
         else:
             layout.prop(self, "size")
+        layout.prop(self, "pages")
 
     def execute(self, context):
+        if self.pages != 'NONE' and self.resolution_mode != 'DPI':
+            self.report({'ERROR'}, "Pages need DPI mode: set Resolution to "
+                                   "DPI so the pages are true to scale.")
+            return {'CANCELLED'}
         path = self.filepath
         if not path.lower().endswith(_FORMATS[self.file_format][1]):
             path = os.path.splitext(path)[0] + self.filename_ext
@@ -507,7 +641,8 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
         try:
             info = render_marks(
                 marks, path, size=self.size, file_format=self.file_format,
-                dpi=self.dpi if self.resolution_mode == 'DPI' else None)
+                dpi=self.dpi if self.resolution_mode == 'DPI' else None,
+                pages=self.pages)
         except (ValueError, OSError) as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
@@ -518,6 +653,9 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
                     "print at the DPI shown)")
         # Its own name: this loop used to reuse `note`, so a warning
         # overwrote the clamp note above it in the final report.
+        if info["page_files"]:
+            note += " + %d %s page files" % (len(info["page_files"]),
+                                             self.pages)
         for warning in info.get("warnings", ()):
             self.report({'WARNING'}, warning)
         self.report({'INFO'}, "Wrote foam pattern image to %s: %d x %d px, "

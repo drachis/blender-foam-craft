@@ -133,6 +133,14 @@ SVG** button is the SVG route, described below.
 > <kbd>Ctrl</kbd>+<kbd>A</kbd> and choose **Scale**, so the mesh's real size and
 > the object's transform agree.
 
+**Pages.** No big printer? Set **Pages** to *US Letter* (or *A4*) in the file
+browser's side panel, in DPI mode only. Besides the whole sheet, the export
+writes one file per page (`name_p03_r1c3.png`: page 3, row 1, column 3), each a
+full sheet of paper at the export DPI, with the pattern inside a quarter-inch
+margin, corner marks at the printable area, and a 10 mm overlap with its
+neighbours to tape along. It is a plain crop of the sheet, nothing is re-packed.
+Print at actual size, then check the scale ruler.
+
 **Format.** PNG is lossless and keeps lines and numbers sharpest. Use JPEG only
 when a print service asks for it.
 
