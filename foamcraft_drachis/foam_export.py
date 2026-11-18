@@ -22,7 +22,7 @@ import bmesh
 
 from . import foam_angle_core as core  # noqa: F401  (kept for importers)
 from .foam_marks import (build_marks, build_marks_multi, scale_warnings,
-                         SheetItem, object_prefix)
+                         SheetItem, object_prefix, mirror_planes)
 
 # What to draw is decided in foam_marks.build_marks; this module only writes
 # it out. The helpers that used to live here moved with that decision, and
@@ -162,7 +162,7 @@ def svg_from_marks(marks):
     dart_els += [_polygon(s) for s in relief_strokes
                  if s.points not in filled]
 
-    tick_els = [_line(s) for s in strokes_of('bracket')]
+    tick_els = [_polygon(s) for s in strokes_of('bracket')]
     align_els = [_line(s) for s in strokes_of('align')]
     align_label_els = [_text(l) for l in labels_of('align')]
     angle_els = [_text(l) for l in labels_of('angle')]
@@ -292,7 +292,7 @@ class SheetSource:
                 bm, uv_layer, obj.matrix_world.copy(),
                 object_prefix(obj.name,
                               getattr(obj, "foamcraft_drachis_prefix", "")),
-                obj.name))
+                obj.name, tuple(mirror_planes(obj))))
         return self.items
 
     def __exit__(self, *exc):

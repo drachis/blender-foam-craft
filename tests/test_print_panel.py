@@ -64,6 +64,12 @@ class FakeLayout:
 
     box = row = column = split = column_flow = grid_flow = _child
 
+    def panel(self, idname, default_closed=False):
+        # Blender's collapsible section (2026-11-17 panel pass). Drawn open
+        # here, whatever its default: the test is about what the panel can
+        # reach, and a closed section is still reachable with one click.
+        return self._child(), self._child()
+
     def prop(self, data, name, **kw):
         self._log["props"].append((name, self._eff()))
         # Which struct it was drawn from (2026-11-17): the piece prefix is
@@ -83,12 +89,31 @@ class FakeLayout:
         pass
 
 
-def _draw(context):
-    cls = getattr(bpy.types, PANEL_ID)
+PANEL_IDS = (
+    # Top to bottom, as the sidebar shows them (bl_order 0..4).
+    "IMAGE_PT_foamcraft_drachis_export",     # Foam Pattern (+ export)
+    "IMAGE_PT_foamcraft_drachis_advice",     # Craftability
+    "IMAGE_PT_foamcraft_drachis",            # Cut Runs
+    "IMAGE_PT_foamcraft_drachis_display",    # On Screen Only
+    "IMAGE_PT_foamcraft_drachis_pattern",    # Pattern from Strokes
+)
+
+# Settings no code reads, so there is nothing for a panel to offer
+# (checked 2026-11-17 by grepping the package): drawing them would be a
+# control that does nothing.
+UNUSED_SETTINGS = {"kerf", "dissolve_angle_limit_deg"}
+
+
+def _draw(context, panel_id=PANEL_ID):
+    cls = getattr(bpy.types, panel_id)
     log = {"props": [], "ops": [], "labels": []}
 
     class Self:
         layout = FakeLayout(log)
+    # The header too: the overlay switch sits in the Foam Pattern header,
+    # Blender's usual place for a panel's on/off checkbox.
+    if hasattr(cls, "draw_header"):
+        cls.draw_header(Self(), context)
     cls.draw(Self(), context)
     return log
 
@@ -124,7 +149,10 @@ def test_panel_registered_and_props_exist():
         "drawn": sorted(drawn),
         "checks": {
             "panel_registered": hasattr(bpy.types, PANEL_ID),
-            "title": cls is not None and cls.bl_label == "Print / Export",
+            # Renamed in the 2026-11-17 panel pass: it holds every setting
+            # that changes the printout, not only the export buttons.
+            "title": cls is not None and cls.bl_label == "Foam Pattern",
+            "first_in_the_tab": getattr(cls, "bl_order", None) == 0,
             "same_tab_as_siblings":
                 cls.bl_category == bpy.types.IMAGE_PT_foamcraft_drachis.bl_category,
             # Both bounds: nothing drawn is missing from RNA, and the drawn
@@ -214,7 +242,8 @@ def test_all_export_props_are_reachable():
     missing = [p for p in EXPORT_PROPS if p not in union]
     return {"missing": missing,
             "checks": {"none_missing": not missing,
-                       "show_darts_not_duplicated": "show_darts" not in union}}
+                       # Darts moved here in the panel pass: they print.
+                       "darts_on_the_print_panel": "show_darts" in union}}
 
 
 def test_export_buttons_and_missing_operator_guard():
@@ -269,7 +298,113 @@ def test_piece_prefix_is_drawn_for_the_active_mesh():
     }
 
 
+def test_every_setting_has_exactly_one_home():
+    """Each scene setting is drawn by one FoamCraft panel, and only one.
+
+    The panel pass (2026-11-17) was prompted by settings that were not
+    exposed at all (notch_shape, notch_depth_ratio, origin_object) and by
+    others that turned up in two places. Both bounds: nothing missing, and
+    nothing drawn twice. Modes that swap props are unioned over.
+    """
+    s = bpy.context.scene.foamcraft_drachis
+    rna = {k for k, p in s.bl_rna.properties.items()
+           if k not in ("rna_type", "name") and not p.is_hidden}
+    homes = {}
+    s, before = _with_settings(tick_mode='PER_RUN', scale_text_with_view=True)
+    try:
+        for tick_mode, by_view in (('PER_RUN', True), ('BY_DISTANCE', False)):
+            s.tick_mode = tick_mode
+            s.scale_text_with_view = by_view
+            for pid in PANEL_IDS:
+                for name, _en in _draw(bpy.context, pid)["props"]:
+                    homes.setdefault(name, set()).add(pid)
+    finally:
+        _restore(s, before)
+    missing = sorted(rna - UNUSED_SETTINGS - set(homes))
+    twice = {n: sorted(p) for n, p in homes.items() if len(p) > 1}
+    return {"missing": missing, "twice": twice,
+            "checks": {"none_missing": not missing,
+                       "none_drawn_twice": not twice,
+                       "something_drawn": len(homes) > 20}}
+
+
+def test_panels_in_workflow_order():
+    """Export first, the stroke bake last (the user's order, 2026-11-17)."""
+    orders = [getattr(getattr(bpy.types, pid), "bl_order", None)
+              for pid in PANEL_IDS]
+    # One tab only (2026-11-17): the old paper overlay registered its own
+    # "Fold Angles" tab and read as a second plugin. Every sidebar panel this
+    # add-on registers sits in FoamCraft, and there are exactly five.
+    ours = [cls for cls in bpy.types.Panel.__subclasses__()
+            if "foamcraft_drachis" in cls.__module__
+            and getattr(cls, "bl_region_type", "") == 'UI']
+    categories = sorted({getattr(cls, "bl_category", "") for cls in ours})
+    return {"orders": orders, "categories": categories,
+            "checks": {"strictly_increasing": orders == sorted(orders)
+                       and len(set(orders)) == len(orders),
+                       "one_tab": categories == ["FoamCraft"],
+                       "five_panels": len(ours) == len(PANEL_IDS),
+                       "no_fold_angles_panel":
+                           not hasattr(bpy.types, "IMAGE_PT_fold_angle_overlay")}}
+
+
+# Hard maxima that stand for something real (2026-11-17). Everything else
+# gets a soft_max only -- Blender's convention: the slider has a range, the
+# field accepts what you type. Each entry says what breaks past it.
+HARD_MAX_ALLOWED = {
+    "max_tilt_deg": "bevel depth is thickness * tan(tilt); diverges at 90",
+    "max_angle_variation_deg": "an angle between faces cannot pass 180",
+    "dissolve_angle_limit_deg": "an angle between faces cannot pass 180",
+    "dart_wedge_deg": "an angle cannot pass 180",
+    "corner_angle_deg": "a turn along an outline cannot pass 180",
+    "min_angle": "a dihedral cannot pass 180",
+    "notch_depth_ratio": "a fraction of the foam's thickness",
+    "merge_fraction": "a fraction",
+    "decimals": "Blender's own display precision stops at 6",
+}
+
+
+def _hard_maxima(rna_props):
+    """Names whose hard max is not the type's own ceiling."""
+    found = {}
+    for name, prop in rna_props.items():
+        if prop.type not in {'FLOAT', 'INT'} or getattr(prop, "array_length", 0):
+            continue
+        ceiling = 2 ** 31 - 1 if prop.type == 'INT' else 3.0e38
+        if prop.hard_max < ceiling:
+            found[name] = prop.hard_max
+    return found
+
+
+def test_no_arbitrary_hard_limits():
+    """A typed value is accepted unless it is meaningless (user, 2026-11-17:
+    "keep the blender philosophy ... no arb limits"). Tick Length refusing
+    anything over 5 cm prompted it. Both bounds: the allowed list is not
+    empty of real hits, and nothing outside it has a hard max."""
+    s = bpy.context.scene.foamcraft_drachis
+    found = _hard_maxima(s.bl_rna.properties)
+    for idname in ("foamcraft_drachis.export_pattern_image",
+                   "foamcraft_drachis.bake_pattern"):
+        category, _, name = idname.partition(".")
+        rna = getattr(getattr(bpy.ops, category), name).get_rna_type()
+        for k, v in _hard_maxima(rna.properties).items():
+            found["%s.%s" % (name, k)] = v
+    unexplained = {k: v for k, v in found.items()
+                   if k.split(".")[-1] not in HARD_MAX_ALLOWED}
+    tick = s.bl_rna.properties["tick_length"]
+    return {"hard_maxima": found, "unexplained": unexplained,
+            "checks": {"none_unexplained": not unexplained,
+                       "tilt_still_bounded": "max_tilt_deg" in found,
+                       "tick_length_unbounded": "tick_length" not in found,
+                       # float32 in RNA: 0.05 reads back as 0.0500000007.
+                       "tick_length_keeps_its_slider":
+                           abs(tick.soft_max - 0.05) < 1e-6}}
+
+
 TESTS = (
+    test_no_arbitrary_hard_limits,
+    test_every_setting_has_exactly_one_home,
+    test_panels_in_workflow_order,
     test_panel_registered_and_props_exist,
     test_piece_prefix_is_drawn_for_the_active_mesh,
     test_per_run_mode,

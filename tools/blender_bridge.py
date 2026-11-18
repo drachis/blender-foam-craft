@@ -50,7 +50,11 @@ def sandbox_marker(port=DEFAULT_PORT, host="localhost", refresh=False):
     if not refresh and key in _MARKER_CACHE:
         return _MARKER_CACHE[key]
     try:
-        reply = _send(_MARKER_PROBE, port, host, False, 10)
+        # 30 s, not 10 (2026-11-17): a windowed instance off-screen answered
+        # the probe in over 10 s twice in one session and was refused as
+        # "not ours". Waiting longer cannot weaken the guard; the reply must
+        # still carry the marker.
+        reply = _send(_MARKER_PROBE, port, host, False, 30)
     except Exception:
         reply = None
     marker = None

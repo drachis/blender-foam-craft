@@ -163,7 +163,11 @@ def _marker_on_port(port):
     try:
         # Unguarded on purpose: this *is* the ownership handshake, and
         # reading an environment variable cannot change anything.
-        out = execute(code, port=port, timeout=10, require_sandbox=False)
+        # 30 s, not 10 (2026-11-17): an off-screen windowed instance took
+        # longer than 10 s to answer, was judged "somebody else's", and the
+        # suite leaked it. A longer wait cannot weaken the guard -- the reply
+        # must still carry the marker.
+        out = execute(code, port=port, timeout=30, require_sandbox=False)
     except Exception:
         return None
     # The bridge returns the whole envelope: {"status", "result", "stdout",
@@ -243,6 +247,22 @@ def _pid_on_port(port):
     return None
 
 
+def _owned_by_pid(port):
+    """True when the process listening on `port` is the one this launcher
+    started there.
+
+    The fallback for a handshake that times out. Measured 2026-11-17: right
+    after tests/test_panel_gui.py, an off-screen windowed instance took 19 s
+    to answer the marker probe (2 s thereafter), and the suite refused to
+    stop its own Blender and leaked it. Two independent facts have to agree
+    -- the PID recorded at launch is still a Blender, and it is the PID that
+    owns the port -- so a session somebody opened themselves cannot pass:
+    it has no PID file, and its PID is not the one in ours.
+    """
+    recorded = _recorded_pid(port)
+    return recorded is not None and recorded == _pid_on_port(port)
+
+
 def stop(port):
     """Shut down the instance on `port`, window and process included.
 
@@ -255,7 +275,9 @@ def stop(port):
         print(f"nothing listening on {port}")
         return 0
 
-    if _marker_on_port(port) is None:
+    # The PID check first: it asks Windows, not Blender, so it is instant
+    # even while the instance is too busy to answer the handshake.
+    if not _owned_by_pid(port) and _marker_on_port(port) is None:
         print(f"REFUSING to stop port {port}: the instance there was not "
               f"started by this launcher, so quitting it could discard "
               f"somebody's unsaved work.", file=sys.stderr)
@@ -264,9 +286,13 @@ def stop(port):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from blender_bridge import execute
     try:
+        # Unguarded: ownership was settled just above, and the bridge's own
+        # guard would re-run the handshake that a busy instance can fail --
+        # it raised NotASandboxInstance here and leaked the instance
+        # (2026-11-17). Any failure falls through to terminating the process.
         execute("import bpy\nbpy.ops.wm.quit_blender()\nresult = {}", port=port,
-                timeout=10)
-    except OSError:
+                timeout=10, require_sandbox=False)
+    except Exception:                                   # noqa: BLE001
         pass  # the socket dropping is the expected result of quitting
     time.sleep(1.5)
 

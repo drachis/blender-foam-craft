@@ -2037,7 +2037,7 @@ class FOAMCRAFT_DRACHIS_OT_bake_pattern(bpy.types.Operator):
                     "vertex reuse it rather than splitting again. Measured "
                     "on the sculpt, so the sculpt must be at real-world "
                     "scale for it to mean anything",
-        default=0.002, min=0.0, max=0.05,
+        default=0.002, min=0.0, soft_max=0.05,
         subtype='DISTANCE', unit='LENGTH', precision=4)
     merge_fraction: bpy.props.FloatProperty(
         name="Merge Overlapping",
@@ -2055,7 +2055,7 @@ class FOAMCRAFT_DRACHIS_OT_bake_pattern(bpy.types.Operator):
         ],
         default='MINIMUM_STRETCH')
     unwrap_margin: bpy.props.FloatProperty(
-        name="Island Margin", default=0.02, min=0.0, max=0.5)
+        name="Island Margin", default=0.02, min=0.0, soft_max=0.5)
 
     @classmethod
     def blocked_because(cls, context):
@@ -2238,7 +2238,10 @@ class IMAGE_PT_foamcraft_drachis_pattern(bpy.types.Panel):
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "FoamCraft"
-    bl_label = "Pattern"
+    bl_label = "Pattern from Strokes"
+    # Last: an alternative way to arrive at the UVs, which most work skips.
+    bl_order = 4
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout

@@ -461,8 +461,10 @@ def _bevel_measure(obj, **overrides):
         glyphs = ("\u2192", "\u2190")
         screen_arrows = [mm(m.u, m.v) + (m.rotation_deg,) for m in cached
                          if any(g in m.text for g in glyphs)]
-        screen_ends = [mm(u0, v0) + mm(u1, v1)
-                       for u0, v0, u1, v1 in cached_ends]
+        # Run-end marks are rings (2026-11-17): compared by two points
+        # half a turn apart, which fixes both centre and radius.
+        screen_ends = [mm(*ring[0]) + mm(*ring[len(ring) // 2])
+                       for ring in cached_ends]
         # What every export prints: build_marks lays the labels out by
         # default.
         marks = fm.build_marks(bm, uv_layer, s, scale_length,
@@ -484,8 +486,8 @@ def _bevel_measure(obj, **overrides):
         paper_arrows = [(l.x, l.y, l.rotation_deg) for l in marks.labels
                         if l.kind == 'angle'
                         and any(g in l.text for g in glyphs)]
-        paper_ends = [st.points[0] + st.points[-1] for st in marks.strokes
-                      if st.kind == 'bracket']
+        paper_ends = [st.points[0] + st.points[len(st.points) // 2]
+                      for st in marks.strokes if st.kind == 'bracket']
         plain = all(
             isinstance(m.u, float) and isinstance(m.v, float)
             and isinstance(m.text, str)
@@ -493,7 +495,8 @@ def _bevel_measure(obj, **overrides):
             and isinstance(m.size_mm, float)
             and all(isinstance(x, float) for pt in m.leader for x in pt)
             for m in cached) and all(isinstance(c, float)
-                                     for t in cached_ends for c in t)
+                                     for ring in cached_ends
+                                     for pt in ring for c in pt)
     finally:
         for k, v in saved.items():
             setattr(s, k, v)

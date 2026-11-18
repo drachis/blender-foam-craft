@@ -39,9 +39,9 @@ re-deriving anything:
     Stroke.kind  'outline'  a piece boundary -- the cut line
                  'bracket'  a run-end mark: where one bevel angle stops
                             and the next starts *part way along* a seam.
-                            Two points, the first on the cut line, the
-                            second inside the piece, square to the line,
-                            `tick_length` long. None at corners or
+                            A small closed circle centred on the cut line
+                            (RUN_END_SIDES points), so it cannot be read
+                            as an alignment mark. None at corners or
                             junctions (`_run_end_marks`).
                  'align'    an alignment (registration) mark. Two points,
                             the first on the cut line, the second inside
@@ -694,6 +694,65 @@ def _remember_tick(wanted, edge, t):
     params.append(t)
 
 
+MirrorPlane = core.MirrorPlane
+
+
+def mirror_planes(obj):
+    """Every plane `obj`'s enabled Mirror modifiers reflect across.
+
+    Read from the modifier rather than set again in FoamCraft (the maker,
+    2026-11-17: mirror the half sculpt "across X ... centered around the
+    origin or an empty"), with the modifier's own semantics
+    (`MOD_mirror.cc`): each ticked axis is the plane through the mirror
+    object's origin, square to that object's local axis -- or the object's
+    own origin and axes when there is no mirror object. `merge_threshold`
+    is how close to the plane Blender itself welds a vertex to its twin, so
+    it is exactly how close an edge has to lie to be glued to its mirror.
+    """
+    planes = []
+    if obj is None:
+        return planes
+    for mod in getattr(obj, "modifiers", ()):
+        if mod.type != 'MIRROR' or not mod.show_viewport:
+            continue
+        if mod.mirror_object is not None:
+            mtx = obj.matrix_world.inverted() @ \
+                mod.mirror_object.matrix_world
+        else:
+            mtx = None
+        tol = max(float(mod.merge_threshold), 1e-6)
+        for axis, used in enumerate(mod.use_axis):
+            if not used:
+                continue
+            normal = Vector((0.0, 0.0, 0.0))
+            normal[axis] = 1.0
+            point = Vector((0.0, 0.0, 0.0))
+            if mtx is not None:
+                # A plane's normal goes through the inverse transpose.
+                normal = mtx.to_3x3().inverted_safe().transposed() @ normal
+                point = mtx.translation.copy()
+            if normal.length < 1e-12:
+                continue
+            planes.append(MirrorPlane(point, normal.normalized(), tol))
+    return planes
+
+
+def _planes_of(islands):
+    return getattr(islands[0], 'mirror_planes', ()) if islands else ()
+
+
+def is_join(edge, planes=()):
+    """True when `edge` glues to something: a seam between two faces, or an
+    open edge lying on a mirror plane, which glues to its own mirror twin.
+
+    Any other open edge -- the rim of the sculpt -- joins nothing and gets
+    no alignment mark and no seam number.
+    """
+    if len(edge.link_faces) == 2:
+        return True
+    return core.on_mirror_plane(edge, planes) is not None
+
+
 def _seam_chains(islands):
     """The seams, as chains of connected 3D edges.
 
@@ -723,6 +782,17 @@ def _seam_chains(islands):
         for v in e.verts:
             by_vert.setdefault(v.index, []).append(e)
 
+    # A chain also ends where a glued stretch meets an open one -- a seam
+    # (or a mirror line) running into the rim -- so marks spaced along a
+    # seam are spaced along the seam only.
+    planes = _planes_of(islands)
+    joined = {e.index: is_join(e, planes) for e in edges}
+
+    def _is_end(vert):
+        around = by_vert.get(vert.index, ())
+        return len(around) != 2 or \
+            joined[around[0].index] != joined[around[1].index]
+
     chains, used = [], set()
     def _walk(start_edge, start_vert):
         chain = [start_edge]
@@ -732,7 +802,7 @@ def _seam_chains(islands):
             nxt = [e for e in by_vert.get(vert.index, ())
                    if e.index not in used]
             # Only continue through a plain two-edge join.
-            if len(by_vert.get(vert.index, ())) != 2 or len(nxt) != 1:
+            if _is_end(vert) or len(nxt) != 1:
                 break
             edge = nxt[0]
             chain.append(edge)
@@ -749,7 +819,7 @@ def _seam_chains(islands):
         start, far = _edge_canonical_start(e), None
         far = e.other_vert(start)
         for v in (start, far):
-            if len(by_vert.get(v.index, ())) != 2:
+            if _is_end(v):
                 chains.append(_walk(e, v))
                 break
     # Whatever is left is a closed loop. "Any edge will do as a start" is
@@ -922,8 +992,9 @@ def _seam_numbers(islands, corner_angle_deg):
     (`_tick_segments`), not to a piece or a cut run. An open rim has no
     neighbouring piece and gets no number.
     """
+    planes = _planes_of(islands)
     seams = [seg for seg in _tick_segments(islands, corner_angle_deg)
-             if any(len(edge.link_faces) == 2 for edge, _v, _l in seg)]
+             if any(is_join(edge, planes) for edge, _v, _l in seg)]
     seams.sort(key=_segment_key)
     numbers = {}
     # Numbering continues across the objects on one sheet: `build_marks_multi`
@@ -1263,10 +1334,13 @@ def _run_end_marks(islands, uv_layer, runs_by_island, settings,
     The corners are implicitly aligning." There used to be one on every
     corner of every piece, crossing the neighbouring piece's.
 
-    Drawn as an alignment mark is: starting on the cut line and going into
-    the piece only, square to the line -- to the average of the two edges
-    when it sits on a bend -- `tick_length` long, shortened where the piece
-    is too narrow to take it.
+    Drawn as a small open circle centred on the cut line (the maker,
+    2026-11-17: run-end marks "look clearly different" from the ticks).
+    They used to be drawn exactly as an alignment mark is, and since they
+    belong to one piece's cut -- the neighbour's bevel changes somewhere
+    else -- they read as ticks missing their partner. Radius
+    RUN_END_RADIUS of `tick_length`, so the two marks scale together,
+    shrunk where the piece is too narrow to take it.
 
     The caller decides whether to draw them (`show_brackets`).
     """
@@ -1283,13 +1357,28 @@ def _run_end_marks(islands, uv_layer, runs_by_island, settings,
                 if end_vert.index in segment_ends:
                     continue
                 at = isl.to_sheet(run_a.uv_end)
-                inward, room = _inward_at(isl, uv_layer, at,
-                                          run_a.loops[-1], run_b.loops[0])
-                reach = min(tick_length_mm, max(room * 0.6, 0.2))
+                _inward, room = _inward_at(isl, uv_layer, at,
+                                           run_a.loops[-1], run_b.loops[0])
+                radius = min(tick_length_mm * RUN_END_RADIUS,
+                             max(room * 0.4, 0.2))
                 out.append((isl.index, Stroke(
-                    'bracket', (_pt(at), _pt(at + inward * reach)),
-                    False, width_mm, BLACK)))
+                    'bracket', run_end_circle(at.x, at.y, radius),
+                    True, width_mm, BLACK)))
     return out
+
+
+# A run-end circle: its radius as a fraction of `tick_length`, and how many
+# points it is drawn with. 16 reads as round at any printed size it gets.
+RUN_END_RADIUS = 0.25
+RUN_END_SIDES = 16
+
+
+def run_end_circle(cx, cy, radius):
+    """The run-end mark's ring, as plain (x, y) points, closed implicitly."""
+    from math import cos as _cos, pi, sin as _sin
+    return tuple((cx + radius * _cos(2 * pi * k / RUN_END_SIDES),
+                  cy + radius * _sin(2 * pi * k / RUN_END_SIDES))
+                 for k in range(RUN_END_SIDES))
 
 
 def _segment_distances(total, settings, mode=None):
@@ -1315,29 +1404,54 @@ def _segment_distances(total, settings, mode=None):
 
 def _segment_tick_params(islands, settings, matrix=None, mode=None):
     """Every alignment mark, as (edge, t) from the edge's canonical start.
+    See `_segment_ticks`, which also says each mark's place on its seam."""
+    return [(edge, t) for edge, t, _n in
+            _segment_ticks(islands, settings, matrix, mode)]
+
+
+def _segment_ticks(islands, settings, matrix=None, mode=None):
+    """Every alignment mark, as (edge, t, n): t from the edge's canonical
+    start, n its place along its corner-to-corner seam segment, 1 first.
+
+    n counts along the whole segment (the maker, 2026-11-17: "number the
+    ticks along the whole seam until a corner"); it used to restart on
+    every mesh edge, so nearly every tick read "1". Counted from the
+    segment's coordinate-chosen start (`_tick_segments`), and decided on
+    the 3D segment, so both pieces carry the same number on the same mark.
 
     Decided once per geometric segment, so both pieces sharing the seam
     derive the same point and carry the same dash.
+
+    Only on seams. An open edge -- the rim of the sculpt, one face -- glues
+    to nothing, so a registration mark there has nothing to register
+    against (the maker, 2026-11-17: "For open edges there shouldn't be an
+    alignment tick"). The same test `_seam_numbers` uses for numbering.
+    An open edge on a Mirror modifier's plane does glue -- to its mirror
+    twin -- and is marked (`is_join`).
     """
+    planes = _planes_of(islands)
     out = []
     for segment in _tick_segments(islands, settings.corner_angle_deg,
                                   matrix):
+        if not any(is_join(edge, planes) for edge, _v, _l in segment):
+            continue
         total = sum(seg_len for _e, _v, seg_len in segment)
         if total <= 1e-12:
             continue
-        index, walked = 0, 0.0
+        index, walked, number = 0, 0.0, 0
         for d in _segment_distances(total, settings, mode):
+            number += 1
             while index < len(segment) - 1 and \
                     d > walked + segment[index][2]:
                 walked += segment[index][2]
                 index += 1
             edge, entry, seg_len = segment[index]
-            if seg_len <= 1e-12:
+            if seg_len <= 1e-12 or not is_join(edge, planes):
                 continue
             local = max(0.0, min(1.0, (d - walked) / seg_len))
             if entry is not _edge_canonical_start(edge):
                 local = 1.0 - local
-            out.append((edge, round(local, 6)))
+            out.append((edge, round(local, 6), number))
     return out
 
 
@@ -1412,18 +1526,21 @@ def _alignment_ticks(islands, uv_layer, runs_by_island, settings,
     length on a scaled object; None measures in object space.
     """
     wanted = {}
-    for edge, t in _segment_tick_params(islands, settings, matrix):
+    placed = _segment_ticks(islands, settings, matrix)
+    for edge, t, _n in placed:
         _remember_tick(wanted, edge, t)
     if not wanted:
         return [], []
 
-    # A stable index per seam, so "tick 3" means the same mark on both of
-    # its pieces when the numbers are switched on.
+    # Each mark's place along its seam segment, so "tick 3" is the third
+    # from the same end on both pieces. A mark `_remember_tick` merged into
+    # one already there keeps that one's number.
     numbering = {}
-    for edge, params in wanted.items():
+    for edge, t, n in placed:
+        kept = min(wanted[edge], key=lambda p: abs(p - t))
+        numbering.setdefault((edge, kept), n)
+    for params in wanted.values():
         params.sort()
-        for order, t in enumerate(params):
-            numbering[(edge, t)] = order + 1
 
     strokes, labels = [], []
     for isl in islands:
@@ -1599,6 +1716,8 @@ class SheetItem(NamedTuple):
     prefix: str = ''
     # The object's name: orders the sheet and names it in warnings.
     name: str = ''
+    # `mirror_planes(obj)`: open edges on these glue to their mirror twin.
+    mirror_planes: tuple = ()
 
 
 def piece_letters(n):
@@ -1719,6 +1838,8 @@ def _layout_sheet(items, settings, scale_length=1.0):
         item = part.item
         islands = [_Island(i, faces, item.uv_layer, sheet)
                    for i, faces in enumerate(part.islands_faces)]
+        for isl in islands:
+            isl.mirror_planes = tuple(item.mirror_planes)
         id_layer = item.bm.faces.layers.int.get('foam_island_id')
         for isl in islands:
             if id_layer is not None:
@@ -1754,7 +1875,8 @@ def _layout_sheet(items, settings, scale_length=1.0):
                 corner_angle_deg=settings.corner_angle_deg,
                 matrix=item.matrix,
                 dart_wedge_deg=settings.dart_wedge_deg,
-                max_darts_per_run=settings.max_darts_per_run):
+                max_darts_per_run=settings.max_darts_per_run,
+                mirror_planes=tuple(item.mirror_planes)):
             runs_by_island[r.island_index].append(r)
         part.islands = islands
         part.runs_by_island = runs_by_island

@@ -1,6 +1,7 @@
 """Run the FoamCraft test suite against a live Blender and print a summary.
 
     python tools/run_tests.py                  # a fresh Blender per test file
+    python tools/run_tests.py -j 1             # one at a time (default: 6 at once)
     python tools/run_tests.py --only theta     # one file
     python tools/run_tests.py --headless       # no window; skips what needs one
     python tools/run_tests.py --share          # one instance for the lot
@@ -42,6 +43,7 @@ Exits non-zero if anything failed, so it can gate a commit.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -100,6 +102,8 @@ TEST_FILES = (
     # Every setting rebuilds the overlay when changed (the Convex/Concave
     # Colour toggle did not).
     "tests/test_settings_refresh.py",
+    # A capture of the FoamCraft sidebar, for reviewing the panel layout.
+    "tests/test_panel_gui.py",
 )
 
 
@@ -124,6 +128,8 @@ GUI_FILES = frozenset({
     # needs the live window's UV editor to rebuild for. Its other two cases
     # are data-only and run either way.
     "tests/test_settings_refresh.py",
+    # Screenshots the sidebar; a background Blender has no sidebar to draw.
+    "tests/test_panel_gui.py",
     # NOT tests/test_export_raster.py, though it draws into a GPUOffScreen.
     # A background Blender refuses that at first -- and names the cure in the
     # refusal, gpu.init(). The file probes both and all of it passes headless
@@ -145,6 +151,10 @@ def _unlisted_test_files():
 
 LAUNCHER = ROOT / "tools" / "launch_blender.py"
 
+# Blenders at once. Each is a full process (a few hundred MB), so this is
+# capped rather than one per file: half the cores, at most six.
+DEFAULT_JOBS = max(1, min(6, (os.cpu_count() or 2) // 2))
+
 
 def _port_free(port):
     """True when nothing at all is listening on `port`."""
@@ -152,6 +162,11 @@ def _port_free(port):
     with socket.socket() as probe:
         probe.settimeout(0.3)
         return probe.connect_ex(("localhost", port)) != 0
+
+
+# Never taken by the suite, open or closed. 9885 is the user's own Blender
+# (CLAUDE.md); a free port there means it is closed, not that it is spare.
+RESERVED_PORTS = frozenset({9885})
 
 
 def free_ports(start, count):
@@ -164,7 +179,7 @@ def free_ports(start, count):
     """
     found, port, ceiling = [], start, start + 400
     while len(found) < count and port < ceiling:
-        if _port_free(port):
+        if port not in RESERVED_PORTS and _port_free(port):
             found.append(port)
         port += 1
     if len(found) < count:
@@ -226,8 +241,14 @@ def run_file(path, port):
     return {"__error__": response.get("message") or str(response)[:400]}
 
 
-def report_on(path, report):
-    """Print one file's results. Returns (tests, failures)."""
+def report_on(path, report, out=None):
+    """Print one file's results. Returns (tests, failures).
+
+    `out` collects the lines instead, so files running in parallel are each
+    reported whole and in list order rather than interleaved.
+    """
+    import builtins
+    print = builtins.print if out is None else out.append  # noqa: A001
     if "__error__" in report:
         print("  ERROR: %s" % report["__error__"])
         return 0, 1
@@ -257,7 +278,11 @@ def main():
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=9885)
+    # 9886 upward, never 9885: that is the port the user's own Blender
+    # listens on. Searching from 9885 only skipped it while it was open --
+    # with it closed (2026-11-17) the suite took 9885 and left a windowed
+    # instance there, off-screen, on the user's port.
+    parser.add_argument("--port", type=int, default=9886)
     parser.add_argument("--only", help="run just one file by substring")
     parser.add_argument("--gui-all", dest="force_gui", action="store_true",
                         help="open a window for every file, not just the ones "
@@ -271,6 +296,10 @@ def main():
                         help="one Blender for every file, the old behaviour. "
                              "Quicker while writing a test, but results depend "
                              "on what ran before them")
+    parser.add_argument("--jobs", "-j", type=int, default=DEFAULT_JOBS,
+                        help="how many Blenders run at once, each on its own "
+                             "file (default %d; 1 runs them one after another)"
+                             % DEFAULT_JOBS)
     parser.add_argument("--keep", action="store_true",
                         help="with --share, leave Blender running afterwards")
     args = parser.parse_args()
@@ -302,20 +331,38 @@ def main():
         # Chosen up front, skipping anything already listening, so the suite
         # never stops or starts on a port that belongs to someone else.
         ports = free_ports(args.port, len(files))
-        for index, path in enumerate(files):
-            port = ports[index]
+
+        def one(index):
+            path, port = files[index], ports[index]
             # Windowed only where the file needs it, unless --gui forces it
             # for all of them.
             want_gui = args.gui and (args.force_gui or path in GUI_FILES)
-            print("\n=== %s   (fresh blender on %d%s)"
-                  % (path, port, ", windowed" if want_gui else ""))
+            lines = []
+            began = time.time()
             start(port, want_gui)
             try:
-                counted, failed = report_on(path, run_file(path, port))
+                counted, failed = report_on(path, run_file(path, port), lines)
             finally:
                 stop(port)
-            total += counted
-            failures += failed
+            head = "\n=== %s   (fresh blender on %d%s, %.0fs)" % (
+                path, port, ", windowed" if want_gui else "",
+                time.time() - began)
+            return [head] + lines, counted, failed
+
+        # Parallel is safe for the reason serial was: every file still gets
+        # its own Blender, so nothing one file does can reach another. All
+        # they share is the screenshots folder, whose counter tolerates two
+        # captures taking one number (tools/shot.py).
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            futures = [pool.submit(one, k) for k in range(len(files))]
+            # Reported in list order, each file whole, as a serial run would.
+            for future in futures:
+                lines, counted, failed = future.result()
+                print("\n".join(lines))
+                sys.stdout.flush()
+                total += counted
+                failures += failed
 
     print("\n%d test(s), %d failure(s) in %.0fs"
           % (total, failures, time.time() - started_at))

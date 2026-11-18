@@ -2,8 +2,8 @@
 
 Two related workflows share one geometry core:
 
-* Paper  -- ``uv_fold_angle_overlay`` (live UV overlay) and ``paper_model_export``
-  (companion SVG for Blender's bundled Export Paper Model add-on).
+* Paper  -- ``paper_model_export`` (companion SVG for Blender's bundled Export
+  Paper Model add-on).
 * Foam   -- ``foam_panel_tabs``: saw bevel angles, relief darts and cut patterns
   for panels with real material thickness.
 
@@ -23,14 +23,16 @@ bl_info = {
 
 from . import foam_angle_core  # noqa: F401  (pure helpers, nothing to register)
 from . import foam_settings
-from . import uv_fold_angle_overlay
 from . import paper_model_export
 
 # Submodules exposing register()/unregister(). Settings register first; every
 # foam module reads scene.foamcraft_drachis from it.
+#
+# The standalone paper fold-angle overlay (its own "Fold Angles" sidebar tab)
+# was removed 2026-11-17: the project's original seed script, superseded by
+# foam_overlay, and it read as a second plugin in the sidebar.
 _modules = [
     foam_settings,
-    uv_fold_angle_overlay,
     paper_model_export,
 ]
 

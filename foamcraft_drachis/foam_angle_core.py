@@ -1,12 +1,13 @@
 """Shared geometry and math for the FoamCraft add-on.
 
 Pure functions only -- no bpy.types subclasses, no register()/unregister().
-Both the paper workflow (uv_fold_angle_overlay, paper_model_export) and the
+Both the paper workflow (paper_model_export) and the
 foam workflow (foam_panel_tabs) import from here.
 """
 
 import sys
 from dataclasses import dataclass, field
+from typing import NamedTuple
 from math import acos, degrees, tan, cos, radians
 
 from mathutils import Vector
@@ -35,11 +36,13 @@ MIN_BEVEL_ANGLE_DEG = 5.0
 DART_WEDGE_DEG = 15.0
 
 
-def dihedral_angle_deg(edge):
+def dihedral_angle_deg(edge, mirror_planes=()):
     """Signed fold angle between the two 3D faces sharing this edge.
 
     Positive = convex/mountain, negative = concave/valley. None if the edge
-    doesn't have exactly two connected faces (mesh boundary).
+    doesn't have exactly two connected faces (mesh boundary) -- unless it
+    lies on one of `mirror_planes`, where it folds against its own mirror
+    twin (`mirror_twin_angle_deg`).
 
     Uses BMEdge.calc_face_angle_signed rather than a hand-rolled cross-product
     sign test. The hand-rolled version this replaces derived its sign from
@@ -51,9 +54,56 @@ def dihedral_angle_deg(edge):
     three unambiguous cases on 5.2.0: cube = +90 (all convex), normals-flipped
     cube = -90, explicit valley crease = -90.
     """
-    if len(edge.link_faces) != 2:
+    if len(edge.link_faces) == 2:
+        return degrees(edge.calc_face_angle_signed(0.0))
+    return mirror_twin_angle_deg(edge, mirror_planes)
+
+
+class MirrorPlane(NamedTuple):
+    """A Mirror modifier's plane, in the mesh's own (object-local) space."""
+    point: object      # mathutils.Vector
+    normal: object     # mathutils.Vector, unit length
+    tolerance: float   # the modifier's merge_threshold
+
+
+def on_mirror_plane(edge, planes):
+    """The plane an open `edge` lies on, or None.
+
+    Within the modifier's own merge distance, at both ends: the distance at
+    which Blender welds a vertex to its mirror twin is exactly how close an
+    edge has to lie to be glued to its twin.
+    """
+    if len(edge.link_faces) != 1:
         return None
-    return degrees(edge.calc_face_angle_signed(0.0))
+    for p in planes:
+        if all(abs((v.co - p.point).dot(p.normal)) <= p.tolerance
+               for v in edge.verts):
+            return p
+    return None
+
+
+def mirror_twin_angle_deg(edge, planes):
+    """The signed fold between an open edge's one face and its mirror twin,
+    or None when the edge is not on a mirror plane.
+
+    The twin is the face reflected in the plane, so its normal is the
+    reflected normal and the fold's size is the angle between the two. The
+    sign follows `calc_face_angle_signed`'s convention (positive = convex):
+    convex when the twin's centre lies behind this face's plane. Checked
+    against Blender's own answer on the mesh with the modifier applied
+    (tests/test_marks_model.py).
+    """
+    plane = on_mirror_plane(edge, planes)
+    if plane is None:
+        return None
+    face = edge.link_faces[0]
+    n, m = face.normal, plane.normal
+    twin_normal = n - m * (2.0 * n.dot(m))
+    size = degrees(n.angle(twin_normal, 0.0))
+    centre = face.calc_center_median()
+    twin_centre = centre - m * (2.0 * (centre - plane.point).dot(m))
+    behind = n.dot(twin_centre - edge.verts[0].co) < 0.0
+    return size if behind else -size
 
 
 def iter_uv_edges(bm, uv_layer, only_selected=False):
@@ -602,7 +652,8 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
                            max_angle_variation_deg, island_index=0,
                            corner_angle_deg=CORNER_ANGLE_DEG,
                            matrix=None, dart_wedge_deg=DART_WEDGE_DEG,
-                           max_darts_per_run=0, defect_load=None):
+                           max_darts_per_run=0, defect_load=None,
+                           mirror_planes=()):
     """Split one boundary cycle into DartRuns.
 
     A run is one continuous pass at one blade tilt, so the angle staying put is
@@ -630,7 +681,7 @@ def segment_boundary_cycle(cycle, uv_layer, max_chord_deviation,
     angles = []
     measured = []
     for loop in cycle:
-        ang = dihedral_angle_deg(loop.edge)
+        ang = dihedral_angle_deg(loop.edge, mirror_planes)
         measured.append(ang is not None)
         angles.append(0.0 if ang is None else ang)
 
@@ -854,7 +905,8 @@ def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
                                 islands=None,
                                 corner_angle_deg=CORNER_ANGLE_DEG,
                                 matrix=None, dart_wedge_deg=DART_WEDGE_DEG,
-                           max_darts_per_run=0, defect_load=None):
+                           max_darts_per_run=0, defect_load=None,
+                           mirror_planes=()):
     """Yield a DartRun for every saw pass along every UV island boundary.
 
     This replaces per-mesh-edge iteration: foam flexes between darts, so a dart
@@ -875,7 +927,7 @@ def iter_boundary_dart_segments(bm, uv_layer, max_chord_deviation,
                     corner_angle_deg=corner_angle_deg, matrix=matrix,
                     dart_wedge_deg=dart_wedge_deg,
                     max_darts_per_run=max_darts_per_run,
-                    defect_load=load):
+                    defect_load=load, mirror_planes=mirror_planes):
                 yield run
 
 

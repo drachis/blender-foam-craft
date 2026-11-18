@@ -5,8 +5,8 @@ boundary is divided into runs by perpendicular tick marks, and each run carries
 the bevel angle for that single saw pass -- the |--- 45° ---| convention. Piece
 numbers sit at island centres.
 
-This is deliberately not the paper overlay in ``uv_fold_angle_overlay``. That
-one labels every mesh edge, which is correct for paper (every polygon edge is a
+This is deliberately not the old paper overlay (``uv_fold_angle_overlay``,
+removed 2026-11-17). That one labelled every mesh edge, which is correct for paper (every polygon edge is a
 fold) and unreadable for foam (foam bends between darts, so most edges need no
 mark at all).
 
@@ -273,10 +273,20 @@ def _signature(pairs, s):
          # The piece names it prints, and where it sits: a shared sheet's
          # scale and the mirror warning both follow the world matrix.
          getattr(obj, "foamcraft_drachis_prefix", ""),
-         tuple(round(v, 6) for row in obj.matrix_world for v in row))
+         tuple(round(v, 6) for row in obj.matrix_world for v in row),
+         # A Mirror modifier's axes, mirror object and merge distance
+         # decide which open edges are seams (foam_marks.is_join).
+         tuple((tuple(round(c, 6) for c in p.point),
+                tuple(round(c, 6) for c in p.normal), round(p.tolerance, 9))
+               for p in _mirror_planes(obj)))
         for obj, bm, uv_layer in pairs
     )
     return (per_object, round(_scale_length(s), 6), _settings_key(s))
+
+
+def _mirror_planes(obj):
+    from . import foam_marks as fm
+    return fm.mirror_planes(obj)
 
 
 def _scale_length(s):
@@ -360,7 +370,8 @@ class _Model:
         self.island_shown = _island_shown(self.islands, s, shown_islands)
 
     def run_end_marks(self):
-        """The sheet's run-end marks, as ((u0, v0, u1, v1), ...).
+        """The sheet's run-end marks, each a closed ring of UV points:
+        (((u, v), ...), ...).
 
         `foam_marks._run_end_marks` is what `build_marks` draws them with:
         only where a run ends part way along a seam, never at a corner or a
@@ -377,8 +388,7 @@ class _Model:
                 self.stroke_mm * 0.7):
             if not self.island_shown[island_index]:
                 continue
-            (x0, y0), (x1, y1) = stroke.points[0], stroke.points[-1]
-            out.append(to_uv(x0, y0) + to_uv(x1, y1))
+            out.append(tuple(tuple(to_uv(x, y)) for x, y in stroke.points))
         return out
 
     def align_ticks(self):
@@ -588,7 +598,7 @@ def _rebuild(pairs, s):
                       fm.object_prefix(
                           obj.name,
                           getattr(obj, "foamcraft_drachis_prefix", "")),
-                      obj.name)
+                      obj.name, tuple(fm.mirror_planes(obj)))
          for obj, bm, uv_layer in pairs], s, _scale_length(s))
     part_of = {part.item.name: part for part in parts}
     # Sheet-wide island ordinals (`BevelAnchor.piece`) left on screen by
@@ -611,7 +621,8 @@ def _rebuild(pairs, s):
                 corner_angle_deg=s.corner_angle_deg,
                 matrix=obj.matrix_world,
                 dart_wedge_deg=s.dart_wedge_deg,
-                max_darts_per_run=s.max_darts_per_run))
+                max_darts_per_run=s.max_darts_per_run,
+                mirror_planes=tuple(part.item.mirror_planes)))
 
         # What the sheet prints, asked of the model once per object.
         if s.show_align_ticks or s.show_brackets:
@@ -1162,11 +1173,11 @@ def draw_callback():
     # a seam: the sheet's own, from the line inward. None at corners.
     if s.show_brackets and _cache.run_end_marks:
         bucket = segments.setdefault(tuple(s.island_id_color), [])
-        for u0, v0, u1, v1 in _cache.run_end_marks:
-            x0, y0 = view.view_to_region(u0, v0, clip=False)
-            x1, y1 = view.view_to_region(u1, v1, clip=False)
-            if all(abs(c) < 1e6 for c in (x0, y0, x1, y1)):
-                bucket.extend([(x0, y0), (x1, y1)])
+        for ring in _cache.run_end_marks:
+            pts = [view.view_to_region(u, v, clip=False) for u, v in ring]
+            if all(abs(c) < 1e6 for p in pts for c in p):
+                for k, p in enumerate(pts):
+                    bucket.extend([p, pts[(k + 1) % len(pts)]])
 
     # Bevel labels: seam number, blade-tilt arrow and degrees, at the place,
     # size and turn the exported sheet prints them -- the laid-out labels
@@ -1347,156 +1358,6 @@ _SEVERITY_ICON = {'blocker': 'CANCEL', 'warn': 'ERROR',
                   'info': 'INFO', 'ok': 'CHECKMARK'}
 
 
-class IMAGE_PT_foamcraft_drachis(bpy.types.Panel):
-    bl_space_type = 'IMAGE_EDITOR'
-    bl_region_type = 'UI'
-    bl_category = "FoamCraft"
-    bl_label = "Foam Cut Plan"
-
-    def draw(self, context):
-        layout = self.layout
-        s = _settings(context)
-        if s is None:
-            layout.label(text="FoamCraft settings unavailable", icon='ERROR')
-            return
-
-        layout.prop(s, "show_overlay", toggle=True)
-        col = layout.column()
-        col.enabled = s.show_overlay
-
-        box = col.box()
-        box.label(text="Material")
-        box.prop(s, "foam_grade")
-        box.prop(s, "foam_thickness")
-
-        box = col.box()
-        box.label(text="Cut Runs")
-        box.prop(s, "max_chord_deviation")
-        box.prop(s, "max_angle_variation_deg")
-        box.prop(s, "max_tilt_deg")
-        box.operator("foamcraft_drachis.estimate_tolerances", icon='SHADERFX')
-        box.label(text=f"{len(_cache.runs)} run(s) cached")
-        box.operator(FOAMCRAFT_DRACHIS_OT_refresh_overlay.bl_idname, icon='FILE_REFRESH')
-
-        box = col.box()
-        box.label(text="Show")
-        row = box.row(align=True)
-        row.prop(s, "show_brackets", toggle=True)
-        row.prop(s, "show_island_ids", toggle=True)
-        row = box.row(align=True)
-        row.prop(s, "show_heat_form", toggle=True)
-        row.prop(s, "show_dart_colors", toggle=True)
-        box.prop(s, "only_selected")
-        box.prop(s, "overlay_scale")
-
-
-class IMAGE_PT_foamcraft_drachis_display(bpy.types.Panel):
-    bl_space_type = 'IMAGE_EDITOR'
-    bl_region_type = 'UI'
-    bl_category = "FoamCraft"
-    bl_label = "Display"
-    bl_parent_id = "IMAGE_PT_foamcraft_drachis"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        s = _settings(context)
-        if s is None:
-            return
-        layout.prop(s, "corner_angle_deg")
-        layout.separator()
-        layout.prop(s, "scale_text_with_view")
-        if s.scale_text_with_view:
-            layout.prop(s, "angle_text_size")
-            layout.prop(s, "mark_size")
-            layout.prop(s, "number_size")
-        else:
-            layout.prop(s, "font_size")
-            layout.prop(s, "tick_length_px")
-            layout.prop(s, "island_id_font_size")
-        layout.prop(s, "decimals")
-        layout.prop(s, "min_angle")
-        layout.prop(s, "show_darts")
-        layout.prop(s, "allow_gores")
-        layout.prop(s, "show_blockers")
-        col = layout.column(align=True)
-        col.enabled = s.show_darts
-        col.prop(s, "dart_wedge_deg")
-        col.prop(s, "max_darts_per_run")
-        layout.prop(s, "min_label_run_px")
-        layout.prop(s, "min_run_length")
-        layout.separator()
-        layout.prop(s, "log_level")
-        # Show where the log actually is. Otherwise the only way to find it is
-        # to already know, which makes the log useless to anyone debugging.
-        col = layout.column(align=True)
-        col.enabled = False
-        col.label(text=foam_log.log_path(), icon='TEXT')
-        layout.prop(s, "convex_color")
-        layout.prop(s, "concave_color")
-        layout.prop(s, "blocker_color")
-        layout.prop(s, "suppressed_color")
-        layout.prop(s, "heat_form_color")
-        layout.prop(s, "island_id_color")
-
-
-class IMAGE_PT_foamcraft_drachis_advice(bpy.types.Panel):
-    bl_space_type = 'IMAGE_EDITOR'
-    bl_region_type = 'UI'
-    bl_category = "FoamCraft"
-    bl_label = "Craftability"
-    bl_parent_id = "IMAGE_PT_foamcraft_drachis"
-
-    def draw(self, context):
-        layout = self.layout
-        s = _settings(context)
-        if s is None:
-            return
-        # Real-world size of what is being built, so the sheet figures below
-        # can be judged against it without leaving the panel.
-        objects = getattr(context, "objects_in_mode", None) or []
-        if not objects and context.edit_object:
-            objects = [context.edit_object]
-        meshes = [o for o in objects if o and o.type == 'MESH']
-        if meshes:
-            unit = context.scene.unit_settings.scale_length
-            box = layout.box()
-            box.label(text="Model Size", icon='FIXED_SIZE')
-            for obj in meshes:
-                w, d, h = (v * unit for v in obj.dimensions)
-                if len(meshes) > 1:
-                    box.label(text=obj.name)
-                # One row each: the sidebar is narrow enough that two
-                # dimensions on a line get truncated mid-number.
-                col = box.column(align=True)
-                col.scale_y = 0.85
-                for axis, value in (("W", w), ("D", d), ("H", h)):
-                    col.label(text=f"{axis}  {_fmt_len(value)}")
-
-        row = layout.row(align=True)
-        row.prop(s, "sheet_width")
-        row.prop(s, "sheet_height")
-        layout.prop(s, "stretch_tolerance")
-        layout.operator(FOAMCRAFT_DRACHIS_OT_check_craftability.bl_idname, icon='VIEWZOOM')
-
-        if not _findings:
-            layout.label(text="Not checked yet")
-            return
-
-        for finding in _findings:
-            box = layout.box()
-            box.label(text=finding.title,
-                      icon=_SEVERITY_ICON.get(finding.severity, 'DOT'))
-            for line in _wrap(finding.detail, 44):
-                box.label(text=line)
-            if finding.severity != 'ok':
-                sub = box.column(align=True)
-                sub.scale_y = 0.8
-                for para in finding.advice.split("\n"):
-                    for line in _wrap(para, 46):
-                        sub.label(text=line)
-
-
 def _operator_registered(idname):
     """True when "category.name" is a registered operator.
 
@@ -1513,13 +1374,51 @@ def _operator_registered(idname):
     return True
 
 
+def _section(layout, idname, title, toggle=None, settings=None,
+             default_closed=True):
+    """A collapsible section inside a panel, Blender's own layout.panel().
+
+    `toggle` names a boolean drawn as a checkbox in the section header, the
+    way Blender's own sub-panels carry an enable switch; the body is then
+    drawn disabled while it is off. Returns the body layout, or None when the
+    section is collapsed.
+    """
+    header, body = layout.panel(idname, default_closed=default_closed)
+    if toggle is not None:
+        header.use_property_split = False
+        header.prop(settings, toggle, text="")
+    header.label(text=title)
+    if body is not None:
+        body.use_property_split = True
+        body.use_property_decorate = False
+        if toggle is not None:
+            body.enabled = bool(getattr(settings, toggle))
+    return body
+
+
+def _wysiwyg_note(layout):
+    note = layout.row()
+    note.enabled = False
+    note.label(text="The UV overlay previews the printout", icon='INFO')
+
+
 class IMAGE_PT_foamcraft_drachis_export(bpy.types.Panel):
+    """Everything that decides what is printed, with the export at the top.
+
+    The overlay is a preview of the sheet (both draw the same foam_marks
+    model), so every setting here changes the overlay and the file alike.
+    Settings that only change the screen live in "On Screen" instead.
+    """
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "FoamCraft"
-    bl_label = "Print / Export"
-    bl_parent_id = "IMAGE_PT_foamcraft_drachis"
-    bl_options = {'DEFAULT_CLOSED'}
+    bl_label = "Foam Pattern"
+    bl_order = 0
+
+    def draw_header(self, context):
+        s = _settings(context)
+        if s is not None:
+            self.layout.prop(s, "show_overlay", text="")
 
     def draw(self, context):
         layout = self.layout
@@ -1528,55 +1427,261 @@ class IMAGE_PT_foamcraft_drachis_export(bpy.types.Panel):
             layout.label(text="FoamCraft settings unavailable", icon='ERROR')
             return
 
-        box = layout.box()
-        box.label(text="Alignment Marks")
-        box.prop(s, "show_align_ticks")
-        col = box.column()
-        col.enabled = s.show_align_ticks
-        col.prop(s, "tick_mode")
-        if s.tick_mode == 'BY_DISTANCE':
-            col.prop(s, "tick_spacing")
-        else:
-            col.prop(s, "ticks_per_run")
-        col.prop(s, "tick_length")
-        col.prop(s, "tick_numbers")
-
-        box = layout.box()
-        box.label(text="Bevels")
-        box.prop(s, "show_seam_numbers")
-        box.prop(s, "pattern_surface")
-        box.prop(s, "min_label_mm")
-
-        box = layout.box()
-        box.label(text="Pieces")
-        box.prop(s, "piece_label_style")
-        obj = context.active_object
-        if obj is not None and obj.type == 'MESH':
-            row = box.row()
-            row.enabled = s.piece_label_style == 'NAME'
-            row.prop(obj, "foamcraft_drachis_prefix")
-            if not obj.foamcraft_drachis_prefix:
-                # Say what an empty field prints, rather than leave the
-                # maker to discover it on paper.
-                from . import foam_marks as fm
-                note = box.row()
-                note.enabled = False
-                note.label(text="Uses %s" % fm.object_prefix(obj.name, ""))
-
-        box = layout.box()
-        box.label(text="Sheet")
-        box.prop(s, "island_fill")
-        box.prop(s, "show_scale_ruler")
-
+        col = layout.column(align=True)
+        col.scale_y = 1.4
         for idname, text, icon in (
                 ("foamcraft_drachis.export_pattern_image", "Export Image", 'IMAGE_DATA'),
                 ("foamcraft_drachis.export_panel_pattern", "Export SVG", 'EXPORT')):
             if _operator_registered(idname):
-                layout.operator(idname, text=text, icon=icon)
+                col.operator(idname, text=text, icon=icon)
             else:
-                row = layout.row()
+                row = col.row()
                 row.enabled = False
                 row.label(text=f"{text} (unavailable)", icon=icon)
+        _wysiwyg_note(layout)
+
+        body = _section(layout, "fc_bevels", "Bevel Labels",
+                        toggle="show_brackets", settings=s, default_closed=False)
+        if body:
+            body.prop(s, "pattern_surface")
+            body.prop(s, "show_seam_numbers")
+            body.prop(s, "min_angle", text="Min Angle")
+            body.prop(s, "decimals")
+            body.prop(s, "angle_text_size", text="Text Size")
+            body.prop(s, "min_label_mm", text="Min Text Size")
+            body.prop(s, "max_tilt_deg")
+            body.prop(s, "show_heat_form")
+
+        body = _section(layout, "fc_ticks", "Alignment Marks",
+                        toggle="show_align_ticks", settings=s)
+        if body:
+            body.prop(s, "tick_mode")
+            if s.tick_mode == 'BY_DISTANCE':
+                body.prop(s, "tick_spacing")
+            else:
+                body.prop(s, "ticks_per_run")
+            body.prop(s, "tick_length")
+            body.prop(s, "tick_numbers")
+            body.prop(s, "corner_angle_deg")
+            # Where the mirror line comes from: the object's own Mirror
+            # modifier, so say whether one is being read.
+            obj = getattr(context, "active_object", None)
+            mirrors = [m for m in getattr(obj, "modifiers", ())
+                       if getattr(m, "type", None) == 'MIRROR'
+                       and m.show_viewport]
+            if mirrors:
+                axes = "".join(a for m in mirrors
+                               for a, on in zip("XYZ", m.use_axis) if on)
+                centre = next((m.mirror_object.name for m in mirrors
+                               if m.mirror_object is not None), "origin")
+                body.label(text=f"Mirror {axes or '-'} about {centre}: "
+                                "open edges on it are seams",
+                           icon='MOD_MIRROR')
+            else:
+                body.label(text="Add a Mirror modifier to mark a centre line",
+                           icon='MOD_MIRROR')
+
+        body = _section(layout, "fc_darts", "Relief Darts",
+                        toggle="show_darts", settings=s)
+        if body:
+            body.prop(s, "dart_wedge_deg")
+            body.prop(s, "max_darts_per_run")
+            body.prop(s, "notch_shape")
+            body.prop(s, "notch_depth_ratio")
+            body.prop(s, "allow_gores")
+
+        body = _section(layout, "fc_pieces", "Piece Names",
+                        toggle="show_island_ids", settings=s)
+        if body:
+            body.prop(s, "piece_label_style")
+            obj = context.active_object
+            if obj is not None and obj.type == 'MESH':
+                row = body.row()
+                row.enabled = s.piece_label_style == 'NAME'
+                row.prop(obj, "foamcraft_drachis_prefix")
+                if not obj.foamcraft_drachis_prefix:
+                    # Say what an empty field prints, rather than leave the
+                    # maker to discover it on paper.
+                    from . import foam_marks as fm
+                    note = body.row()
+                    note.enabled = False
+                    note.label(text="Uses %s" % fm.object_prefix(obj.name, ""))
+            body.prop(s, "number_size", text="Text Size")
+            body.prop(s, "origin_object")
+            body.operator("foamcraft_drachis.assign_island_ids",
+                          text="Renumber Pieces", icon='LINENUMBERS_ON')
+
+        body = _section(layout, "fc_sheet", "Sheet & Colour", settings=s)
+        if body:
+            body.prop(s, "overlay_scale", text="Mark Scale")
+            body.prop(s, "island_fill")
+            body.prop(s, "show_scale_ruler")
+            body.prop(s, "show_dart_colors")
+            sub = body.column()
+            sub.enabled = s.show_dart_colors
+            sub.prop(s, "convex_color")
+            sub.prop(s, "concave_color")
+            sub = body.column()
+            sub.enabled = s.show_heat_form
+            sub.prop(s, "heat_form_color")
+
+
+class IMAGE_PT_foamcraft_drachis_advice(bpy.types.Panel):
+    bl_space_type = 'IMAGE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "FoamCraft"
+    bl_label = "Craftability"
+    bl_order = 1
+
+    def draw(self, context):
+        layout = self.layout
+        s = _settings(context)
+        if s is None:
+            return
+
+        row = layout.row()
+        row.scale_y = 1.4
+        row.operator(FOAMCRAFT_DRACHIS_OT_check_craftability.bl_idname,
+                     icon='VIEWZOOM')
+
+        if not _findings:
+            layout.label(text="Not checked yet")
+        else:
+            counts = {}
+            for finding in _findings:
+                counts[finding.severity] = counts.get(finding.severity, 0) + 1
+            # Counts beside their icons only: words truncate in a sidebar of
+            # default width (measured in the 2026-11-17 capture).
+            row = layout.row()
+            for severity in ('blocker', 'warn', 'info'):
+                if counts.get(severity):
+                    row.label(text=str(counts[severity]),
+                              icon=_SEVERITY_ICON[severity])
+            if not (counts.get('blocker') or counts.get('warn')):
+                row.label(text="Buildable", icon='CHECKMARK')
+            # One line per finding; the explanation opens on demand, so the
+            # verdict reads at a glance instead of being buried in text.
+            for k, finding in enumerate(_findings):
+                header, body = layout.panel(
+                    f"fc_finding_{finding.code}_{k}", default_closed=True)
+                header.label(text=finding.title,
+                             icon=_SEVERITY_ICON.get(finding.severity, 'DOT'))
+                if body is None:
+                    continue
+                col = body.column(align=True)
+                for line in _wrap(finding.detail, 44):
+                    col.label(text=line)
+                if finding.severity != 'ok':
+                    col.separator()
+                    sub = body.column(align=True)
+                    sub.scale_y = 0.8
+                    for para in finding.advice.split("\n"):
+                        for line in _wrap(para, 46):
+                            sub.label(text=line)
+
+        body = _section(layout, "fc_check_limits", "Limits", settings=s)
+        if body:
+            body.prop(s, "sheet_width")
+            body.prop(s, "sheet_height")
+            body.prop(s, "stretch_tolerance")
+            body.prop(s, "min_run_length")
+
+        # Real-world size of what is being built, so the sheet figures above
+        # can be judged against it without leaving the panel.
+        objects = getattr(context, "objects_in_mode", None) or []
+        if not objects and context.edit_object:
+            objects = [context.edit_object]
+        meshes = [o for o in objects if o and o.type == 'MESH']
+        if meshes:
+            body = _section(layout, "fc_model_size", "Model Size", settings=s)
+            if body:
+                unit = context.scene.unit_settings.scale_length
+                for obj in meshes:
+                    w, d, h = (v * unit for v in obj.dimensions)
+                    if len(meshes) > 1:
+                        body.label(text=obj.name)
+                    # One row each: the sidebar is narrow enough that two
+                    # dimensions on a line get truncated mid-number.
+                    col = body.column(align=True)
+                    col.scale_y = 0.85
+                    for axis, value in (("W", w), ("D", d), ("H", h)):
+                        col.label(text=f"{axis}  {_fmt_len(value)}")
+
+
+class IMAGE_PT_foamcraft_drachis(bpy.types.Panel):
+    """How the UV boundaries are split into cut runs, and the foam."""
+    bl_space_type = 'IMAGE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "FoamCraft"
+    bl_label = "Cut Runs"
+    bl_order = 2
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = _settings(context)
+        if s is None:
+            layout.label(text="FoamCraft settings unavailable", icon='ERROR')
+            return
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        col = layout.column()
+        col.prop(s, "foam_grade")
+        col.prop(s, "foam_thickness")
+        col.separator()
+        col.prop(s, "max_chord_deviation")
+        col.prop(s, "max_angle_variation_deg")
+        col.operator("foamcraft_drachis.estimate_tolerances", icon='SHADERFX')
+        row = layout.row()
+        row.label(text=f"{len(_cache.runs)} run(s)")
+        row.operator(FOAMCRAFT_DRACHIS_OT_refresh_overlay.bl_idname,
+                     text="Refresh", icon='FILE_REFRESH')
+
+
+class IMAGE_PT_foamcraft_drachis_display(bpy.types.Panel):
+    """Settings that change the UV editor and never the printout."""
+    bl_space_type = 'IMAGE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "FoamCraft"
+    bl_label = "On Screen Only"
+    bl_order = 3
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        s = _settings(context)
+        if s is None:
+            return
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(s, "only_selected")
+        layout.prop(s, "min_label_run_px")
+        layout.prop(s, "show_blockers")
+        layout.prop(s, "scale_text_with_view")
+        col = layout.column()
+        if s.scale_text_with_view:
+            col.prop(s, "mark_size")
+        else:
+            col.prop(s, "font_size")
+            col.prop(s, "tick_length_px")
+            col.prop(s, "island_id_font_size")
+
+        body = _section(layout, "fc_screen_colours", "Colours", settings=s)
+        if body:
+            body.prop(s, "island_id_color")
+            body.prop(s, "blocker_color")
+            body.prop(s, "suppressed_color")
+
+        body = _section(layout, "fc_debug", "Debug Log", settings=s)
+        if body:
+            body.prop(s, "log_level")
+            # Show where the log actually is. Otherwise the only way to find
+            # it is to already know, which makes the log useless to anyone
+            # debugging.
+            col = body.column(align=True)
+            col.enabled = False
+            col.label(text=foam_log.log_path(), icon='TEXT')
 
 
 def _fmt_len(metres):
@@ -1612,10 +1717,10 @@ def _wrap(text, width):
 _classes = (
     FOAMCRAFT_DRACHIS_OT_refresh_overlay,
     FOAMCRAFT_DRACHIS_OT_check_craftability,
+    IMAGE_PT_foamcraft_drachis_export,
+    IMAGE_PT_foamcraft_drachis_advice,
     IMAGE_PT_foamcraft_drachis,
     IMAGE_PT_foamcraft_drachis_display,
-    IMAGE_PT_foamcraft_drachis_advice,
-    IMAGE_PT_foamcraft_drachis_export,
 )
 
 

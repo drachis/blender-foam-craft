@@ -183,7 +183,18 @@ when a print service asks for it.
   Marks are spread along each stretch of edge from one corner to the next:
   either a fixed number, evenly spaced (default 2), or one every set
   distance (default 25 mm), centred so none lands on a corner. Each mark is 6 mm long by default, and the numbering
-  toggle is off. Turn the marks off if you do not want them.
+  toggle is off. With numbering on, ticks count from one corner to the next
+  along the seam, so the third tick on one piece is the third on its
+  neighbour. Turn the marks off if you do not want them.
+  - Open edges (the rim of the model) glue to nothing and get no marks.
+  - **Mirror line.** Model one half with a **Mirror modifier**, and open edges
+    lying on its plane count as seams: they get alignment marks, a seam
+    number, and the bevel against the mirrored half. The plane comes from the
+    modifier: its axis toggles, its Mirror Object (an empty), or the object's
+    origin when there is none, within its Merge distance.
+  - A small **circle** on a cut line marks a *run end*: where the bevel angle
+    changes part way along a seam. It belongs to that piece's cut only, so
+    the neighbouring piece has no circle there.
 - **Colour Pieces** (on by default). Each piece is filled with its own colour,
   so it can be matched to the model. Turn it off before printing on plain
   paper: outlines and numbers are what you want there.
@@ -211,15 +222,19 @@ shaded overlap band to align against its neighbour. Options are `--page`
 
 ## Panels
 
-All in the UV Editor sidebar (<kbd>N</kbd>):
+All in the UV Editor sidebar (<kbd>N</kbd>), **FoamCraft** tab, top to bottom:
 
-- **FoamCraft ▸ Pattern** — Grease Pencil bake
-- **FoamCraft ▸ Foam Cut Plan** — material, saw, darts, numbering
-- **FoamCraft ▸ Foam Cut Plan ▸ Display** — what the overlay draws
-- **FoamCraft ▸ Foam Cut Plan ▸ Craftability** — findings from the last check
-- **FoamCraft ▸ Foam Cut Plan ▸ Print / Export** — image and SVG export, with
-  alignment marks, piece colour and the scale ruler
-- **Fold Angles** — the standalone live fold-angle overlay
+- **Foam Pattern** — Export Image / Export SVG, then everything that changes
+  the printout: bevel labels, alignment marks, relief darts, piece names,
+  sheet and colour. The UV overlay is a preview of the printout; its on/off
+  switch is the checkbox in this panel's header.
+- **Craftability** — Check, a one-line count, and one line per finding (click
+  a finding for the explanation and the fix); limits and model size below.
+- **Cut Runs** — foam grade and thickness, and how boundaries split into runs.
+- **On Screen Only** — settings that change the UV editor but never the print,
+  and the debug log.
+- **Pattern from Strokes** — the Grease Pencil bake, an alternative way to
+  arrive at the UVs.
 
 ## Paper model companion (optional)
 
@@ -259,8 +274,6 @@ Honest list of what is unresolved as of 0.1:
   reliably matches what the UV Editor is displaying when a mesh has several UV
   maps has not been confirmed. With one UV map — the normal case — this cannot
   bite.
-- **Two sidebar tabs.** The standalone fold-angle overlay sits under its own
-  **Fold Angles** tab rather than with the rest of FoamCraft. Cosmetic.
 - **Foam grade stiffness figures are rough.** The relative stiffness numbers
   behind the grade presets give a sensible *ordering*, not calibrated physical
   values. Calibrate against a bend test on your actual stock before trusting

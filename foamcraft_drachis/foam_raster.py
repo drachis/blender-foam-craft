@@ -802,7 +802,7 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
         default='DPI')
     dpi: bpy.props.IntProperty(
         name="DPI", description="Pixels per inch of pattern",
-        default=300, min=10, max=2400)
+        default=300, min=1, soft_min=10, soft_max=2400)
     pages: bpy.props.EnumProperty(
         name="Pages",
         items=(('NONE', "Whole sheet only", "One image"),
@@ -815,7 +815,8 @@ class FOAMCRAFT_DRACHIS_OT_export_pattern_image(bpy.types.Operator,
         default='NONE')
     size: bpy.props.IntProperty(
         name="Size", description="Longest edge of the image",
-        default=4096, min=64, max=MAX_PIXELS, subtype='PIXEL')
+        default=4096, min=1, soft_min=64, soft_max=MAX_PIXELS,
+        subtype='PIXEL')
 
     # ExportHelper reads this to name the file and to correct its extension
     # as the format changes in the file browser.

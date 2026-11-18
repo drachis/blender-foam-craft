@@ -53,7 +53,8 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         name="Thickness",
         description="Thickness of the foam sheet being cut. Independent of "
                     "grade -- read it off the stock you actually have",
-        default=THICKNESS_DEFAULT, min=THICKNESS_MIN, max=THICKNESS_MAX,
+        default=THICKNESS_DEFAULT, min=0.0,
+        soft_min=THICKNESS_MIN, soft_max=THICKNESS_MAX,
         subtype='DISTANCE', unit='LENGTH', precision=4)
 
     # --- Saw
@@ -62,11 +63,11 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         description="Furthest the saw blade tilts off vertical. Seams needing "
                     "more than this are flagged for heat forming rather than "
                     "silently clamped",
-        default=45.0, min=0.0, max=89.0)
+        default=45.0, min=0.0, max=89.0)  # hard: tan(tilt) diverges at 90
     kerf: bpy.props.FloatProperty(
         name="Kerf",
         description="Blade width, allowed for when placing cut lines",
-        default=0.0032, min=0.0, max=0.02,
+        default=0.0032, min=0.0, soft_max=0.02,
         subtype='DISTANCE', unit='LENGTH', precision=4)
 
     # --- Dart run segmentation
@@ -75,7 +76,7 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         description="How much the bevel angle may drift along one run. One run "
                     "is one pass at one blade tilt, so this is what decides "
                     "where a run ends and the next begins",
-        default=10.0, min=0.5, max=90.0)
+        default=10.0, min=0.0, max=180.0, soft_min=0.5, soft_max=90.0)
     max_chord_deviation: bpy.props.FloatProperty(
         name="Straight Cut Limit",
         description="Only for straight-cut tools. How far a run may bow away "
@@ -83,14 +84,14 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "limit, correct for a band saw, which follows a curve at a "
                     "fixed blade tilt. Raise above zero only for a table saw, "
                     "where every pass has to be straight",
-        default=0.0, min=0.0, max=0.1,
+        default=0.0, min=0.0, soft_max=0.1,
         subtype='DISTANCE', unit='LENGTH', precision=4)
     dissolve_angle_limit_deg: bpy.props.FloatProperty(
         name="Pre-simplify Angle",
         description="Optional Decimate (Planar) pre-pass, delimited by UV and "
                     "seam so island boundaries survive. Helps on dense sculpts; "
                     "leave at zero to segment the boundary directly",
-        default=0.0, min=0.0, max=45.0)
+        default=0.0, min=0.0, max=180.0, soft_max=45.0)
 
     # --- Darts
     notch_shape: bpy.props.EnumProperty(
@@ -103,7 +104,7 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
     notch_depth_ratio: bpy.props.FloatProperty(
         name="Dart Depth",
         description="Fraction of the foam thickness the dart cuts through",
-        default=0.5, min=0.1, max=0.95)
+        default=0.5, min=0.0, max=1.0, soft_min=0.1, soft_max=0.95)  # hard: a fraction of the thickness
     allow_gores: bpy.props.BoolProperty(
         name="Allow Gores",
         description="Permit pieces that saddle, by adding material rather than "
@@ -131,12 +132,12 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "narrower darts. Darts land where the curvature is, not at "
                     "even spacing: a stretch that is developable gets none "
                     "however curved it looks, and a dome gets several",
-        default=core.DART_WEDGE_DEG, min=0.0, max=90.0)
+        default=core.DART_WEDGE_DEG, min=0.0, max=180.0, soft_max=90.0)
     max_darts_per_run: bpy.props.IntProperty(
         name="Max Darts Per Run",
         description="Upper limit per cut run, whatever the spacing works out "
                     "to. A safety net for a long run on a tight curve",
-        default=24, min=0, max=200)
+        default=24, min=0, soft_max=200)
 
     # --- Grease Pencil patterning
     pattern_source: bpy.props.PointerProperty(
@@ -159,7 +160,7 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "this is welded away, because a notch narrower than the "
                     "blade cannot be cut. Set it from the tool, and model "
                     "the sculpt at real-world scale so it means something",
-        default=0.002, min=0.0, max=0.05,
+        default=0.002, min=0.0, soft_max=0.05,
         # Four decimals of a metre, so the setting steps in 0.1 mm. That is
         # the right grain for a thing cut by hand at metre scale -- finer
         # steps would be tuning below what the cutting can hold anyway.
@@ -206,16 +207,18 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "keeps their spacing on the foam even, which matters more "
                     "when runs differ wildly in length")
     ticks_per_run: bpy.props.IntProperty(
-        name="Ticks Per Run", default=2, min=1, max=20,
+        name="Ticks Per Run", default=2, min=1, soft_max=20,
         description="How many alignment marks on each corner-to-corner "
                     "segment of seam")
     tick_spacing: bpy.props.FloatProperty(
-        name="Tick Spacing", default=0.025, min=0.002, max=0.5,
+        name="Tick Spacing", default=0.025, min=0.0001,
+        soft_min=0.002, soft_max=0.5,
         subtype='DISTANCE', unit='LENGTH', precision=4,
         description="Distance along the seam between alignment marks, in real "
                     "units, when spacing By Distance")
     tick_length: bpy.props.FloatProperty(
-        name="Tick Length", default=0.006, min=0.001, max=0.05,
+        name="Tick Length", default=0.006, min=0.0,
+        soft_min=0.001, soft_max=0.05,
         subtype='DISTANCE', unit='LENGTH', precision=4,
         description="How long each alignment mark is, in real units. A "
                     "registration mark is drawn on the foam with a pen and "
@@ -226,8 +229,9 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "take it")
     tick_numbers: bpy.props.BoolProperty(
         name="Number The Ticks", default=False,
-        description="Print a small index beside each alignment mark, so the "
-                    "third tick on one piece is visibly the third on its "
+        description="Print a small index beside each alignment mark, "
+                    "counted along the seam from one corner to the next, so "
+                    "the third tick on one piece is visibly the third on its "
                     "neighbour. Useful on a long seam where the marks look "
                     "alike; clutter on a short one")
 
@@ -242,7 +246,7 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         name="Stretch Tolerance",
         description="How much a piece may distort when flattened before it is "
                     "called non-developable",
-        default=0.25, min=0.01, max=2.0)
+        default=0.25, min=0.0, soft_min=0.01, soft_max=2.0)
 
     # --- Numbering
     origin_object: bpy.props.PointerProperty(
@@ -275,7 +279,8 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         ],
         default='OUTER')
     min_label_mm: bpy.props.FloatProperty(
-        name="Smallest Label (mm)", default=2.5, min=0.5, max=20.0,
+        name="Smallest Label (mm)", default=2.5, min=0.1,
+        soft_min=0.5, soft_max=20.0,
         precision=2,
         description="The smallest printed text the maker's printer and eyes "
                     "can read, in millimetres on the sheet. Where a bevel "
@@ -319,7 +324,7 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         name="Overlay Scale",
         description="Scales ticks and text together, so the same data can be a "
                     "readable full-size transfer pattern or a compact map",
-        default=1.0, min=0.05, max=10.0)
+        default=1.0, min=0.001, soft_min=0.05, soft_max=10.0)
     # Sizes relative to the pattern are given in parts per thousand of UV
     # space, as whole numbers. Expressed as a decimal fraction they landed
     # around 0.016, where a click of the arrow keys is far too coarse a step
@@ -329,23 +334,24 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         description="Height of the angle numbers, in thousandths of the UV "
                     "sheet. They then hold their size against the pattern as "
                     "you zoom, the way they would if printed on it",
-        default=16, min=2, max=200)
+        default=16, min=1, soft_min=2, soft_max=200)
     mark_size: bpy.props.IntProperty(
         name="Mark Size",
         description="Length of the guide ticks and dart marks, in thousandths "
                     "of the UV sheet",
-        default=10, min=1, max=200)
+        default=10, min=1, soft_max=200)
     number_size: bpy.props.IntProperty(
         name="Number Size",
         description="Height of the piece numbers, in thousandths of the UV "
                     "sheet",
-        default=35, min=2, max=400)
+        default=35, min=1, soft_min=2, soft_max=400)
 
     # Fixed screen sizes, used only when Scale With Pattern is off.
     tick_length_px: bpy.props.FloatProperty(name="Tick Length (px)",
-                                            default=10.0, min=1.0, max=100.0)
+                                            default=10.0, min=0.0,
+                                            soft_min=1.0, soft_max=100.0)
     font_size: bpy.props.IntProperty(name="Angle Text (px)", default=13,
-                                     min=6, max=60)
+                                     min=1, soft_min=6, soft_max=60)
     min_label_run_px: bpy.props.IntProperty(
         name="Hide Labels Under",
         description="Runs drawn shorter than this many pixels get no angle "
@@ -353,7 +359,7 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "numbers pile into an unreadable clump; the guide and its "
                     "ticks still show, so nothing is lost but the crowding. "
                     "Zoom in and they come back",
-        default=34, min=0, max=400)
+        default=34, min=0, soft_max=400)
     log_level: bpy.props.EnumProperty(
         name="Log Detail",
         description="How much FoamCraft writes to its log file. Debug adds a "
@@ -375,7 +381,7 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "on the sculpt, so zooming the UV editor or scaling the "
                     "UVs never changes which edges are flagged. Set it to the "
                     "shortest pass you can actually make on the saw",
-        default=0.006, min=0.0, max=0.2,
+        default=0.006, min=0.0, soft_max=0.2,
         subtype='DISTANCE', unit='LENGTH')
     corner_angle_deg: bpy.props.FloatProperty(
         name="Corner Angle",
@@ -384,15 +390,17 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
                     "run, so each straight-ish edge gets its own angle guide "
                     "instead of one guide running through the corner and "
                     "describing neither edge. Lower values break more often",
-        default=core.CORNER_ANGLE_DEG, min=5.0, max=170.0)
+        default=core.CORNER_ANGLE_DEG, min=0.0, max=180.0,
+        soft_min=5.0, soft_max=170.0)
     scale_text_with_view: bpy.props.BoolProperty(
         name="Scale With Pattern", default=True,
         description="Size every mark and number relative to the pattern, the "
                     "way they would be if printed on it. Off falls back to "
                     "fixed screen sizes")
     island_id_font_size: bpy.props.IntProperty(name="Number Size (px)",
-                                               default=20, min=6, max=120)
-    decimals: bpy.props.IntProperty(name="Decimals", default=0, min=0, max=2)
+                                               default=20, min=1, soft_min=6, soft_max=120)
+    decimals: bpy.props.IntProperty(name="Decimals", default=0, min=0, max=6,
+                                   soft_max=2)
     min_angle: bpy.props.FloatProperty(
         name="Minimum Cut Angle",
         default=core.MIN_BEVEL_ANGLE_DEG, min=0.0, max=180.0,

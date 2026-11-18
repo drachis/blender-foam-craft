@@ -366,7 +366,10 @@ Known-risky spots to check first in a live session:
   displayed in the UV Editor when multiple UV maps exist. **Still open.**
 
 **Superseded:** this file now lives in the `foam_craft/` package as
-`foam_craft/uv_fold_angle_overlay.py`, with its geometry moved to
+`foam_craft/uv_fold_angle_overlay.py` -- **removed from the package
+2026-11-17**: `foam_overlay` replaced it, and its separate "Fold Angles"
+sidebar tab read as a second plugin. The root-level draft stays as history.
+Its geometry had moved to
 `foam_craft/foam_angle_core.py`. Both bugs above are fixed there, and the
 overlay has been confirmed drawing live against Suzanne UVs.
 

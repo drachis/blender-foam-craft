@@ -1589,42 +1589,279 @@ def test_alignment_marks_go_inward_and_square_to_the_line():
     return out
 
 
+def test_no_alignment_mark_on_an_open_edge():
+    """The maker (2026-11-17): "For open edges there shouldn't be an
+    alignment tick." An open edge (one face, the rim of the sculpt) glues to
+    nothing, so a registration mark there registers against nothing.
+
+    Flat pair: two 1 m quads, one seam between them, six open rim edges, a
+    90 degree corner at every vertex -- so every edge is its own segment.
+    Per Run, 1 mark per segment: the seam gets exactly 1 mark, drawn on both
+    pieces -> exactly 2 'align' strokes, both starting on the seam. The rim
+    gets 0. Before the fix it was 8 (2 + one on each of the 6 rim edges).
+
+    Cube (closed, every edge a seam), same settings: 12 seams x 1 mark x 2
+    pieces = 24 -- the closed case must not lose any.
+    """
+    flat = _bevel_marks_of(_flat_pair(), ticks_per_run=1)
+    flat_align = [s for s in flat.strokes if s.kind == 'align']
+    cube = _bevel_marks_of(_seamed_cube(), ticks_per_run=1)
+    cube_align = [s for s in cube.strokes if s.kind == 'align']
+    return {
+        "flat_align": len(flat_align), "cube_align": len(cube_align),
+        "checks": {
+            "flat_two_marks_on_the_seam_only": len(flat_align) == 2,
+            "cube_24_marks": len(cube_align) == 24,
+        },
+    }
+
+
+def _mirror_marks_of(obj, **overrides):
+    """`_bevel_marks_of`, but through a SheetItem carrying the object's
+    Mirror planes -- the way the export and the overlay build it."""
+    s = bpy.context.scene.foamcraft_drachis
+    wanted = dict(BEVEL_BASE)
+    wanted.update(overrides)
+    saved = {k: getattr(s, k) for k in wanted}
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    try:
+        for k, v in wanted.items():
+            setattr(s, k, v)
+        item = fm.SheetItem(bm, bm.loops.layers.uv.active,
+                            obj.matrix_world.copy(), '', obj.name,
+                            tuple(fm.mirror_planes(obj)))
+        return fm.build_marks_multi([item], s, 1.0)
+    finally:
+        for k, v in saved.items():
+            setattr(s, k, v)
+        bm.free()
+
+
+def test_an_open_edge_on_the_mirror_plane_is_a_seam():
+    """The maker (2026-11-17): pick a plane and "have that count as a
+    mirror and have marks along that ... centered around the origin or an
+    empty". Read from the object's own Mirror modifier (axis toggles,
+    Mirror Object, Merge distance), as agreed.
+
+    Flat pair, x in [0, 2], y in [0, 1]; corners everywhere, so every edge
+    is its own segment. Per Run, 1 mark each:
+      no modifier                  -> 2 marks (the real seam, both pieces)
+      Mirror X, origin             -> 3 (+1 on the open edge at x = 0)
+      Mirror X, empty at x = 2     -> 3 (+1 on the open edge at x = 2)
+      Mirror X, empty at x = 0.5   -> 2 (no edge on that plane)
+      Mirror Y, origin             -> 4 (+1 on each bottom edge, y = 0;
+                                       the seam's end at (1, 0) splits them)
+      Mirror X, modifier hidden    -> 2 (show_viewport off: not mirrored)
+    Seam numbers: with Mirror X the open edge at x = 0 is seam 2 and is
+    numbered on its one piece, so the distinct seam numbers go {1} -> {1, 2}.
+    """
+    obj = _flat_pair()
+    empty = bpy.data.objects.new("MirrorEmpty", None)
+    bpy.context.collection.objects.link(empty)
+
+    def count(marks):
+        return sum(1 for st in marks.strokes if st.kind == 'align')
+
+    def numbers(marks):
+        return sorted({_parse(l.text)[0] for l in marks.labels
+                       if l.kind == 'angle'} - {None})
+
+    out = {"none": count(_mirror_marks_of(obj, ticks_per_run=1))}
+    none_numbers = numbers(_mirror_marks_of(obj, ticks_per_run=1))
+    mod = obj.modifiers.new("Mirror", 'MIRROR')
+    mod.use_axis = (True, False, False)
+    x_marks = _mirror_marks_of(obj, ticks_per_run=1)
+    out["x_origin"] = count(x_marks)
+    x_numbers = numbers(x_marks)
+    mod.mirror_object = empty
+    empty.location = (2.0, 0.0, 0.0)
+    bpy.context.view_layer.update()
+    out["x_empty_at_2"] = count(_mirror_marks_of(obj, ticks_per_run=1))
+    empty.location = (0.5, 0.0, 0.0)
+    bpy.context.view_layer.update()
+    out["x_empty_at_half"] = count(_mirror_marks_of(obj, ticks_per_run=1))
+    mod.mirror_object = None
+    mod.use_axis = (False, True, False)
+    out["y_origin"] = count(_mirror_marks_of(obj, ticks_per_run=1))
+    mod.use_axis = (True, False, False)
+    mod.show_viewport = False
+    out["x_hidden"] = count(_mirror_marks_of(obj, ticks_per_run=1))
+    out["numbers_none"], out["numbers_x"] = none_numbers, x_numbers
+    out["checks"] = {
+        "none_2": out["none"] == 2,
+        "x_origin_3": out["x_origin"] == 3,
+        "x_empty_at_2_3": out["x_empty_at_2"] == 3,
+        "x_empty_at_half_2": out["x_empty_at_half"] == 2,
+        "y_origin_4": out["y_origin"] == 4,
+        "x_hidden_2": out["x_hidden"] == 2,
+        "numbers_none_1": none_numbers == [1],
+        "numbers_x_1_2": x_numbers == [1, 2],
+    }
+    return out
+
+
+def test_tick_numbers_count_along_the_whole_seam():
+    """The maker (2026-11-17): "number the ticks along the whole seam until
+    a corner". They used to restart on every mesh edge, so nearly every
+    tick read "1".
+
+    Gore sphere: six gores, so six pole-to-pole seams, each one segment
+    (ended by the poles, where six pieces meet; the gore sides have no
+    corner) and each running over many mesh edges. Per Run, 5 marks per
+    segment: 6 x 5 marks, each printed on both pieces -> 60 numbers,
+    "1".."5" exactly 12 times each. And each piece reads its two seams'
+    numbers in order along the seam: within one segment, numbers rise
+    strictly with distance from its start (checked on `_segment_ticks`).
+    """
+    obj = _gore_sphere()
+    marks = _bevel_marks_of(obj, ticks_per_run=5, tick_numbers=True)
+    texts = [l.text for l in marks.labels if l.kind == 'align']
+    counts = {t: texts.count(t) for t in sorted(set(texts))}
+
+    s = bpy.context.scene.foamcraft_drachis
+    saved = (s.tick_mode, s.ticks_per_run)
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    try:
+        s.tick_mode, s.ticks_per_run = 'PER_RUN', 5
+        uv_layer = bm.loops.layers.uv.active
+        sheet = fm._Sheet(core.uv_islands(bm, uv_layer, only_selected=False),
+                          uv_layer, 1.0, obj.matrix_world)
+        islands = [fm._Island(i, f, uv_layer, sheet) for i, f in
+                   enumerate(core.uv_islands(bm, uv_layer,
+                                             only_selected=False))]
+        placed = [n for _e, _t, n in fm._segment_ticks(islands, s)]
+    finally:
+        s.tick_mode, s.ticks_per_run = saved
+        bm.free()
+    # Emitted segment by segment in distance order: 1..5, six times over.
+    return {
+        "counts": counts, "placed": placed,
+        "checks": {
+            "sixty_numbers": len(texts) == 60,
+            "one_to_five_twelve_each": counts == {str(k): 12
+                                                  for k in range(1, 6)},
+            "rising_along_each_seam": placed == list(range(1, 6)) * 6,
+        },
+    }
+
+
+def test_the_mirror_bevel_is_blenders_own_fold_once_applied():
+    """The bevel across a mirror line is the fold between the edge's one
+    face and its reflection. Known answer, two ways:
+
+    Arithmetic: a 1 m half-roof dropping `h` = 0.5 from the plane x = 0.
+    Mirrored, it is a ridge folding by 2 * atan(0.5) = 53.130 degrees --
+    convex (+) with the face up, a valley (-) with the slope reversed.
+
+    Blender: the same mesh with the Mirror modifier *applied* (merged) has
+    a real two-face ridge edge, and `calc_face_angle_signed` on it is the
+    convention this whole add-on uses (CLAUDE.md, positive = convex). The
+    unapplied mirror answer must equal it, sign included, to 1e-4 degrees.
+    """
+    expected = _math.degrees(2.0 * _math.atan(0.5))
+    out, checks = {"expected": expected}, {}
+    for name, h in (("ridge", -0.5), ("valley", 0.5)):
+        _clear()
+        me = bpy.data.meshes.new(name)
+        me.from_pydata([(0, 0, 0), (1, 0, h), (1, 1, h), (0, 1, 0)], [],
+                       [(0, 1, 2, 3)])
+        me.update()
+        if me.polygons[0].normal.z < 0:
+            me.flip_normals()
+        obj = bpy.data.objects.new(name, me)
+        bpy.context.collection.objects.link(obj)
+        bpy.context.view_layer.objects.active = obj
+        mod = obj.modifiers.new("Mirror", 'MIRROR')
+        mod.use_axis = (True, False, False)
+        mod.use_mirror_merge = True
+
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        planes = fm.mirror_planes(obj)
+        on_plane = [e for e in bm.edges
+                    if all(abs(v.co.x) < 1e-9 for v in e.verts)]
+        ours = core.dihedral_angle_deg(on_plane[0], planes) \
+            if len(on_plane) == 1 else None
+        bm.free()
+
+        bpy.ops.object.modifier_apply(modifier="Mirror")
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        ridge = [e for e in bm.edges
+                 if all(abs(v.co.x) < 1e-9 for v in e.verts)]
+        theirs = core.dihedral_angle_deg(ridge[0]) \
+            if len(ridge) == 1 and len(ridge[0].link_faces) == 2 else None
+        bm.free()
+
+        out[name] = {"ours": ours, "blender_applied": theirs}
+        sign = 1.0 if name == "ridge" else -1.0
+        checks[name + "_one_plane_edge"] = len(on_plane) == 1
+        checks[name + "_matches_blender"] = ours is not None and \
+            theirs is not None and abs(ours - theirs) < 1e-4
+        checks[name + "_is_the_arithmetic"] = ours is not None and \
+            abs(ours - sign * expected) < 1e-4
+    out["checks"] = checks
+    return out
+
+
 def test_run_end_marks_only_part_way_along_a_seam():
     """On the gore sphere the bevel drifts with latitude, so each side of a
     gore breaks into several cut runs along one pole-to-pole seam. Those
-    breaks get a run-end mark, inward and square to the line like an
-    alignment mark. Both bounds: more than 0 of them, and 0 at a segment
-    end -- the poles, where six gores meet, are the only segment ends here,
-    and on the sheet each is a gore's topmost or bottommost outline point.
+    breaks get a run-end mark. Both bounds: more than 0 of them, and 0 at a
+    segment end -- the poles, where six gores meet, are the only segment
+    ends here, and on the sheet each is a gore's topmost or bottommost
+    outline point.
 
-    Tolerances as for the gore's alignment marks, from float32.
+    Shape (the maker, 2026-11-17: they must "look clearly different" from
+    the ticks): a closed ring of RUN_END_SIDES points, every point the same
+    distance from its centre, the centre on the cut line, and that radius
+    RUN_END_RADIUS x tick_length (6 mm -> 1.5 mm) or less, where the piece
+    is narrow -- with at least one at full size. Tolerances from float32,
+    as for the gore's alignment marks.
     """
     marks = _bevel_marks_of(_gore_sphere())
-    rows = _start_mark_report(marks, 'bracket')
-    good = [r for r in rows if r is not None]
     u = _sheet_ulp(marks)
-    dot_tol = 4 * u / 6.0 + 4 * u / _shortest_outline_edge(marks)
+    full = fm.RUN_END_RADIUS * 6.0
+    outlines = [s for s in marks.strokes if s.kind == 'outline']
     tips = []
-    for s in marks.strokes:
-        if s.kind == 'outline':
-            ys = sorted(s.points, key=lambda p: p[1])
-            tips += [ys[0], ys[-1]]
-    at_end = sum(1 for st in marks.strokes if st.kind == 'bracket'
-                 and any(_math.hypot(st.points[0][0] - t[0],
-                                     st.points[0][1] - t[1]) < 1.0
-                         for t in tips))
+    for s in outlines:
+        ys = sorted(s.points, key=lambda p: p[1])
+        tips += [ys[0], ys[-1]]
+    rings = [st for st in marks.strokes if st.kind == 'bracket']
+    rows = []
+    for st in rings:
+        n = len(st.points)
+        cx = sum(p[0] for p in st.points) / n
+        cy = sum(p[1] for p in st.points) / n
+        radii = [_math.hypot(p[0] - cx, p[1] - cy) for p in st.points]
+        rows.append({
+            "closed": st.closed, "points": n,
+            "radius": max(radii), "roundness": max(radii) - min(radii),
+            "centre_off_line": min(_dist_to_ring((cx, cy), o.points)
+                                   for o in outlines),
+            "at_a_pole": any(_math.hypot(cx - t[0], cy - t[1]) < 1.0
+                             for t in tips),
+        })
     return {
         "run_end_marks": len(rows),
-        "at_a_pole": at_end,
-        "worst_cos": max((r["dot"] for r in good), default=None),
-        "cos_tol": dot_tol,
+        "radius_range": [min(r["radius"] for r in rows),
+                         max(r["radius"] for r in rows)] if rows else None,
+        "worst_centre_off_line": max((r["centre_off_line"] for r in rows),
+                                     default=None),
         "checks": {
-            "some_mid_seam_marks": len(good) > 0 and len(good) == len(rows),
-            "none_at_a_segment_end": at_end == 0,
-            "start_on_the_line": all(r["start_off_line"] < 4 * u
-                                     for r in good),
-            "inward": all(r["end_depth"] > 4 * u for r in good),
-            "perpendicular": all(r["dot"] < dot_tol for r in good),
+            "some_mid_seam_marks": len(rows) > 0,
+            "none_at_a_segment_end": not any(r["at_a_pole"] for r in rows),
+            "closed_rings": all(r["closed"] and r["points"] == fm.RUN_END_SIDES
+                                for r in rows),
+            "round": all(r["roundness"] < 4 * u for r in rows),
+            "centred_on_the_line": all(r["centre_off_line"] < 4 * u
+                                       for r in rows),
+            "never_larger_than_full": all(r["radius"] <= full + 4 * u
+                                          for r in rows),
+            "some_at_full_size": any(abs(r["radius"] - full) < 4 * u
+                                     for r in rows),
         },
     }
 
@@ -1647,6 +1884,10 @@ TESTS = (
     test_a_cut_run_can_span_two_seams,
     test_nothing_is_drawn_at_a_corner,
     test_alignment_marks_go_inward_and_square_to_the_line,
+    test_no_alignment_mark_on_an_open_edge,
+    test_an_open_edge_on_the_mirror_plane_is_a_seam,
+    test_the_mirror_bevel_is_blenders_own_fold_once_applied,
+    test_tick_numbers_count_along_the_whole_seam,
     test_run_end_marks_only_part_way_along_a_seam,
 )
 
