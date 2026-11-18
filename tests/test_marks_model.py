@@ -1718,6 +1718,18 @@ def test_tick_numbers_count_along_the_whole_seam():
     marks = _bevel_marks_of(obj, ticks_per_run=5, tick_numbers=True)
     texts = [l.text for l in marks.labels if l.kind == 'align']
     counts = {t: texts.count(t) for t in sorted(set(texts))}
+    # Their own size setting (2026-11-17), in thousandths of the sheet like
+    # the angle text: doubling it doubles every number, and nothing else
+    # sets it.
+    big = _bevel_marks_of(obj, ticks_per_run=5, tick_numbers=True,
+                          tick_number_size=22)
+    small = _bevel_marks_of(obj, ticks_per_run=5, tick_numbers=True,
+                            tick_number_size=11)
+    sizes = {n: sorted({round(l.size_mm, 6) for l in m.labels
+                        if l.kind == 'align'})
+             for n, m in (("22", big), ("11", small))}
+    doubled = len(sizes["22"]) == 1 and len(sizes["11"]) == 1 and \
+        abs(sizes["22"][0] - 2 * sizes["11"][0]) < 1e-5
 
     s = bpy.context.scene.foamcraft_drachis
     saved = (s.tick_mode, s.ticks_per_run)
@@ -1737,13 +1749,57 @@ def test_tick_numbers_count_along_the_whole_seam():
         bm.free()
     # Emitted segment by segment in distance order: 1..5, six times over.
     return {
-        "counts": counts, "placed": placed,
+        "counts": counts, "placed": placed, "sizes_mm": sizes,
         "checks": {
+            "number_size_follows_its_setting": doubled,
             "sixty_numbers": len(texts) == 60,
             "one_to_five_twelve_each": counts == {str(k): 12
                                                   for k in range(1, 6)},
             "rising_along_each_seam": placed == list(range(1, 6)) * 6,
         },
+    }
+
+
+def test_by_distance_count_is_clamped_and_short_stretches_skipped():
+    """The maker (2026-11-17): "one every 50 mm, clamped to 1..4", and a
+    stretch "too short" gets none, at a length they set.
+
+    Arithmetic on `_segment_distances` (pure), spacing 0.05 m:
+      0.30 m, no clamp     -> 6 marks, 0.05 apart, centred: 0.025..0.275
+      0.30 m, max 4        -> 4, spread evenly: 0.06, 0.12, 0.18, 0.24
+      0.12 m, max 4        -> 3 at the spacing (the cap does not bite):
+                              0.01, 0.06, 0.11
+      0.03 m, min 2        -> 2, spread evenly: 0.01, 0.02
+      0.03 m, min 1        -> 1, in the middle: 0.015
+      0.03 m, skip 0.04    -> none (both modes)
+      0.05 m, skip 0.04    -> 1: not shorter than the skip length
+    """
+    class S:
+        tick_spacing = 0.05
+        ticks_per_run = 2
+        tick_count_min = 1
+        tick_count_max = 0
+        tick_skip_below = 0.0
+
+    def run(total, mode='BY_DISTANCE', **kw):
+        s = S()
+        for k, v in kw.items():
+            setattr(s, k, v)
+        return [round(d, 9) for d in fm._segment_distances(total, s, mode)]
+
+    cases = {
+        "no_clamp": (run(0.30), [0.025, 0.075, 0.125, 0.175, 0.225, 0.275]),
+        "max_4": (run(0.30, tick_count_max=4), [0.06, 0.12, 0.18, 0.24]),
+        "max_not_biting": (run(0.12, tick_count_max=4), [0.01, 0.06, 0.11]),
+        "min_2": (run(0.03, tick_count_min=2), [0.01, 0.02]),
+        "min_1": (run(0.03), [0.015]),
+        "skipped": (run(0.03, tick_skip_below=0.04), []),
+        "skipped_per_run": (run(0.03, 'PER_RUN', tick_skip_below=0.04), []),
+        "at_skip_length": (run(0.05, tick_skip_below=0.04), [0.025]),
+    }
+    return {
+        "got": {k: v[0] for k, v in cases.items()},
+        "checks": {k: v[0] == v[1] for k, v in cases.items()},
     }
 
 
@@ -1888,6 +1944,7 @@ TESTS = (
     test_an_open_edge_on_the_mirror_plane_is_a_seam,
     test_the_mirror_bevel_is_blenders_own_fold_once_applied,
     test_tick_numbers_count_along_the_whole_seam,
+    test_by_distance_count_is_clamped_and_short_stretches_skipped,
     test_run_end_marks_only_part_way_along_a_seam,
 )
 

@@ -216,6 +216,29 @@ class FOAMCRAFT_DRACHIS_PG_panel_settings(bpy.types.PropertyGroup):
         subtype='DISTANCE', unit='LENGTH', precision=4,
         description="Distance along the seam between alignment marks, in real "
                     "units, when spacing By Distance")
+    # By Distance, clamped (the maker, 2026-11-17: "one every 50 mm,
+    # clamped to 1..4"). Spacing decides the count; these bound it.
+    tick_count_min: bpy.props.IntProperty(
+        name="Min Ticks", default=1, min=0, soft_max=10,
+        description="Fewest alignment marks on a corner-to-corner stretch of "
+                    "seam when spacing By Distance, however short it is "
+                    "(stretches shorter than Skip Shorter Than still get "
+                    "none)")
+    tick_count_max: bpy.props.IntProperty(
+        name="Max Ticks", default=0, min=0, soft_max=20,
+        description="Most alignment marks on a corner-to-corner stretch of "
+                    "seam when spacing By Distance. 0 means no limit. When "
+                    "the limit applies, the marks are spread evenly")
+    tick_skip_below: bpy.props.FloatProperty(
+        name="Skip Shorter Than", default=0.0, min=0.0,
+        soft_max=0.2, subtype='DISTANCE', unit='LENGTH', precision=4,
+        description="A stretch of seam between two corners shorter than this "
+                    "gets no alignment mark: its corners already line it up. "
+                    "0 marks every stretch")
+    tick_number_size: bpy.props.IntProperty(
+        name="Tick Number Size", default=11, min=1, soft_min=2, soft_max=200,
+        description="Height of the alignment mark numbers, in thousandths of "
+                    "the UV sheet, like the angle text")
     tick_length: bpy.props.FloatProperty(
         name="Tick Length", default=0.006, min=0.0,
         soft_min=0.001, soft_max=0.05,

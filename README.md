@@ -8,15 +8,16 @@ and a **bevel angle**: the tilt the saw blade has to sit at so the panel's edge
 meets its neighbour cleanly instead of leaving a wedge-shaped gap. That work is
 traditionally done by hand on paper. FoamCraft computes it from the mesh.
 
-![The FoamCraft overlay in the UV editor: eight numbered pieces from a torus,
-each cut run bracketed, with the bevel angle printed at every
-edge](docs/images/overlay-cut-plan.png)
+![The FoamCraft overlay in the UV editor on a creature skull: named pieces,
+a seam number and bevel angle on every cut run, alignment ticks, and the
+FoamCraft sidebar](docs/images/overlay-skull.png)
 
-*Eight panels unwrapped from a torus. Blue angles are convex folds, pink are
-concave, and the brackets group edges into **cut runs** — one run is one pass at
-one blade tilt.*
+*Pieces of a creature skull in the UV editor, with the FoamCraft sidebar.
+Each label is a seam number and a blade tilt: blue for convex folds, pink for
+concave, the arrow showing which way the blade leans. The white ticks are
+alignment marks, and the overlay previews exactly what prints.*
 
-> **Status: 0.1, early.** The geometry has been checked against shapes with
+> **Status: early.** The geometry has been checked against shapes with
 > known answers (see [Known limitations](#known-limitations) for what hasn't).
 > Expect to sanity-check the output against a test piece before cutting
 > expensive stock.
@@ -89,9 +90,10 @@ make, and the fix is to redraw more coarsely or use a finer tool.
 
 ### 4. Set the material and the saw
 
-In the **Foam Cut Plan** panel: foam grade and thickness (read the thickness off
-the stock you actually have — grade and thickness are independent), max blade
-tilt, and kerf. **Estimate From Foam** fills the flex tolerances from the grade.
+In the **Cut Runs** panel: foam grade and thickness (read the thickness off
+the stock you actually have — grade and thickness are independent).
+**Estimate From Foam** fills the flex tolerances from the grade. The saw's
+**Max Blade Tilt** is under **Foam Pattern ▸ Bevel Labels**.
 
 ### 5. Check craftability
 
@@ -124,8 +126,16 @@ The recommended route is the **image export**. The image is sized from the
 pattern's real dimensions, so printing it at the stated DPI gives a true-size
 sheet.
 
-Find it in the UV Editor sidebar (<kbd>N</kbd>) under **FoamCraft ▸ Foam Cut
-Plan ▸ Print / Export**, and press **Export Image**. The same operator is also
+![The same skull pieces as printed: coloured pieces with names, seam numbers
+and bevel angles, alignment ticks on the seams and small circles where a
+bevel changes part way along](docs/images/print-skull.png)
+
+*The same pieces from the image export. Ticks on a seam line up with the
+neighbouring piece's; a small circle marks where the bevel changes part way
+along a cut.*
+
+Find it in the UV Editor sidebar (<kbd>N</kbd>) under **FoamCraft ▸ Foam
+Pattern**, and press **Export Image**. The same operator is also
 at **File ▸ Export ▸ Foam Pattern Image (.png/.jpg)**. The panel's **Export
 SVG** button is the SVG route, described below.
 
@@ -175,7 +185,7 @@ when a print service asks for it.
   too large for the pattern, the image is clamped and the report names the DPI
   to print at.
 
-**Print / Export options**, all in the same panel:
+**Foam Pattern sections**, all in the same panel:
 
 - **Alignment Marks** (on by default). These are registration marks, not relief
   cuts. Each seam is marked at the same point on the shared edge and drawn on
@@ -183,7 +193,11 @@ when a print service asks for it.
   Marks are spread along each stretch of edge from one corner to the next:
   either a fixed number, evenly spaced (default 2), or one every set
   distance (default 25 mm), centred so none lands on a corner. Each mark is 6 mm long by default, and the numbering
-  toggle is off. With numbering on, ticks count from one corner to the next
+  toggle is off. By Distance takes a **Min** and **Max** count per stretch
+  (Max 0 = no limit); where one applies, the marks are spread evenly
+  instead. **Skip Shorter Than** leaves short stretches unmarked in either
+  mode, since their corners already line them up. With numbering on, ticks
+  count from one corner to the next
   along the seam, so the third tick on one piece is the third on its
   neighbour. Turn the marks off if you do not want them.
   - Open edges (the rim of the model) glue to nothing and get no marks.

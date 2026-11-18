@@ -1387,15 +1387,32 @@ def _segment_distances(total, settings, mode=None):
     PER_RUN: N marks at i/(N+1) of the length -- never at either end.
     BY_DISTANCE: every `tick_spacing`, the leftover split equally between
     the two ends; a segment no longer than one spacing gets one mark in its
-    middle. Both are symmetric under reversing the segment.
+    middle. The count is clamped to `tick_count_min`..`tick_count_max`
+    (max 0 = no limit), spread evenly where the clamp applies. Both are
+    symmetric under reversing the segment. A segment shorter than
+    `tick_skip_below` gets none, in either mode.
     """
     mode = mode or settings.tick_mode
+    # Too short to need one: its two corners line it up (`tick_skip_below`).
+    # `total` is in world metres when a matrix is given, as the setting is.
+    if total < float(getattr(settings, 'tick_skip_below', 0.0)):
+        return []
     if mode == 'BY_DISTANCE':
         step = max(float(settings.tick_spacing), 1e-4)
         # Gaps strictly inside the segment, so no mark lands on an end. The
         # epsilon keeps a segment of exactly k steps (0.2 m at 0.05) from
         # flipping between k-1 and k gaps on its last bit of arithmetic.
         gaps = max(0, ceil(total / step - 1e-6) - 1)
+        natural = gaps + 1
+        # Clamped to Min/Max Ticks (max 0 = no limit). Where the clamp
+        # applies the spacing no longer fits, so the marks are spread
+        # evenly instead -- still symmetric, still never on an end.
+        count = max(natural, int(getattr(settings, 'tick_count_min', 1)))
+        high = int(getattr(settings, 'tick_count_max', 0))
+        if high > 0:
+            count = min(count, high)
+        if count != natural:
+            return [total * i / (count + 1) for i in range(1, count + 1)]
         first = (total - gaps * step) / 2.0
         return [first + i * step for i in range(gaps + 1)]
     count = max(1, int(settings.ticks_per_run))
@@ -2139,7 +2156,8 @@ def _sheet_marks(sheet, parts, settings, scale_length, bevel_out=None,
             part_align, part_labels = _alignment_ticks(
                 islands, uv_layer, runs_by_island, settings,
                 settings.tick_length * scale_length * 1000.0,
-                angle_font_mm * 0.7, stroke_mm * 0.9, matrix)
+                sheet.permille(settings.tick_number_size, overlay_scale),
+                stroke_mm * 0.9, matrix)
             align += part_align
             align_labels += part_labels
 

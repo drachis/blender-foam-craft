@@ -409,7 +409,8 @@ class _Model:
         strokes, labels = self.fm._alignment_ticks(
             self.islands, uv_layer, self.runs_by_island, s,
             s.tick_length * self.scale_length * 1000.0,
-            self.angle_font_mm * 0.7, self.stroke_mm * 0.9,
+            self.sheet.permille(s.tick_number_size, s.overlay_scale),
+            self.stroke_mm * 0.9,
             self.matrix)
 
         ticks = []
@@ -1221,8 +1222,10 @@ def draw_callback():
     _draw_lines(segments, max(1.0, scale))
 
     if tick_marks:
-        # 0.7 of the angle text, the same ratio the sheet uses.
-        blf.size(font_id, max(6, int(angle_px * 0.7)))
+        # Tick Number Size against Angle Text: the ratio the sheet prints
+        # them at, both being thousandths of the sheet.
+        blf.size(font_id, max(6, int(angle_px * s.tick_number_size
+                                     / max(1, s.angle_text_size))))
         blf.color(font_id, *tuple(s.island_id_color))
         for x, y, text in tick_marks:
             width, height = blf.dimensions(font_id, text)
@@ -1458,10 +1461,17 @@ class IMAGE_PT_foamcraft_drachis_export(bpy.types.Panel):
             body.prop(s, "tick_mode")
             if s.tick_mode == 'BY_DISTANCE':
                 body.prop(s, "tick_spacing")
+                row = body.row(align=True)
+                row.prop(s, "tick_count_min", text="Min")
+                row.prop(s, "tick_count_max", text="Max")
             else:
                 body.prop(s, "ticks_per_run")
+            body.prop(s, "tick_skip_below")
             body.prop(s, "tick_length")
             body.prop(s, "tick_numbers")
+            sub = body.column()
+            sub.enabled = s.tick_numbers
+            sub.prop(s, "tick_number_size", text="Number Size")
             body.prop(s, "corner_angle_deg")
             # Where the mirror line comes from: the object's own Mirror
             # modifier, so say whether one is being read.
